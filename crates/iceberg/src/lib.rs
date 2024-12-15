@@ -64,7 +64,7 @@ mod catalog;
 
 pub use catalog::{
     Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement,
-    TableUpdate, ViewCreation,
+    TableUpdate, ViewCreation, ViewUpdate,
 };
 
 pub mod table;

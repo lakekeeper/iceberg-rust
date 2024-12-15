@@ -221,6 +221,17 @@ impl TableMetadata {
         }
     }
 
+    /// Returns the last column id.
+    #[inline]
+    pub fn last_column_id(&self) -> i32 {
+        self.last_column_id
+    }
+
+    /// Returns the last partition_id
+    pub fn last_partition_id(&self) -> i32 {
+        self.last_partition_id
+    }
+
     /// Returns last updated time.
     #[inline]
     pub fn last_updated_timestamp(&self) -> Result<DateTime<Utc>> {
@@ -286,6 +297,12 @@ impl TableMetadata {
     /// Returns spec id of the "current" partition spec.
     pub fn default_partition_spec_id(&self) -> i32 {
         self.default_spec.spec_id()
+    }
+
+    #[inline]
+    /// Returns snapshot references.
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
     }
 
     /// Returns all snapshots
@@ -504,12 +521,12 @@ impl TableMetadata {
                 self.current_snapshot_id = None;
             } else if self.snapshot_by_id(current_snapshot_id).is_none() {
                 return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Snapshot for current snapshot id {} does not exist in the existing snapshots list",
-                            current_snapshot_id
-                        ),
-                    ));
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Snapshot for current snapshot id {} does not exist in the existing snapshots list",
+                        current_snapshot_id
+                    ),
+                ));
             }
         }
         Ok(())
@@ -626,6 +643,118 @@ impl TableMetadata {
 
         Ok(())
     }
+
+    /// Construct `Self` from parts.
+    ///
+    /// Useful when reconstructing `TableMetadata` from DB etc.
+    pub fn try_from_parts(
+        Parts {
+            format_version,
+            table_uuid,
+            location,
+            last_sequence_number,
+            last_updated_ms,
+            last_column_id,
+            schemas,
+            current_schema_id,
+            partition_specs,
+            default_spec,
+            last_partition_id,
+            properties,
+            current_snapshot_id,
+            snapshots,
+            snapshot_log,
+            metadata_log,
+            sort_orders,
+            default_sort_order_id,
+            refs,
+            statistics,
+            partition_statistics,
+        }: Parts,
+    ) -> Result<Self> {
+        let default_partition_type =
+            default_spec.partition_type(schemas.get(&current_schema_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "No schema exists with the current schema id {}.",
+                        current_schema_id
+                    ),
+                )
+            })?)?;
+        let mut metadata = TableMetadata {
+            format_version,
+            table_uuid,
+            location,
+            last_sequence_number,
+            last_updated_ms,
+            last_column_id,
+            schemas,
+            current_schema_id,
+            partition_specs,
+            default_partition_type,
+            default_spec,
+            last_partition_id,
+            properties,
+            current_snapshot_id,
+            snapshots,
+            snapshot_log,
+            metadata_log,
+            sort_orders,
+            default_sort_order_id,
+            refs,
+            statistics,
+            partition_statistics,
+        };
+
+        metadata.try_normalize()?;
+        Ok(metadata)
+    }
+}
+/// Struct representing the parts of a table metadata.
+pub struct Parts {
+    /// The format version of the table metadata.
+    pub format_version: FormatVersion,
+    /// The UUID of the table.
+    pub table_uuid: Uuid,
+    /// The base location of the table.
+    pub location: String,
+    /// The highest sequence number of the table.
+    pub last_sequence_number: i64,
+    /// The last updated timestamp in milliseconds.
+    pub last_updated_ms: i64,
+    /// The highest assigned column ID for the table.
+    pub last_column_id: i32,
+    /// A map of schema IDs to schema references.
+    pub schemas: HashMap<i32, SchemaRef>,
+    /// The ID of the current schema.
+    pub current_schema_id: i32,
+    /// A map of partition spec IDs to partition spec references.
+    pub partition_specs: HashMap<i32, PartitionSpecRef>,
+    /// The default partition spec reference.
+    pub default_spec: PartitionSpecRef,
+    /// The highest assigned partition field ID.
+    pub last_partition_id: i32,
+    /// A map of table properties.
+    pub properties: HashMap<String, String>,
+    /// The ID of the current snapshot, if any.
+    pub current_snapshot_id: Option<i64>,
+    /// A map of snapshot IDs to snapshot references.
+    pub snapshots: HashMap<i64, SnapshotRef>,
+    /// A log of snapshot changes.
+    pub snapshot_log: Vec<SnapshotLog>,
+    /// A log of metadata changes.
+    pub metadata_log: Vec<MetadataLog>,
+    /// A map of sort order IDs to sort order references.
+    pub sort_orders: HashMap<i64, SortOrderRef>,
+    /// The ID of the default sort order.
+    pub default_sort_order_id: i64,
+    /// A map of snapshot references.
+    pub refs: HashMap<String, SnapshotReference>,
+    /// A map of snapshot IDs to statistics files.
+    pub statistics: HashMap<i64, StatisticsFile>,
+    /// A map of snapshot IDs to partition statistics files.
+    pub partition_statistics: HashMap<i64, PartitionStatisticsFile>,
 }
 
 pub(super) mod _serde {

@@ -19,20 +19,26 @@
 //! The main struct here is [ViewMetadata] which defines the data for a view.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use _serde::ViewMetadataEnum;
 use chrono::{DateTime, Utc};
+use itertools::{FoldWhile, Itertools};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use uuid::Uuid;
 
 use super::view_version::{ViewVersion, ViewVersionId, ViewVersionRef};
-use super::{SchemaId, SchemaRef};
+use super::{Schema, SchemaId, SchemaRef, ViewRepresentation};
 use crate::catalog::ViewCreation;
 use crate::error::{timestamp_ms_to_utc, Result};
+use crate::spec::view_properties::{
+    REPLACE_DROP_DIALECT_ALLOWED, REPLACE_DROP_DIALECT_ALLOWED_DEFAULT, VERSION_HISTORY_SIZE,
+    VERSION_HISTORY_SIZE_DEFAULT,
+};
+use crate::Error;
 
 /// Reference to [`ViewMetadata`].
 pub type ViewMetadataRef = Arc<ViewMetadata>;
@@ -47,24 +53,24 @@ pub(crate) static INITIAL_VIEW_VERSION_ID: i32 = 1;
 /// We check the validity of this data structure when constructing.
 pub struct ViewMetadata {
     /// Integer Version for the format.
-    pub(crate) format_version: ViewFormatVersion,
+    pub format_version: ViewFormatVersion,
     /// A UUID that identifies the view, generated when the view is created.
-    pub(crate) view_uuid: Uuid,
+    pub view_uuid: Uuid,
     /// The view's base location; used to create metadata file locations
-    pub(crate) location: String,
+    pub location: String,
     /// ID of the current version of the view (version-id)
-    pub(crate) current_version_id: ViewVersionId,
+    pub current_version_id: ViewVersionId,
     /// A list of known versions of the view
-    pub(crate) versions: HashMap<ViewVersionId, ViewVersionRef>,
+    pub versions: HashMap<ViewVersionId, ViewVersionRef>,
     /// A list of version log entries with the timestamp and version-id for every
     /// change to current-version-id
-    pub(crate) version_log: Vec<ViewVersionLog>,
+    pub version_log: Vec<ViewVersionLog>,
     /// A list of schemas, stored as objects with schema-id.
-    pub(crate) schemas: HashMap<i32, SchemaRef>,
+    pub schemas: HashMap<i32, SchemaRef>,
     /// A string to string map of view properties.
     /// Properties are used for metadata such as comment and for settings that
     /// affect view maintenance. This is not intended to be used for arbitrary metadata.
-    pub(crate) properties: HashMap<String, String>,
+    pub properties: HashMap<String, String>,
 }
 
 impl ViewMetadata {
@@ -138,6 +144,115 @@ impl ViewMetadata {
         &self.properties
     }
 
+    /// Append view version to view
+    fn add_version(&mut self, view_version: ViewVersion) -> Result<AddedOrPresent<ViewVersionId>> {
+        if self.versions.contains_key(&view_version.version_id()) {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!(
+                    "A version with the version id {} already exists.",
+                    view_version.version_id()
+                ),
+            ));
+        }
+
+        let (exist, max_version) = self
+            .versions
+            .values()
+            .fold_while((None, 0), |(_, max), v| {
+                if is_same_version(v, &view_version) {
+                    FoldWhile::Done((Some(v.version_id()), max))
+                } else {
+                    FoldWhile::Continue((None, max.max(v.version_id())))
+                }
+            })
+            .into_inner();
+        if let Some(v) = exist {
+            return Ok(AddedOrPresent::AlreadyPresent(v));
+        }
+
+        let new_version_id = max_version + 1;
+
+        let mut view_version = view_version;
+        view_version.version_id = new_version_id;
+        self.versions.insert(new_version_id, Arc::new(view_version));
+        Ok(AddedOrPresent::Added(new_version_id))
+    }
+
+    fn set_current_version_id(&mut self, current_version_id: ViewVersionId) -> Result<()> {
+        if !self.versions.contains_key(&current_version_id) {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!(
+                    "No version exists with the version id {}.",
+                    current_version_id
+                ),
+            ));
+        }
+        self.current_version_id = current_version_id;
+        self.version_log
+            .push(ViewVersionLog::now(current_version_id));
+        Ok(())
+    }
+
+    fn add_schema(&mut self, schema: Schema) -> Result<AddedOrPresent<i32>> {
+        if self.schemas.contains_key(&schema.schema_id()) {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!(
+                    "A schema with the schema id {} already exists.",
+                    schema.schema_id()
+                ),
+            ));
+        }
+        // Not sure why, but the java implementation replaces schema_ids by internally computed ids
+        let (maybe_existing, max_schema_id) = self
+            .schemas
+            .values()
+            .fold_while((None, 0), |(_, max), s| {
+                if is_same_schema(s, &schema) {
+                    FoldWhile::Done((Some(s.schema_id()), max))
+                } else {
+                    FoldWhile::Continue((None, max.max(s.schema_id())))
+                }
+            })
+            .into_inner();
+
+        if let Some(existing) = maybe_existing {
+            return Ok(AddedOrPresent::AlreadyPresent(existing));
+        }
+
+        let schema_id = max_schema_id + 1;
+
+        // TODO: use for updates
+        let _highest_field_id = self.highest_field_id().max(schema.highest_field_id());
+
+        let schema = Arc::new(schema.into_builder().with_schema_id(schema_id).build()?);
+        let schema_id = schema.schema_id();
+        self.schemas.insert(schema_id, schema);
+        Ok(AddedOrPresent::Added(schema_id))
+    }
+
+    fn set_properties(&mut self, properties: HashMap<String, String>) {
+        self.properties.extend(properties);
+    }
+
+    fn remove_properties(&mut self, keys: HashSet<&String>) {
+        self.properties.retain(|k, _| !keys.contains(k));
+    }
+
+    fn assign_uuid(&mut self, uuid: Uuid) {
+        self.view_uuid = uuid;
+    }
+
+    fn highest_field_id(&self) -> i32 {
+        self.schemas
+            .values()
+            .map(|s| s.highest_field_id())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Returns view history.
     #[inline]
     pub fn history(&self) -> &[ViewVersionLog] {
@@ -145,13 +260,165 @@ impl ViewMetadata {
     }
 }
 
-/// Manipulating view metadata.
-pub struct ViewMetadataBuilder(ViewMetadata);
+/// `ViewVersion` wrapper to allow appending a new version or replacing the current version.
+///
+/// `Append` will add a new version without setting it as the current version.
+/// `AsCurrent` will add a new version and set it as the current version.
+#[derive(Debug, Clone)]
+pub enum AppendViewVersion {
+    /// Append a new version to the view.
+    Append(ViewVersion),
+    /// Replace the current version with a new version.
+    AsCurrent(ViewVersion),
+}
 
+enum AddedOrPresent<T> {
+    Added(T),
+    AlreadyPresent(T),
+}
+
+impl AsRef<ViewVersion> for AppendViewVersion {
+    fn as_ref(&self) -> &ViewVersion {
+        match self {
+            AppendViewVersion::Append(v) => v,
+            AppendViewVersion::AsCurrent(v) => v,
+        }
+    }
+}
+
+impl AsMut<ViewVersion> for AppendViewVersion {
+    fn as_mut(&mut self) -> &mut ViewVersion {
+        match self {
+            AppendViewVersion::Append(v) => v,
+            AppendViewVersion::AsCurrent(v) => v,
+        }
+    }
+}
+
+// Checks whether the given view versions would behave the same while ignoring the view version
+// id, the creation timestamp, and the operation.
+fn is_same_version(a: &ViewVersion, b: &ViewVersion) -> bool {
+    a.summary == b.summary
+        && a.representations == b.representations
+        && a.default_catalog == b.default_catalog
+        && a.default_namespace == b.default_namespace
+        && a.schema_id == b.schema_id
+}
+
+fn is_same_schema(a: &Schema, b: &Schema) -> bool {
+    a.as_struct() == b.as_struct()
+        && a.identifier_field_ids().collect::<HashSet<_>>()
+            == b.identifier_field_ids().collect::<HashSet<_>>()
+}
+
+/// Manipulating view metadata.
+pub struct ViewMetadataBuilder {
+    previous: ViewVersionRef,
+    metadata: ViewMetadata,
+    last_added_version: Option<ViewVersionId>,
+    last_added_schema: Option<i32>,
+    added_versions: usize, // TODO: Update tracking needed?
+}
+
+// TODO: these errors don't match at all
 impl ViewMetadataBuilder {
     /// Creates a new view metadata builder from the given view metadata.
     pub fn new(origin: ViewMetadata) -> Self {
-        Self(origin)
+        Self {
+            previous: origin.current_version().clone(),
+            metadata: origin,
+            last_added_version: None,
+            last_added_schema: None,
+            added_versions: 0,
+        }
+    }
+
+    /// Adds a new version to the view metadata.
+    ///
+    /// If the schema id is -1, the schema id of the last added schema will be used.
+    /// If the view version matches an existing version (ignoring the version id, creation timestamp, and operation),
+    /// a new version will not be added.
+    ///
+    /// # Errors
+    /// - If the schema id is -1 and no schema was added before, an error will be returned.
+    /// - If the view version contains multiple queries for the same dialect, an error will be returned.
+    /// - If the view version is already present, an error will be returned.
+    pub fn add_version(mut self, mut version: AppendViewVersion) -> Result<Self> {
+        let schema_id = version.as_ref().schema_id();
+        if schema_id == -1 {
+            version.as_mut().schema_id = self.last_added_schema.ok_or(Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Cannot set schema to last added without adding schema before.",
+            ))?;
+        }
+
+        let (_, maybe_err) = version.as_ref().representations().iter().fold_while((HashSet::new(), None), |(mut dialects, _), r| match r {
+            ViewRepresentation::Sql(sql) => {
+                if dialects.insert(sql.dialect.as_str()) {
+                    FoldWhile::Continue((dialects, None))
+                } else {
+                    FoldWhile::Done((dialects, Some(Error::new(
+                        crate::ErrorKind::DataInvalid,
+                        format!("Invalid view version: Cannot add multiple queries for dialect {}", sql.dialect),
+                    ))))
+                }
+            }
+        }).into_inner();
+        if let Some(err) = maybe_err {
+            return Err(err);
+        }
+
+        match version {
+            AppendViewVersion::Append(version) => {
+                self.add_and_maybe_set_last_version(version)?;
+                Ok(self)
+            }
+            AppendViewVersion::AsCurrent(version) => {
+                let version_id = version.version_id();
+                self.add_and_maybe_set_last_version(version)?;
+                Ok(self.set_current_version_id(version_id)?)
+            }
+        }
+    }
+
+    /// Adds a new schema to the view metadata.
+    ///
+    /// If the schema matches an existing schema, a new schema will not be added.
+    /// Any set schema_id will not be respected, it will be set to the next available id.
+    pub fn add_schema(mut self, schema: Schema) -> Result<Self> {
+        match self.metadata.add_schema(schema)? {
+            AddedOrPresent::Added(added) => {
+                self.last_added_schema = Some(added);
+            }
+            AddedOrPresent::AlreadyPresent(_) => {}
+        };
+        Ok(self)
+    }
+
+    fn add_and_maybe_set_last_version(&mut self, version: ViewVersion) -> Result<()> {
+        match self.metadata.add_version(version)? {
+            AddedOrPresent::Added(added) => {
+                self.added_versions += 1;
+                self.last_added_version = Some(added);
+            }
+            AddedOrPresent::AlreadyPresent(_) => {}
+        };
+        Ok(())
+    }
+
+    /// Sets the current version id.
+    pub fn set_current_version_id(mut self, current_version_id: ViewVersionId) -> Result<Self> {
+        if current_version_id == -1 {
+            if let Some(last_added_version) = self.last_added_version {
+                return self.set_current_version_id(last_added_version);
+            }
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Cannot set current version to last added without adding version before.",
+            ));
+        }
+        self.metadata.set_current_version_id(current_version_id)?;
+        Ok(self)
     }
 
     /// Creates a new view metadata builder from the given view creation.
@@ -185,27 +452,153 @@ impl ViewMetadataBuilder {
             location,
             current_version_id: initial_version_id,
             versions,
-            version_log: Vec::new(),
+            version_log: vec![ViewVersionLog::now(initial_version_id)],
             schemas: HashMap::from_iter(vec![(schema.schema_id(), Arc::new(schema))]),
             properties,
         };
 
-        Ok(Self(view_metadata))
+        Ok(Self {
+            previous: view_metadata.current_version().clone(),
+            metadata: view_metadata,
+            last_added_version: None,
+            last_added_schema: None,
+            added_versions: 1,
+        })
     }
 
     /// Changes uuid of view metadata.
-    pub fn assign_uuid(mut self, uuid: Uuid) -> Result<Self> {
-        self.0.view_uuid = uuid;
-        Ok(self)
+    pub fn assign_uuid(mut self, uuid: Uuid) -> Self {
+        self.metadata.assign_uuid(uuid);
+        self
+    }
+
+    /// Updates view properties, replacing existing keys, leaving old entries.
+    pub fn set_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.metadata.set_properties(properties);
+        self
+    }
+
+    /// Removes view properties by keys.
+    pub fn remove_properties(mut self, keys: HashSet<&String>) -> Self {
+        self.metadata.remove_properties(keys);
+        self
     }
 
     /// Returns the new view metadata after changes.
-    pub fn build(self) -> Result<ViewMetadata> {
-        Ok(self.0)
+    pub fn build(mut self) -> Result<ViewMetadata> {
+        if self.metadata.versions.is_empty() {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Cannot create view metadata without versions.",
+            ));
+        }
+
+        if self
+            .metadata
+            .properties()
+            .get(REPLACE_DROP_DIALECT_ALLOWED)
+            .map(|s| s == "true")
+            .unwrap_or(REPLACE_DROP_DIALECT_ALLOWED_DEFAULT)
+        {
+            check_if_dialect_is_dropped(
+                self.previous.as_ref(),
+                self.metadata.current_version().as_ref(),
+            )?;
+        }
+
+        let history_size = self
+            .metadata
+            .properties()
+            .get(VERSION_HISTORY_SIZE)
+            .map(|s| {
+                s.parse().map_err(|_| {
+                    crate::Error::new(
+                        crate::ErrorKind::DataInvalid,
+                        format!(
+                            "{} must be positive int but was: {}",
+                            VERSION_HISTORY_SIZE, s
+                        ),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(VERSION_HISTORY_SIZE_DEFAULT);
+
+        if history_size < 1 {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!(
+                    "{} must be positive int but was: {}",
+                    VERSION_HISTORY_SIZE, history_size
+                ),
+            ));
+        }
+
+        if self.metadata.versions.len() > history_size.max(self.added_versions) {
+            let mut versions = self.metadata.versions.keys().copied().collect::<Vec<_>>();
+            versions.sort();
+            let to_remove = versions
+                .iter()
+                .take(versions.len() - history_size)
+                .copied()
+                .collect::<HashSet<_>>();
+            self.metadata
+                .version_log
+                .retain(|log| !to_remove.contains(&log.version_id));
+            self.metadata
+                .versions
+                .retain(|version_id, _| !to_remove.contains(version_id));
+        }
+        Ok(self.metadata)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+fn check_if_dialect_is_dropped(previous: &ViewVersion, current: &ViewVersion) -> Result<()> {
+    let base_dialects = sql_dialects_for(previous);
+    let updated_dialects = sql_dialects_for(current);
+
+    if !updated_dialects.is_superset(&base_dialects) {
+        return Err(crate::Error::new(
+            crate::ErrorKind::DataInvalid,
+            format!(
+                "Cannot replace view due to loss of view dialects ({REPLACE_DROP_DIALECT_ALLOWED}=false):\nPrevious dialects: {:?}\nNew dialects: {:?}",
+                base_dialects,
+                updated_dialects
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sql_dialects_for(view_version: &ViewVersion) -> HashSet<String> {
+    view_version
+        .representations()
+        .iter()
+        .map(|repr| match repr {
+            ViewRepresentation::Sql(sql) => sql.dialect.to_lowercase(),
+        })
+        .collect()
+}
+
+/// View metadata properties.
+pub mod view_properties {
+    /// View metadata version history size
+    pub const VERSION_HISTORY_SIZE: &str = "version.history.num-entries";
+    /// Default view metadata version history size
+    pub const VERSION_HISTORY_SIZE_DEFAULT: usize = 10;
+    /// View metadata compression codec
+    pub const METADATA_COMPRESSION: &str = "write.metadata.compression-codec";
+    /// Default view metadata compression codec
+    pub const METADATA_COMPRESSION_DEFAULT: &str = "gzip";
+    /// View metadata comment
+    pub const COMMENT: &str = "comment";
+    /// View metadata replace drop dialect allowed
+    pub const REPLACE_DROP_DIALECT_ALLOWED: &str = "replace.drop-dialect.allowed";
+    /// Default view metadata replace drop dialect allowed
+    pub const REPLACE_DROP_DIALECT_ALLOWED_DEFAULT: bool = false;
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "kebab-case")]
 /// A log of when each snapshot was made.
 pub struct ViewVersionLog {
@@ -222,6 +615,14 @@ impl ViewVersionLog {
         Self {
             version_id,
             timestamp_ms: timestamp,
+        }
+    }
+
+    /// Returns a new ViewVersionLog with the current timestamp
+    pub fn now(version_id: ViewVersionId) -> Self {
+        Self {
+            version_id,
+            timestamp_ms: Utc::now().timestamp_millis(),
         }
     }
 
@@ -654,7 +1055,7 @@ mod tests {
         let metadata = get_test_view_metadata("ViewMetadataV1Valid.json");
         let metadata_builder = ViewMetadataBuilder::new(metadata);
         let uuid = Uuid::new_v4();
-        let metadata = metadata_builder.assign_uuid(uuid).unwrap().build().unwrap();
+        let metadata = metadata_builder.assign_uuid(uuid).build().unwrap();
         assert_eq!(metadata.uuid(), uuid);
     }
 

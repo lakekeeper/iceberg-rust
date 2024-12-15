@@ -18,12 +18,16 @@
 use std::sync::Arc;
 
 use opendal::layers::RetryLayer;
+#[cfg(feature = "storage-azdls")]
+use opendal::services::AzdlsConfig;
 #[cfg(feature = "storage-gcs")]
 use opendal::services::GcsConfig;
 #[cfg(feature = "storage-s3")]
 use opendal::services::S3Config;
 use opendal::{Operator, Scheme};
 
+#[cfg(feature = "storage-azdls")]
+use super::storage_azdls;
 use super::FileIOBuilder;
 use crate::{Error, ErrorKind};
 
@@ -45,6 +49,11 @@ pub(crate) enum Storage {
         client: reqwest::Client,
         config: Arc<S3Config>,
     },
+    #[cfg(feature = "storage-azdls")]
+    Azdls {
+        config: Arc<AzdlsConfig>,
+        client: reqwest::Client,
+    },
     #[cfg(feature = "storage-gcs")]
     Gcs { config: Arc<GcsConfig> },
 }
@@ -52,7 +61,7 @@ pub(crate) enum Storage {
 impl Storage {
     /// Convert iceberg config to opendal config.
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
-        let (scheme_str, props) = file_io_builder.into_parts();
+        let (scheme_str, props, client) = file_io_builder.into_parts();
         let scheme = Self::parse_scheme(&scheme_str)?;
 
         match scheme {
@@ -63,14 +72,18 @@ impl Storage {
             #[cfg(feature = "storage-s3")]
             Scheme::S3 => Ok(Self::S3 {
                 scheme_str,
-                client: reqwest::Client::new(),
+                client: client.unwrap_or(reqwest::Client::new()),
                 config: super::s3_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-gcs")]
             Scheme::Gcs => Ok(Self::Gcs {
                 config: super::gcs_config_parse(props)?.into(),
             }),
-            // Update doc on [`FileIO`] when adding new schemes.
+            #[cfg(feature = "storage-azdls")]
+            Scheme::Azdls => Ok(Self::Azdls {
+                config: storage_azdls::azdls_config_parse(props)?.into(),
+                client: client.unwrap_or(reqwest::Client::new()),
+            }),
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!("Constructing file io from scheme: {scheme} not supported now",),
@@ -147,10 +160,18 @@ impl Storage {
                     ))
                 }
             }
+            #[cfg(feature = "storage-azdls")]
+            Storage::Azdls { config, client } => {
+                let builder = opendal::Configurator::into_builder(config.as_ref().clone())
+                    .http_client(opendal::raw::HttpClient::with(client.clone()));
+                let op = Operator::new(builder)?.finish();
+                Ok((op, &path["azdls://".len()..]))
+            }
             #[cfg(all(
                 not(feature = "storage-s3"),
                 not(feature = "storage-fs"),
-                not(feature = "storage-gcs")
+                not(feature = "storage-gcs"),
+                not(feature = "storage-azdls")
             ))]
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -172,6 +193,7 @@ impl Storage {
             "file" | "" => Ok(Scheme::Fs),
             "s3" | "s3a" => Ok(Scheme::S3),
             "gs" | "gcs" => Ok(Scheme::Gcs),
+            "azdls" => Ok(Scheme::Azdls),
             s => Ok(s.parse::<Scheme>()?),
         }
     }

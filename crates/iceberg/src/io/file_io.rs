@@ -20,7 +20,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use opendal::Operator;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use opendal::{Entry, Operator};
 use url::Url;
 
 use super::storage::Storage;
@@ -100,6 +102,36 @@ impl FileIO {
         Ok(op.remove_all(relative_path).await?)
     }
 
+    /// Lists all files in the directory.
+    pub async fn list(&self, path: impl AsRef<str>, recursive: bool) -> Result<Vec<Entry>> {
+        let (op, relative_path) = self.inner.create_operator(&path)?;
+        Ok(op.list_with(relative_path).recursive(recursive).await?)
+    }
+
+    /// Lists all files in the directory with pagination.
+    pub async fn list_paginated(
+        &self,
+        path: impl AsRef<str>,
+        recursive: bool,
+        page_size: usize,
+    ) -> Result<BoxStream<Result<Vec<Entry>>>> {
+        let path = path.as_ref().to_string();
+        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let lister = op
+            .lister_with(relative_path)
+            .recursive(recursive)
+            .limit(page_size)
+            .await?;
+        Ok(lister
+            .chunks(page_size)
+            .map(|i| {
+                i.into_iter()
+                    .map(|i| i.map_err(crate::Error::from))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .boxed())
+    }
+
     /// Check file exists.
     ///
     /// # Arguments
@@ -107,7 +139,7 @@ impl FileIO {
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn exists(&self, path: impl AsRef<str>) -> Result<bool> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
-        Ok(op.exists(relative_path).await?)
+        Ok(op.is_exist(relative_path).await?)
     }
 
     /// Creates input file.
@@ -152,6 +184,7 @@ pub struct FileIOBuilder {
     scheme_str: Option<String>,
     /// Arguments for operator.
     props: HashMap<String, String>,
+    pub(crate) client: Option<reqwest::Client>,
 }
 
 impl FileIOBuilder {
@@ -161,6 +194,7 @@ impl FileIOBuilder {
         Self {
             scheme_str: Some(scheme_str.to_string()),
             props: HashMap::default(),
+            client: None,
         }
     }
 
@@ -169,14 +203,15 @@ impl FileIOBuilder {
         Self {
             scheme_str: None,
             props: HashMap::default(),
+            client: None,
         }
     }
 
     /// Fetch the scheme string.
     ///
     /// The scheme_str will be empty if it's None.
-    pub fn into_parts(self) -> (String, HashMap<String, String>) {
-        (self.scheme_str.unwrap_or_default(), self.props)
+    pub fn into_parts(self) -> (String, HashMap<String, String>, Option<reqwest::Client>) {
+        (self.scheme_str.unwrap_or_default(), self.props, self.client)
     }
 
     /// Add argument for operator.
@@ -202,6 +237,12 @@ impl FileIOBuilder {
             builder: self,
             inner: Arc::new(storage),
         })
+    }
+
+    /// Set http client for file io.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = Some(client);
+        self
     }
 }
 
@@ -252,7 +293,10 @@ impl InputFile {
 
     /// Check if file exists.
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self.op.exists(&self.path[self.relative_path_pos..]).await?)
+        Ok(self
+            .op
+            .is_exist(&self.path[self.relative_path_pos..])
+            .await?)
     }
 
     /// Fetch and returns metadata of file.
@@ -331,7 +375,10 @@ impl OutputFile {
 
     /// Checks if file exists.
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self.op.exists(&self.path[self.relative_path_pos..]).await?)
+        Ok(self
+            .op
+            .is_exist(&self.path[self.relative_path_pos..])
+            .await?)
     }
 
     /// Converts into [`InputFile`].
