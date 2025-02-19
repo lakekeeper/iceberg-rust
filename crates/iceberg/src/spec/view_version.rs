@@ -26,10 +26,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-use super::view_metadata::ViewVersionLog;
 use crate::catalog::NamespaceIdent;
 use crate::error::{timestamp_ms_to_utc, Result};
-use crate::spec::{SchemaId, SchemaRef, ViewMetadata};
+use crate::spec::{SchemaId, SchemaRef, ViewMetadata, ViewVersionLog};
 use crate::{Error, ErrorKind};
 
 /// Reference to [`ViewVersion`].
@@ -44,20 +43,20 @@ pub type ViewVersionId = i32;
 /// A view versions represents the definition of a view at a specific point in time.
 pub struct ViewVersion {
     /// A unique long ID
-    version_id: ViewVersionId,
+    pub version_id: ViewVersionId,
     /// ID of the schema for the view version
-    schema_id: SchemaId,
+    pub schema_id: SchemaId,
     /// Timestamp when the version was created (ms from epoch)
-    timestamp_ms: i64,
+    pub timestamp_ms: i64,
     /// A string to string map of summary metadata about the version
-    summary: HashMap<String, String>,
+    pub summary: HashMap<String, String>,
     /// A list of representations for the view definition.
-    representations: ViewRepresentations,
+    pub representations: ViewRepresentations,
     /// Catalog name to use when a reference in the SELECT does not contain a catalog
     #[builder(default = None)]
-    default_catalog: Option<String>,
+    pub default_catalog: Option<String>,
     /// Namespace to use when a reference in the SELECT is a single identifier
-    default_namespace: NamespaceIdent,
+    pub default_namespace: NamespaceIdent,
 }
 
 impl ViewVersion {
@@ -131,10 +130,15 @@ impl ViewVersion {
 }
 
 /// A list of view representations.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Default)]
 pub struct ViewRepresentations(pub(crate) Vec<ViewRepresentation>);
 
 impl ViewRepresentations {
+    /// Create a new list of view representations.
+    pub fn new(representations: Vec<ViewRepresentation>) -> Self {
+        Self(representations)
+    }
+
     #[inline]
     /// Get the number of representations
     pub fn len(&self) -> usize {
@@ -160,6 +164,41 @@ impl IntoIterator for ViewRepresentations {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
+    }
+}
+
+/// A builder for [`ViewRepresentations`].
+pub struct ViewRepresentationsBuilder(Vec<ViewRepresentation>);
+
+impl ViewRepresentationsBuilder {
+    /// Create a new builder.
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Add a representation to the list.
+    pub fn add_representation(mut self, representation: ViewRepresentation) -> Self {
+        self.0.push(representation);
+        self
+    }
+
+    /// Add a SQL representation to the list.
+    pub fn add_sql_representation(self, sql: String, dialect: String) -> Self {
+        self.add_representation(ViewRepresentation::Sql(SqlViewRepresentation {
+            sql,
+            dialect,
+        }))
+    }
+
+    /// Build the list of representations.
+    pub fn build(self) -> ViewRepresentations {
+        ViewRepresentations(self.0)
+    }
+}
+
+impl Default for ViewRepresentationsBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

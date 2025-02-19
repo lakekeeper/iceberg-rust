@@ -30,11 +30,12 @@ keywords = ["iceberg"]
 
 [features]
 default = ["storage-memory", "storage-fs", "storage-s3", "tokio"]
-storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-gcs"]
+storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-azdls", "storage-gcs"]
 
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 storage-s3 = ["opendal/services-s3"]
+storage-azdls = ["opendal/services-azdls"]
 storage-gcs = ["opendal/services-gcs"]
 
 async-std = ["dep:async-std"]
@@ -66,7 +67,7 @@ moka = { version = "0.12.10", features = ["future"] }
 murmur3 = { workspace = true }
 num-bigint = { workspace = true }
 once_cell = { workspace = true }
-opendal = { workspace = true }
+opendal = { workspace = true, features = ["services-s3"] }
 ordered-float = { workspace = true }
 parquet = { workspace = true, features = ["async"] }
 paste = { workspace = true }
@@ -79,7 +80,8 @@ serde_derive = { workspace = true }
 serde_json = { workspace = true }
 serde_repr = { workspace = true }
 serde_with = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["sync"] }
+strum = { workspace = true }
+tokio = { workspace = true, optional = true }
 typed-builder = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
