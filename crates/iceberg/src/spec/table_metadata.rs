@@ -140,8 +140,10 @@ pub const MIN_FORMAT_VERSION_ROW_LINEAGE: FormatVersion = FormatVersion::V3;
 /// Reference to [`TableMetadata`].
 pub type TableMetadataRef = Arc<TableMetadata>;
 
-#[derive(Debug, PartialEq, Deserialize, Eq, Clone)]
+#[derive(Debug, PartialEq, Deserialize, Eq, Clone, typed_builder::TypedBuilder)]
 #[serde(try_from = "TableMetadataEnum")]
+#[builder(builder_type(name=TableMetadataDeclarativeBuilder, doc="Build a new [`TableMetadata`] in a declarative way. For imperative operations (e.g. `add_snapshot`) and creating new TableMetadata, use [`TableMetadataBuilder`] instead."))]
+#[builder(build_method(name = build_unchecked))]
 /// Fields for the version 2 of the table metadata.
 ///
 /// We assume that this data structure is always valid, so we will panic when invalid error happens.
@@ -361,6 +363,12 @@ impl TableMetadata {
     /// Returns spec id of the "current" partition spec.
     pub fn default_partition_spec_id(&self) -> i32 {
         self.default_spec.spec_id()
+    }
+
+    #[inline]
+    /// Returns snapshot references.
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
     }
 
     /// Returns all snapshots

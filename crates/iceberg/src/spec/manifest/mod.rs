@@ -45,7 +45,7 @@ pub struct Manifest {
 
 impl Manifest {
     /// Parse manifest metadata and entries from bytes of avro file.
-    pub(crate) fn try_from_avro_bytes(bs: &[u8]) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
+    pub fn try_from_avro_bytes(bs: &[u8]) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
         let reader = AvroReader::new(bs)?;
 
         // Parse manifest metadata

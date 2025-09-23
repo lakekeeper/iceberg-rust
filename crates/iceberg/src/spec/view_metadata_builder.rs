@@ -33,6 +33,7 @@ use crate::ViewCreation;
 use crate::catalog::ViewUpdate;
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::is_truthy;
+use crate::spec::ViewRepresentations;
 
 /// Manipulating view metadata.
 ///
@@ -303,7 +304,7 @@ impl ViewMetadataBuilder {
             ));
         }
 
-        require_unique_dialects(&view_version)?;
+        require_unique_dialects(view_version.representations())?;
 
         // The `TableMetadataBuilder` uses these checks in multiple places - also in Java.
         // If we think delayed requests are a problem, I think we should also add it here.
@@ -615,9 +616,9 @@ fn lowercase_sql_dialects_for(view_version: &ViewVersion) -> HashSet<String> {
         .collect()
 }
 
-pub(super) fn require_unique_dialects(view_version: &ViewVersion) -> Result<()> {
-    let mut seen_dialects = HashSet::with_capacity(view_version.representations().len());
-    for repr in view_version.representations().iter() {
+pub(super) fn require_unique_dialects(view_version: &ViewRepresentations) -> Result<()> {
+    let mut seen_dialects = HashSet::with_capacity(view_version.len());
+    for repr in view_version.iter() {
         match repr {
             ViewRepresentation::Sql(sql_repr) => {
                 if !seen_dialects.insert(sql_repr.dialect.to_lowercase()) {
@@ -1641,7 +1642,7 @@ mod test {
             .with_default_namespace(NamespaceIdent::new("default".to_string()))
             .build();
 
-        assert!(require_unique_dialects(&view_version).is_err());
+        assert!(require_unique_dialects(view_version.representations()).is_err());
 
         let view_version = ViewVersion::builder()
             .with_version_id(0)
@@ -1660,6 +1661,6 @@ mod test {
             .with_default_namespace(NamespaceIdent::new("default".to_string()))
             .build();
 
-        assert!(require_unique_dialects(&view_version).is_ok());
+        assert!(require_unique_dialects(view_version.representations()).is_ok());
     }
 }
