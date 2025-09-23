@@ -545,7 +545,7 @@ impl TableMetadata {
     /// We run this method after json deserialization.
     /// All constructors for `TableMetadata` which are part of `iceberg-rust`
     /// should return normalized `TableMetadata`.
-    pub(super) fn try_normalize(&mut self) -> Result<&mut Self> {
+    pub fn try_normalize(&mut self) -> Result<&mut Self> {
         self.validate_current_schema()?;
         self.normalize_current_snapshot()?;
         self.construct_refs();
