@@ -90,6 +90,7 @@ tokio = { workspace = true, optional = false, features = ["sync"] }
 typed-builder = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+valuable = { workspace = true, features = ["derive"] }
 zstd = { workspace = true }
 
 [dev-dependencies]
