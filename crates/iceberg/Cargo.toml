@@ -39,7 +39,6 @@ storage-memory = ["opendal/services-memory"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3", "reqsign"]
 
-
 [dependencies]
 anyhow = { workspace = true }
 apache-avro = { workspace = true }
@@ -88,17 +87,18 @@ typed-builder = { workspace = true }
 typetag = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+valuable = { workspace = true, features = ["derive"] }
 zstd = { workspace = true }
 
 [dev-dependencies]
 expect-test = { workspace = true }
 iceberg_test_utils = { path = "../test_utils", features = ["tests"] }
+minijinja = { workspace = true }
 mockall = { workspace = true }
 pretty_assertions = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
-minijinja = { workspace = true }
 
 [package.metadata.cargo-machete]
 # These dependencies are added to ensure minimal dependency version
