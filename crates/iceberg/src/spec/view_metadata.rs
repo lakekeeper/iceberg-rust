@@ -92,6 +92,7 @@ pub struct ViewMetadataParts {
     /// A list of known versions of the view
     pub versions: HashMap<ViewVersionId, ViewVersionRef>,
     /// A list of version log entries with the timestamp and version-id for every
+    /// change to current-version-id
     pub version_log: Vec<ViewVersionLog>,
     /// A list of schemas, stored as objects with schema-id.
     pub schemas: HashMap<SchemaId, SchemaRef>,
