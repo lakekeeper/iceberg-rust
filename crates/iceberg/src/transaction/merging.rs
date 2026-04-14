@@ -327,12 +327,12 @@ impl MergingSnapshotProducer {
         // Create the SnapshotProducer first so we can use its snapshot_id
         // for new manifests. This ensures the manifest list writer can
         // assign sequence numbers to manifests from this snapshot.
-        let snapshot_producer = SnapshotProducer::new(
-            table,
-            self.commit_uuid,
-            HashMap::new(),
-            self.added_data_files.clone(),
-        );
+        let snapshot_producer = SnapshotProducer::builder()
+            .with_table(table)
+            .with_commit_uuid(self.commit_uuid)
+            .with_snapshot_properties(HashMap::new())
+            .with_added_data_files(self.added_data_files.clone())
+            .build();
         snapshot_producer.validate_added_data_files()?;
         snapshot_producer.validate_duplicate_files().await?;
         let snapshot_id = snapshot_producer.snapshot_id;

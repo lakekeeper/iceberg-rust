@@ -21,14 +21,15 @@ use std::ops::RangeFrom;
 
 use futures::TryStreamExt;
 use futures::stream::FuturesUnordered;
+use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
 use crate::error::{Result, invalid_data};
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, update_snapshot_summaries,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
+    ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
+    StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -85,7 +86,6 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn operation(&self) -> Operation;
 
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
-    #[allow(unused)]
     fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer,
@@ -136,38 +136,34 @@ pub(crate) trait ManifestProcess: Send + Sync {
     ) -> Vec<ManifestFile>;
 }
 
+#[derive(TypedBuilder)]
+#[builder(field_defaults(setter(prefix = "with_")))]
 pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
+    #[builder(setter(skip), default_code = "generate_unique_snapshot_id(table)")]
     pub(crate) snapshot_id: i64,
     commit_uuid: Uuid,
+    #[builder(default)]
     snapshot_properties: HashMap<String, String>,
+    #[builder(default)]
     added_data_files: Vec<DataFile>,
+    #[builder(default)]
+    added_delete_files: Vec<DataFile>,
+    #[builder(default)]
+    pub deleted_data_files: Vec<DataFile>,
+    #[builder(default)]
+    pub deleted_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
+    #[builder(setter(skip), default_code = "(0..)")]
     manifest_counter: RangeFrom<u64>,
 }
 
 impl<'a> SnapshotProducer<'a> {
-    pub(crate) fn new(
-        table: &'a Table,
-        commit_uuid: Uuid,
-        snapshot_properties: HashMap<String, String>,
-        added_data_files: Vec<DataFile>,
-    ) -> Self {
-        Self {
-            table,
-            snapshot_id: generate_unique_snapshot_id(table),
-            commit_uuid,
-            snapshot_properties,
-            added_data_files,
-            manifest_counter: (0..),
-        }
-    }
-
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
         for data_file in &self.added_data_files {
-            if data_file.content_type() != crate::spec::DataContentType::Data {
+            if data_file.content_type() != DataContentType::Data {
                 return Err(invalid_data!(
                     "Only data content type is allowed in added data files, but {} is {:?}",
                     data_file.file_path,
@@ -241,6 +237,7 @@ impl<'a> SnapshotProducer<'a> {
     pub(crate) fn new_manifest_writer(
         &mut self,
         content: ManifestContentType,
+        spec_id: i32,
     ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}-m{}.{}",
@@ -253,7 +250,8 @@ impl<'a> SnapshotProducer<'a> {
         let partition_spec = self
             .table
             .metadata()
-            .default_partition_spec()
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| invalid_data!("Partition spec with id: {spec_id} is not found!"))?
             .as_ref()
             .clone();
         let schema = self.table.metadata().current_schema().clone();
@@ -312,8 +310,15 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     // Write manifest file for added data files and return the ManifestFile for ManifestList.
-    async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
-        let added_data_files = std::mem::take(&mut self.added_data_files);
+    async fn write_added_manifest(
+        &mut self,
+        content_type: ManifestContentType,
+    ) -> Result<ManifestFile> {
+        let added_data_files = match content_type {
+            ManifestContentType::Data => std::mem::take(&mut self.added_data_files),
+            ManifestContentType::Deletes => std::mem::take(&mut self.added_delete_files),
+        };
+
         if added_data_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
@@ -335,35 +340,67 @@ impl<'a> SnapshotProducer<'a> {
                 builder.build()
             }
         });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        let mut writer = self.new_manifest_writer(
+            content_type,
+            self.table.metadata().default_partition_spec_id(),
+        )?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
         writer.write_manifest_file().await
     }
 
-    // Write a data manifest containing DELETED-status entries and return the ManifestFile.
-    // Note: this is NOT an Iceberg "delete manifest" (content=Deletes for MoR delete files).
-    // It is a data manifest (content=Data) whose entries carry ManifestStatus::Deleted to
-    // record which data files were removed in Copy-on-Write mode.
-    async fn write_manifest_with_deleted_entries(
+    async fn write_deleted_manifest(
         &mut self,
-        delete_entries: Vec<ManifestEntry>,
-    ) -> Result<ManifestFile> {
-        if delete_entries.is_empty() {
-            return Err(Error::new(
-                ErrorKind::PreconditionFailed,
-                "No delete entries found when writing a delete manifest file",
-            ));
-        }
+        deleted_entries: Vec<ManifestEntry>,
+    ) -> Result<Vec<ManifestFile>> {
+        if deleted_entries.is_empty() {
+            Ok(Vec::new())
+        } else {
+            // Initialize partition groups
+            let mut partition_groups = HashMap::new();
+            for entry in deleted_entries {
+                partition_groups
+                    .entry(entry.data_file().partition_spec_id)
+                    .or_insert_with(Vec::new)
+                    .push(entry);
+            }
 
-        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
-        for entry in delete_entries {
-            // Use add_delete_entry() to preserve Deleted status instead of add_entry()
-            // which always overwrites status to Added
-            writer.add_delete_entry(entry)?;
+            // Write manifest files for each spec-entries pair
+            let mut deleted_manifests = Vec::new();
+            for (spec_id, entries) in partition_groups {
+                let mut data_manifest_writer: Option<ManifestWriter> = None;
+                let mut delete_manifest_writer: Option<ManifestWriter> = None;
+                for entry in entries {
+                    match entry.data_file().content_type() {
+                        DataContentType::Data => data_manifest_writer
+                            .get_or_insert(
+                                self.new_manifest_writer(ManifestContentType::Data, spec_id)?,
+                            )
+                            .add_entry(entry)?,
+                        DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
+                            delete_manifest_writer
+                                .get_or_insert(
+                                    self.new_manifest_writer(
+                                        ManifestContentType::Deletes,
+                                        spec_id,
+                                    )?,
+                                )
+                                .add_delete_entry(entry)?
+                        }
+                    }
+                }
+
+                if let Some(writer) = data_manifest_writer {
+                    deleted_manifests.push(writer.write_manifest_file().await?);
+                };
+                if let Some(writer) = delete_manifest_writer {
+                    deleted_manifests.push(writer.write_manifest_file().await?);
+                };
+            }
+
+            Ok(deleted_manifests)
         }
-        writer.write_manifest_file().await
     }
 
     /// Creates new manifests for data files added or removed,
@@ -383,12 +420,15 @@ impl<'a> SnapshotProducer<'a> {
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
         if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.deleted_data_files.is_empty()
+            && self.deleted_delete_files.is_empty()
             && self.snapshot_properties.is_empty()
             && !has_delete_entries
         {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files, delete entries, or snapshot properties found when write a manifest file",
+                "No added data files, delete files, delete entries, or snapshot properties found when writing a manifest file",
             ));
         }
 
@@ -397,17 +437,19 @@ impl<'a> SnapshotProducer<'a> {
 
         // Process added entries.
         if !self.added_data_files.is_empty() {
-            let added_manifest = self.write_added_manifest().await?;
+            let added_manifest = self.write_added_manifest(ManifestContentType::Data).await?;
+            manifest_files.push(added_manifest);
+        }
+        if !self.added_delete_files.is_empty() {
+            let added_manifest = self
+                .write_added_manifest(ManifestContentType::Deletes)
+                .await?;
             manifest_files.push(added_manifest);
         }
 
         // Process delete entries.
-        if has_delete_entries {
-            let delete_manifest = self
-                .write_manifest_with_deleted_entries(delete_entries)
-                .await?;
-            manifest_files.push(delete_manifest);
-        }
+        let delete_manifests = self.write_deleted_manifest(delete_entries).await?;
+        manifest_files.extend(delete_manifests);
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)

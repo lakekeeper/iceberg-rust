@@ -353,7 +353,7 @@ impl ManifestWriter {
         Ok(())
     }
 
-    /// Add an file as existing manifest entry. The original data and file sequence numbers, snapshot ID,
+    /// Add a file as existing manifest entry. The original data and file sequence numbers, snapshot ID,
     /// which were assigned at commit, must be preserved when adding an existing entry.
     pub fn add_existing_file(
         &mut self,

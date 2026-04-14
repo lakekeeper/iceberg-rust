@@ -120,12 +120,12 @@ impl TransactionAction for RowDeltaAction {
             ));
         }
 
-        let snapshot_producer = SnapshotProducer::new(
-            table,
-            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            self.snapshot_properties.clone(),
-            self.added_data_files.clone(),
-        );
+        let snapshot_producer = SnapshotProducer::builder()
+            .with_table(table)
+            .with_commit_uuid(self.commit_uuid.unwrap_or_else(Uuid::now_v7))
+            .with_snapshot_properties(self.snapshot_properties.clone())
+            .with_added_data_files(self.added_data_files.clone())
+            .build();
 
         // Validate newly added data files (partition value type-checks, etc.).
         // removed_data_files are not re-validated: they are existing table files that were
@@ -221,7 +221,8 @@ impl SnapshotProduceOperation for RowDeltaOperation {
 
             // Rewrite: deleted files → DELETED (new snapshot_id, original seq nums preserved),
             // surviving files → EXISTING (all original fields preserved).
-            let mut writer = snapshot_produce.new_manifest_writer(ManifestContentType::Data)?;
+            let mut writer = snapshot_produce
+                .new_manifest_writer(ManifestContentType::Data, manifest_file.partition_spec_id)?;
             for entry in manifest.entries() {
                 if deleted_paths.contains(entry.data_file().file_path()) {
                     writer.add_delete_entry((**entry).clone())?;
