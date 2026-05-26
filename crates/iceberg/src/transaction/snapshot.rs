@@ -322,7 +322,7 @@ impl<'a> SnapshotProducer<'a> {
         if added_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files found when write an added manifest file",
+                "No added files found when write an added manifest file",
             ));
         }
 
@@ -350,57 +350,55 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    // Write manifest files for deleted manifest entries
     async fn write_deleted_manifest(
         &mut self,
         deleted_entries: Vec<ManifestEntry>,
     ) -> Result<Vec<ManifestFile>> {
         if deleted_entries.is_empty() {
-            Ok(Vec::new())
-        } else {
-            // Initialize partition groups
-            let mut partition_groups = HashMap::new();
-            for entry in deleted_entries {
-                partition_groups
-                    .entry(entry.data_file().partition_spec_id)
-                    .or_insert_with(Vec::new)
-                    .push(entry);
-            }
+            return Ok(Vec::new());
+        }
 
-            // Write manifest files for each spec-entries pair
-            let mut deleted_manifests = Vec::new();
-            for (spec_id, entries) in partition_groups {
-                let mut data_manifest_writer: Option<ManifestWriter> = None;
-                let mut delete_manifest_writer: Option<ManifestWriter> = None;
-                for entry in entries {
-                    match entry.data_file().content_type() {
-                        DataContentType::Data => data_manifest_writer
+        // Initialize partition groups
+        let mut partition_groups = HashMap::new();
+        for entry in deleted_entries {
+            partition_groups
+                .entry(entry.data_file().partition_spec_id)
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+
+        // Write manifest files for each spec-entries pair
+        let mut deleted_manifests = Vec::new();
+        for (spec_id, entries) in partition_groups {
+            let mut data_manifest_writer: Option<ManifestWriter> = None;
+            let mut delete_manifest_writer: Option<ManifestWriter> = None;
+            for entry in entries {
+                match entry.data_file().content_type() {
+                    DataContentType::Data => data_manifest_writer
+                        .get_or_insert(
+                            self.new_manifest_writer(ManifestContentType::Data, spec_id)?,
+                        )
+                        .add_delete_entry(entry)?,
+                    DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
+                        delete_manifest_writer
                             .get_or_insert(
-                                self.new_manifest_writer(ManifestContentType::Data, spec_id)?,
+                                self.new_manifest_writer(ManifestContentType::Deletes, spec_id)?,
                             )
-                            .add_delete_entry(entry)?,
-                        DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                            delete_manifest_writer
-                                .get_or_insert(
-                                    self.new_manifest_writer(
-                                        ManifestContentType::Deletes,
-                                        spec_id,
-                                    )?,
-                                )
-                                .add_delete_entry(entry)?
-                        }
+                            .add_delete_entry(entry)?
                     }
                 }
-
-                if let Some(writer) = data_manifest_writer {
-                    deleted_manifests.push(writer.write_manifest_file().await?);
-                };
-                if let Some(writer) = delete_manifest_writer {
-                    deleted_manifests.push(writer.write_manifest_file().await?);
-                };
             }
 
-            Ok(deleted_manifests)
+            if let Some(writer) = data_manifest_writer {
+                deleted_manifests.push(writer.write_manifest_file().await?);
+            };
+            if let Some(writer) = delete_manifest_writer {
+                deleted_manifests.push(writer.write_manifest_file().await?);
+            };
         }
+
+        Ok(deleted_manifests)
     }
 
     /// Creates new manifests for data files added or removed,
