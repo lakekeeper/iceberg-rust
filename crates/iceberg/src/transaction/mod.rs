@@ -57,6 +57,7 @@ mod append;
 mod expire_snapshots;
 mod merging;
 mod rewrite;
+mod rewrite_manifests;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -78,6 +79,7 @@ use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 pub use crate::transaction::rewrite::RewriteFilesAction;
+pub use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -161,6 +163,11 @@ impl Transaction {
     /// [`Operation::Replace`](crate::spec::Operation::Replace).
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new(self.table.metadata().current_snapshot_id())
+    }
+
+    /// Creates a rewrite-manifests (manifest compaction) action.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates replace sort order action.
