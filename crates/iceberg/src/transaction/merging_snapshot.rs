@@ -104,8 +104,8 @@ impl MergingSnapshotProducer {
             deleted_data_files: Vec::new(),
             deleted_delete_files: Vec::new(),
             data_sequence_number: None,
-            data_filter: ManifestFilterManager::default(),
-            delete_filter: ManifestFilterManager::default(),
+            data_filter: ManifestFilterManager::new(true),
+            delete_filter: ManifestFilterManager::new(true),
             cache: Mutex::new(MergingCache { snapshot_id: None }),
         }
     }
