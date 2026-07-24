@@ -295,4 +295,73 @@ mod tests {
         assert_eq!(op.msp.deleted_data_files().len(), 1);
         assert_eq!(op.msp.data_sequence_number(), Some(3));
     }
+
+    /// End-to-end: a rewrite with a pinned `data_sequence_number` must write the
+    /// output data file's manifest entry with that sequence number.
+    #[tokio::test]
+    async fn test_rewrite_preserves_pinned_data_sequence_number() {
+        use crate::memory::tests::new_memory_catalog;
+        use crate::transaction::tests::make_v3_minimal_table_in_catalog;
+        use crate::transaction::{ApplyTransactionAction, Transaction};
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // Seed one data file via a fast append; capture its data sequence number.
+        let original = file("data/original.parquet", DataContentType::Data);
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![original.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let start_snapshot_id = table.metadata().current_snapshot_id().unwrap();
+        let original_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        // Rewrite that file, pinning the output to the original (lower) seq.
+        let compacted = file("data/compacted.parquet", DataContentType::Data);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .set_starting_snapshot_id(start_snapshot_id)
+            .set_data_sequence_number(original_seq)
+            .add_files(vec![compacted])
+            .unwrap()
+            .delete_files(vec![original])
+            .unwrap();
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        // The new snapshot's sequence number is strictly higher (sanity), but
+        // the rewritten output entry must carry the PRESERVED (lower) one.
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert!(
+            snapshot.sequence_number() > original_seq,
+            "sanity: new snapshot seq {} should exceed the pinned seq {}",
+            snapshot.sequence_number(),
+            original_seq
+        );
+
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let mut asserted = false;
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                if entry.file_path() == "data/compacted.parquet" {
+                    assert_eq!(
+                        entry.sequence_number(),
+                        Some(original_seq),
+                        "rewritten output must preserve the pinned data sequence number, \
+                         not inherit the new snapshot's"
+                    );
+                    asserted = true;
+                }
+            }
+        }
+        assert!(
+            asserted,
+            "compacted output entry not found in the new snapshot's manifests"
+        );
+    }
 }

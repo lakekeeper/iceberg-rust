@@ -264,6 +264,7 @@ impl MergingSnapshotProducer {
             .commit_uuid(self.commit_uuid)
             .snapshot_properties(self.snapshot_properties.clone())
             .added_data_files(self.added_data_files.clone())
+            .data_sequence_number(self.data_sequence_number)
             .build();
 
         // 4. Delegate the write, forwarding the caller-supplied manifest process.

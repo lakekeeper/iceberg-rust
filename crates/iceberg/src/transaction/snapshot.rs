@@ -138,6 +138,10 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_properties: HashMap<String, String>,
     #[builder(default)]
     added_data_files: Vec<DataFile>,
+    /// When `Some`, added data files are written with this data sequence number
+    /// instead of inheriting the new snapshot's (higher) sequence number.
+    #[builder(default)]
+    data_sequence_number: Option<i64>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -353,12 +357,15 @@ impl<'a> SnapshotProducer<'a> {
 
         let snapshot_id = self.resolve_snapshot_id();
         let format_version = self.table.metadata().format_version();
+        let data_sequence_number = self.data_sequence_number;
         let manifest_entries = added_data_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
                 .data_file(data_file);
             if format_version == FormatVersion::V1 {
                 builder.snapshot_id(snapshot_id).build()
+            } else if let Some(seq_num) = data_sequence_number {
+                builder.sequence_number(seq_num).build()
             } else {
                 // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
                 // commit failed.
