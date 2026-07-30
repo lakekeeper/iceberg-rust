@@ -264,6 +264,13 @@ impl MergingSnapshotProducer {
             .commit_uuid(self.commit_uuid)
             .snapshot_properties(self.snapshot_properties.clone())
             .added_data_files(self.added_data_files.clone())
+            .removed_files(
+                self.deleted_data_files
+                    .iter()
+                    .chain(&self.deleted_delete_files)
+                    .cloned()
+                    .collect(),
+            )
             .data_sequence_number(self.data_sequence_number)
             .build();
 

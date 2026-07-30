@@ -364,4 +364,63 @@ mod tests {
             "compacted output entry not found in the new snapshot's manifests"
         );
     }
+
+    /// A rewrite must report what it removed, so the running `total-*` counters shrink.
+    #[tokio::test]
+    async fn test_rewrite_summary_accounts_for_removed_files() {
+        use crate::memory::tests::new_memory_catalog;
+        use crate::transaction::tests::make_v3_minimal_table_in_catalog;
+        use crate::transaction::{ApplyTransactionAction, Transaction};
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let first = file("data/first.parquet", DataContentType::Data);
+        let second = file("data/second.parquet", DataContentType::Data);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .add_data_files(vec![first.clone(), second.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let summary = &table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+        assert_eq!(summary.get("total-data-files").unwrap(), "2");
+        assert_eq!(summary.get("total-records").unwrap(), "2");
+        assert_eq!(summary.get("total-files-size").unwrap(), "200");
+
+        let start_snapshot_id = table.metadata().current_snapshot_id().unwrap();
+        let compacted = file("data/compacted.parquet", DataContentType::Data);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .set_starting_snapshot_id(start_snapshot_id)
+            .add_files(vec![compacted])
+            .unwrap()
+            .delete_files(vec![first, second])
+            .unwrap();
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let summary = &table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+
+        assert_eq!(summary.get("added-data-files").unwrap(), "1");
+        assert_eq!(summary.get("added-records").unwrap(), "1");
+        assert_eq!(summary.get("deleted-data-files").unwrap(), "2");
+        assert_eq!(summary.get("deleted-records").unwrap(), "2");
+        assert_eq!(summary.get("removed-files-size").unwrap(), "200");
+
+        // Two files of one record each, replaced by one file of one record.
+        assert_eq!(summary.get("total-data-files").unwrap(), "1");
+        assert_eq!(summary.get("total-records").unwrap(), "1");
+        assert_eq!(summary.get("total-files-size").unwrap(), "100");
+    }
 }

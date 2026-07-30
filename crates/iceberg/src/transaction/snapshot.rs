@@ -138,6 +138,9 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_properties: HashMap<String, String>,
     #[builder(default)]
     added_data_files: Vec<DataFile>,
+    /// Files this snapshot removes, both data and delete files
+    #[builder(default)]
+    removed_files: Vec<DataFile>,
     /// When `Some`, added data files are written with this data sequence number
     /// instead of inheriting the new snapshot's (higher) sequence number.
     #[builder(default)]
@@ -442,6 +445,22 @@ impl<'a> SnapshotProducer<'a> {
                 data_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        for data_file in &self.removed_files {
+            // A removed file can predate the current spec (partition migration rewrites
+            // files written under an older one). Partition metrics index the file's
+            // partition values positionally by the spec's fields, so only the spec the
+            // file was written under is guaranteed to have matching arity.
+            let partition_spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .unwrap_or_else(|| table_metadata.default_partition_spec())
+                .clone();
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                partition_spec,
             );
         }
 
