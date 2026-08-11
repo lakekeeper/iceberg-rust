@@ -97,6 +97,18 @@ impl FileIO {
         &self.config
     }
 
+    /// Returns the underlying [`Storage`] backend, building it if necessary.
+    ///
+    /// Useful for callers that need to recover a concrete storage
+    /// implementation from a `FileIO` via [`Storage::as_any`] — for example to
+    /// bridge the backend into another I/O abstraction.
+    ///
+    /// # Errors
+    /// Returns an error if the storage backend fails to build.
+    pub fn storage(&self) -> Result<Arc<dyn Storage>> {
+        self.get_storage()
+    }
+
     /// Get or create the storage instance.
     ///
     /// The factory is invoked on first access and the result is cached
