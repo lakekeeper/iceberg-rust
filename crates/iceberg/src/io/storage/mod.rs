@@ -102,6 +102,18 @@ pub trait Storage: Debug + Send + Sync {
 
     /// Create a new output file for writing
     fn new_output(&self, path: &str) -> Result<OutputFile>;
+
+    /// Downcast support for recovering the concrete storage implementation from
+    /// a `&dyn Storage`.
+    ///
+    /// Backends that wrap another I/O abstraction and want to be recoverable
+    /// (e.g. a bridge that adapts a foreign storage trait onto [`Storage`])
+    /// override this to return `self`. The default returns a reference that
+    /// downcasts to nothing, so native backends need not implement it.
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        const UNIT: () = ();
+        &UNIT
+    }
 }
 
 /// Factory for creating Storage instances from configuration.

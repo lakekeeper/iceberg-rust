@@ -28,6 +28,7 @@ use typed_builder::TypedBuilder;
 
 use super::INITIAL_VIEW_VERSION_ID;
 use super::view_metadata::ViewVersionLog;
+use super::view_metadata_builder::require_unique_dialects;
 use crate::catalog::NamespaceIdent;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::spec::{SchemaId, SchemaRef, ViewMetadata};
@@ -162,7 +163,41 @@ impl ViewVersion {
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct ViewRepresentations(pub(crate) Vec<ViewRepresentation>);
 
+/// Builder for [`ViewRepresentations`]
+#[derive(Debug, Default)]
+pub struct ViewRepresentationsBuilder {
+    inner: Vec<ViewRepresentation>,
+}
+
+impl ViewRepresentationsBuilder {
+    /// Add a representation to the list of representations
+    pub fn add_representation(mut self, rep: ViewRepresentation) -> Self {
+        self.inner.push(rep);
+        self
+    }
+
+    /// Add multiple representations to the list of representations
+    pub fn add_all_representations(mut self, reps: Vec<ViewRepresentation>) -> Self {
+        self.inner.extend(reps);
+        self
+    }
+
+    /// Build the list of representations
+    /// # Errors
+    /// - if there are multiple representations with the same dialect
+    pub fn build(self) -> Result<ViewRepresentations> {
+        let rep = ViewRepresentations(self.inner);
+        require_unique_dialects(&rep)?;
+        Ok(rep)
+    }
+}
+
 impl ViewRepresentations {
+    /// Create a new builder for [`ViewRepresentations`]
+    pub fn builder() -> ViewRepresentationsBuilder {
+        ViewRepresentationsBuilder::default()
+    }
+
     #[inline]
     /// Get the number of representations
     pub fn len(&self) -> usize {

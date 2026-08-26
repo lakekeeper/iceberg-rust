@@ -124,7 +124,10 @@ pretty_assertions = "1.4"
 pyo3 = "0.28"
 rand = "0.9.3"
 regex = "1.11.3"
-reqwest = { version = "0.12.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+] }
 roaring = { version = "0.11" }
 rstest = "0.26"
 serde = { version = "1.0.219", features = ["rc"] }
@@ -150,6 +153,7 @@ typed-builder = "0.20"
 typetag = "0.2"
 url = "2.5.7"
 uuid = { version = "1.18", features = ["v7"] }
+valuable = "0.1.1"
 volo = "0.10.6"
 volo-thrift = "0.10.8"
 zeroize = "1.7"

@@ -30,6 +30,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use uuid::Uuid;
 
 pub use super::view_metadata_builder::ViewMetadataBuilder;
+use super::view_metadata_builder::require_unique_dialects;
 use super::view_version::{ViewVersionId, ViewVersionRef};
 use super::{SchemaId, SchemaRef};
 use crate::error::{Result, timestamp_ms_to_utc};
@@ -78,7 +79,59 @@ pub struct ViewMetadata {
     pub(crate) properties: HashMap<String, String>,
 }
 
+/// Container for parts of a view metadata, passed to `ViewMetadata::try_from_parts`.
+pub struct ViewMetadataParts {
+    /// Integer Version for the format.
+    pub format_version: ViewFormatVersion,
+    /// A UUID that identifies the view, generated when the view is created.
+    pub view_uuid: Uuid,
+    /// The view's base location; used to create metadata file locations
+    pub location: String,
+    /// ID of the current version of the view (version-id)
+    pub current_version_id: ViewVersionId,
+    /// A list of known versions of the view
+    pub versions: HashMap<ViewVersionId, ViewVersionRef>,
+    /// A list of version log entries with the timestamp and version-id for every
+    pub version_log: Vec<ViewVersionLog>,
+    /// A list of schemas, stored as objects with schema-id.
+    pub schemas: HashMap<SchemaId, SchemaRef>,
+    /// A string to string map of view properties.
+    pub properties: HashMap<String, String>,
+}
+
 impl ViewMetadata {
+    /// Construct `Self` from parts.
+    ///
+    /// Useful when reconstructing `ViewMetadata` from DB etc.
+    pub fn try_from_parts(
+        ViewMetadataParts {
+            format_version,
+            view_uuid,
+            location,
+            current_version_id,
+            versions,
+            version_log,
+            schemas,
+            properties,
+        }: ViewMetadataParts,
+    ) -> Result<Self> {
+        let meta = Self {
+            format_version,
+            view_uuid,
+            location,
+            current_version_id,
+            versions,
+            version_log,
+            schemas,
+            properties,
+        };
+        for v in meta.versions.values() {
+            require_unique_dialects(v.representations())?;
+        }
+        meta.validate()?;
+        Ok(meta)
+    }
+
     /// Convert this View Metadata into a builder for modification.
     #[must_use]
     pub fn into_builder(self) -> ViewMetadataBuilder {

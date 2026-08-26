@@ -195,7 +195,10 @@ pub trait CatalogBuilder: Default + Debug + Send + Sync {
 /// The namespace identifier is a list of strings, where each string is a
 /// component of the namespace. It's the catalog implementer's responsibility to
 /// handle the namespace identifier correctly.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, valuable::Valuable,
+)]
+#[valuable(transparent)]
 pub struct NamespaceIdent(Vec<String>);
 
 impl NamespaceIdent {
@@ -293,7 +296,9 @@ impl Display for NamespaceIdent {
 }
 
 /// TableIdent represents the identifier of a table in the catalog.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, valuable::Valuable,
+)]
 pub struct TableIdent {
     /// Namespace of the table.
     pub namespace: NamespaceIdent,
@@ -370,7 +375,6 @@ pub struct TableCreation {
 /// [`TableCommit`] directly.
 /// Users are supposed to use [`crate::transaction::Transaction`] to update table.
 #[derive(Debug, TypedBuilder)]
-#[builder(build_method(vis = "pub(crate)"))]
 pub struct TableCommit {
     /// The table ident.
     ident: TableIdent,
