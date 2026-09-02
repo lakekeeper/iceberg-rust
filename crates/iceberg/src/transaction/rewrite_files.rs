@@ -113,6 +113,23 @@ impl RewriteFilesAction {
         self
     }
 
+    /// Produce the metadata `updates` and `requirements` for this rewrite against `table`
+    /// — writing any new manifests and running the same snapshot production and validation
+    /// as a normal commit — **without** committing to a [`Catalog`](crate::Catalog).
+    ///
+    /// This is the catalog-free counterpart to [`Transaction::commit`](crate::transaction::Transaction::commit):
+    /// it returns the resulting [`ActionCommit`] so the caller can apply the changes through a
+    /// different sink (e.g. an embedded catalog that applies `TableUpdate`s directly). Conceptually
+    /// mirrors how [`TableMetadataBuilder::build`](crate::spec::TableMetadataBuilder::build) hands
+    /// back its `changes`. The returned requirements must still be enforced by whoever commits them.
+    ///
+    /// Takes `self: Arc<Self>` so it can be called repeatedly against successive (refreshed) base
+    /// tables in a caller-driven refresh-and-retry loop; the internal `MergingSnapshotProducer`
+    /// carries a stable snapshot id, so each attempt produces idempotent output.
+    pub async fn build_commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        self.commit(table).await
+    }
+
     /// Build a fresh [`RewriteFilesOperation`] borrowing the durable MSP.
     ///
     /// A new operation is built per commit attempt. Only the action-owned
