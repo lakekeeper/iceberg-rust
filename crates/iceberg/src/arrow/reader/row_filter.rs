@@ -1374,6 +1374,7 @@ mod tests {
                 partition_spec_id: 0,
                 equality_ids: None,
                 file_size_in_bytes: std::fs::metadata(&pos_del_path).unwrap().len(),
+                record_count: None,
                 key_metadata: None,
             }],
             partition: None,

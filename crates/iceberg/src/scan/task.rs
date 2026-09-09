@@ -205,6 +205,7 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
         FileScanTaskDeleteFile::builder()
             .with_file_path(ctx.manifest_entry.file_path().to_string())
             .with_file_size_in_bytes(ctx.manifest_entry.file_size_in_bytes())
+            .with_record_count(Some(ctx.manifest_entry.record_count()))
             .with_file_type(ctx.manifest_entry.content_type())
             .with_partition_spec_id(ctx.partition_spec_id)
             .with_equality_ids(ctx.manifest_entry.data_file.equality_ids.clone())
@@ -228,6 +229,14 @@ pub struct FileScanTaskDeleteFile {
 
     /// The total size of the delete file in bytes, from the manifest entry.
     pub file_size_in_bytes: u64,
+
+    /// Number of delete records in the file, from the manifest entry.
+    /// `None` when the scan plan was produced before this field existed
+    /// (deserialized old plans) — treat as "unknown", not zero.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub record_count: Option<u64>,
 
     /// delete file type
     pub file_type: DataContentType,

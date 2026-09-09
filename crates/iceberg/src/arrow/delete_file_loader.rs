@@ -233,6 +233,7 @@ mod tests {
         let task = FileScanTaskDeleteFile {
             file_path: del_path.clone(),
             file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+            record_count: None,
             file_type: DataContentType::PositionDeletes,
             partition_spec_id: 0,
             equality_ids: None,
@@ -307,6 +308,7 @@ mod tests {
         let task = FileScanTaskDeleteFile {
             file_path: del_path.clone(),
             file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+            record_count: None,
             file_type: DataContentType::EqualityDeletes,
             partition_spec_id: 0,
             equality_ids: Some(vec![1]),
