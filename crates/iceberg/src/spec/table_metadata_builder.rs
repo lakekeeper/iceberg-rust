@@ -481,6 +481,155 @@ impl TableMetadataBuilder {
         self
     }
 
+    /// Roll `branch` back to the ancestor snapshot `snapshot_id`, discarding every snapshot
+    /// between `snapshot_id` (exclusive) and the current branch head (inclusive).
+    ///
+    /// Unlike [`Self::remove_snapshots`], which only drops snapshots and prunes now-dangling
+    /// refs, this rewinds the branch as if the discarded snapshots had never been committed:
+    /// it resets the branch reference (and, for `main`, the current-snapshot pointer) to
+    /// `snapshot_id`, drops the discarded snapshots together with their statistics and
+    /// snapshot-log entries, and lowers `last_sequence_number` and the last-updated timestamp
+    /// back to the retained snapshots. Lowering those watermarks frees the discarded sequence
+    /// numbers again, so a subsequent [`Self::add_snapshot`] may commit a snapshot that was
+    /// originally built on top of `snapshot_id` — reusing its sequence number and an earlier
+    /// timestamp. The `metadata_log` is left untouched: the discarded snapshots' metadata files
+    /// remain valid previous versions of the table.
+    ///
+    /// The change is recorded as a [`TableUpdate::SetSnapshotRef`] followed by a
+    /// [`TableUpdate::RemoveSnapshots`]. Callers are responsible for ensuring the discarded
+    /// snapshots are safe to drop (e.g. that no external consumer depends on them); the builder
+    /// only enforces that they are not reachable from another branch or tag.
+    ///
+    /// # Errors
+    /// - `branch` does not exist or is not a branch reference.
+    /// - `snapshot_id` is unknown or is not an ancestor of the branch head.
+    /// - A discarded snapshot is reachable from another branch or tag.
+    pub fn rollback_branch_to_snapshot(mut self, branch: &str, snapshot_id: i64) -> Result<Self> {
+        let reference = self.metadata.refs.get(branch).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot roll back unknown reference '{branch}'"),
+            )
+        })?;
+        if !reference.is_branch() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot roll back non-branch reference '{branch}'"),
+            ));
+        }
+        let head = reference.snapshot_id;
+        if head == snapshot_id {
+            return Ok(self);
+        }
+        if !self.metadata.snapshots.contains_key(&snapshot_id) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot roll back to unknown snapshot '{snapshot_id}'"),
+            ));
+        }
+
+        // Collect the discarded range by walking the parent chain from the head down to (but not
+        // including) `snapshot_id`. Falling off the chain means `snapshot_id` is not an ancestor.
+        let mut discarded: Vec<i64> = Vec::new();
+        let mut cursor = Some(head);
+        loop {
+            let current = cursor.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot '{snapshot_id}' is not an ancestor of branch '{branch}'"),
+                )
+            })?;
+            if current == snapshot_id {
+                break;
+            }
+            let snapshot = self.metadata.snapshots.get(&current).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Branch '{branch}' references unknown snapshot '{current}'"),
+                )
+            })?;
+            discarded.push(current);
+            cursor = snapshot.parent_snapshot_id();
+        }
+
+        // Never discard a snapshot another branch or tag can reach (even transitively): their
+        // manifests still reference its data files.
+        for (ref_name, other) in &self.metadata.refs {
+            if ref_name == branch {
+                continue;
+            }
+            let mut cursor = Some(other.snapshot_id);
+            while let Some(current) = cursor {
+                if discarded.contains(&current) {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot roll back branch '{branch}': snapshot '{current}' is reachable from reference '{ref_name}'"
+                        ),
+                    ));
+                }
+                cursor = self
+                    .metadata
+                    .snapshots
+                    .get(&current)
+                    .and_then(|s| s.parent_snapshot_id());
+            }
+        }
+
+        // Rewind the branch reference (and, for main, the current-snapshot pointer).
+        let mut reference = self
+            .metadata
+            .refs
+            .get(branch)
+            .cloned()
+            .expect("branch reference existence checked above");
+        reference.snapshot_id = snapshot_id;
+        self.metadata
+            .refs
+            .insert(branch.to_string(), reference.clone());
+        if branch == MAIN_BRANCH {
+            self.metadata.current_snapshot_id = Some(snapshot_id);
+        }
+        self.changes.push(TableUpdate::SetSnapshotRef {
+            ref_name: branch.to_string(),
+            reference,
+        });
+
+        // Drop the discarded snapshots, their statistics, and their snapshot-log entries.
+        for id in &discarded {
+            self.metadata.snapshots.remove(id);
+            self.metadata.statistics.remove(id);
+            self.metadata.partition_statistics.remove(id);
+        }
+        self.metadata
+            .snapshot_log
+            .retain(|entry| !discarded.contains(&entry.snapshot_id));
+        self.changes.push(TableUpdate::RemoveSnapshots {
+            snapshot_ids: discarded,
+        });
+
+        // Lower the sequence-number and updated-timestamp watermarks to the retained snapshots
+        // so a rebased commit can reuse the freed sequence numbers.
+        self.metadata.last_sequence_number = self
+            .metadata
+            .snapshots
+            .values()
+            .map(|s| s.sequence_number())
+            .max()
+            .unwrap_or(0);
+        let last_updated_ms = self
+            .metadata
+            .snapshots
+            .values()
+            .map(|s| s.timestamp_ms())
+            .max()
+            .unwrap_or(self.metadata.last_updated_ms);
+        self.metadata.last_updated_ms = last_updated_ms;
+        self.last_updated_ms = Some(last_updated_ms);
+
+        Ok(self)
+    }
+
     /// Set a reference to a snapshot.
     ///
     /// # Errors
@@ -2162,6 +2311,215 @@ mod tests {
             snapshot_id: 1,
             timestamp_ms: snapshot.timestamp_ms()
         }])
+    }
+
+    fn append_snapshot(builder: TableMetadataBuilder, id: i64, seq: i64) -> TableMetadataBuilder {
+        let parent = builder.metadata.current_snapshot_id;
+        let ts = builder.metadata.last_updated_ms + 1;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(id)
+            .with_parent_snapshot_id(parent)
+            .with_timestamp_ms(ts)
+            .with_sequence_number(seq)
+            .with_schema_id(0)
+            .with_manifest_list(format!("/snap-{id}.avro"))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+        builder.set_branch_snapshot(snapshot, MAIN_BRANCH).unwrap()
+    }
+
+    fn rollbackable_compaction_snapshot(
+        builder: TableMetadataBuilder,
+        id: i64,
+        seq: i64,
+    ) -> TableMetadataBuilder {
+        let parent = builder.metadata.current_snapshot_id;
+        let ts = builder.metadata.last_updated_ms + 1;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(id)
+            .with_parent_snapshot_id(parent)
+            .with_timestamp_ms(ts)
+            .with_sequence_number(seq)
+            .with_schema_id(0)
+            .with_manifest_list(format!("/snap-{id}.avro"))
+            .with_summary(Summary {
+                operation: Operation::Replace,
+                additional_properties: HashMap::from_iter(vec![(
+                    "lakekeeper.rollbackable".to_string(),
+                    "true".to_string(),
+                )]),
+            })
+            .build();
+        builder.set_branch_snapshot(snapshot, MAIN_BRANCH).unwrap()
+    }
+
+    #[test]
+    fn test_rollback_branch_to_snapshot_reaps_compaction() {
+        // main: A(append, seq 1) <- C(replace, seq 2), committed separately so both are
+        // durable snapshot-log entries. Roll back to A.
+        let after_a = append_snapshot(builder_without_changes(FormatVersion::V2), 1, 1)
+            .build()
+            .unwrap()
+            .metadata;
+        let metadata = rollbackable_compaction_snapshot(
+            after_a.into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+            )),
+            2,
+            2,
+        )
+        .build()
+        .unwrap()
+        .metadata;
+        assert_eq!(metadata.current_snapshot_id, Some(2));
+        assert_eq!(metadata.last_sequence_number, 2);
+        assert_eq!(metadata.snapshot_log.len(), 2);
+
+        let rolled = metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata2.json".to_string(),
+            ))
+            .rollback_branch_to_snapshot(MAIN_BRANCH, 1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(rolled.current_snapshot_id, Some(1));
+        assert_eq!(rolled.refs.get(MAIN_BRANCH).unwrap().snapshot_id, 1);
+        assert!(rolled.snapshot_by_id(2).is_none());
+        assert!(rolled.snapshot_by_id(1).is_some());
+        // last_sequence_number lowered so a writer can reuse the reaped sequence number.
+        assert_eq!(rolled.last_sequence_number, 1);
+        assert_eq!(rolled.snapshot_log.len(), 1);
+        assert_eq!(rolled.snapshot_log[0].snapshot_id, 1);
+
+        // A writer's snapshot pre-assigned seq 2 (and an older timestamp) now applies cleanly.
+        let writer = Snapshot::builder()
+            .with_snapshot_id(3)
+            .with_parent_snapshot_id(Some(1))
+            .with_timestamp_ms(rolled.snapshot_by_id(1).unwrap().timestamp_ms() + 1)
+            .with_sequence_number(2)
+            .with_schema_id(0)
+            .with_manifest_list("/snap-3.avro")
+            .with_summary(Summary {
+                operation: Operation::Delete,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+        let after_writer = rolled
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata3.json".to_string(),
+            ))
+            .set_branch_snapshot(writer, MAIN_BRANCH)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(after_writer.current_snapshot_id, Some(3));
+        assert!(after_writer.snapshot_by_id(2).is_none());
+    }
+
+    #[test]
+    fn test_rollback_branch_to_snapshot_reaps_stacked_compactions() {
+        // main: A(seq1) <- C1(seq2) <- C2(seq3), each committed separately. Roll back to A,
+        // both compactions excised.
+        let after_a = append_snapshot(builder_without_changes(FormatVersion::V2), 1, 1)
+            .build()
+            .unwrap()
+            .metadata;
+        let after_c1 = rollbackable_compaction_snapshot(
+            after_a.into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+            )),
+            2,
+            2,
+        )
+        .build()
+        .unwrap()
+        .metadata;
+        let metadata = rollbackable_compaction_snapshot(
+            after_c1.into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata2.json".to_string(),
+            )),
+            3,
+            3,
+        )
+        .build()
+        .unwrap()
+        .metadata;
+
+        let rolled = metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+            ))
+            .rollback_branch_to_snapshot(MAIN_BRANCH, 1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(rolled.current_snapshot_id, Some(1));
+        assert!(rolled.snapshot_by_id(2).is_none());
+        assert!(rolled.snapshot_by_id(3).is_none());
+        assert_eq!(rolled.last_sequence_number, 1);
+    }
+
+    #[test]
+    fn test_rollback_branch_to_snapshot_rejects_when_referenced_by_tag() {
+        let metadata = rollbackable_compaction_snapshot(
+            append_snapshot(builder_without_changes(FormatVersion::V2), 1, 1),
+            2,
+            2,
+        )
+        .set_ref("mytag", SnapshotReference {
+            snapshot_id: 2,
+            retention: SnapshotRetention::Tag {
+                max_ref_age_ms: None,
+            },
+        })
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let err = metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+            ))
+            .rollback_branch_to_snapshot(MAIN_BRANCH, 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("reachable from reference"));
+    }
+
+    #[test]
+    fn test_rollback_branch_to_snapshot_rejects_non_ancestor() {
+        let metadata = append_snapshot(builder_without_changes(FormatVersion::V2), 1, 1)
+            .build()
+            .unwrap()
+            .metadata;
+        // Snapshot 99 does not exist.
+        assert!(
+            metadata
+                .clone()
+                .into_builder(Some(
+                    "s3://bucket/test/location/metadata/m.json".to_string()
+                ))
+                .rollback_branch_to_snapshot(MAIN_BRANCH, 99)
+                .is_err()
+        );
+        // Rolling back to the current head is a no-op.
+        let same = metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/m.json".to_string(),
+            ))
+            .rollback_branch_to_snapshot(MAIN_BRANCH, 1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(same.current_snapshot_id, Some(1));
     }
 
     #[test]
