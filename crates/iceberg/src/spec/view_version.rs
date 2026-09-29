@@ -156,7 +156,53 @@ impl ViewVersion {
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct ViewRepresentations(pub(crate) Vec<ViewRepresentation>);
 
+/// Builder for [`ViewRepresentations`].
+#[derive(Debug, Default)]
+pub struct ViewRepresentationsBuilder {
+    inner: Vec<ViewRepresentation>,
+}
+
+impl ViewRepresentationsBuilder {
+    /// Add a representation to the list.
+    pub fn add_representation(mut self, rep: ViewRepresentation) -> Self {
+        self.inner.push(rep);
+        self
+    }
+
+    /// Add multiple representations to the list.
+    pub fn add_all_representations(mut self, reps: Vec<ViewRepresentation>) -> Self {
+        self.inner.extend(reps);
+        self
+    }
+
+    /// Build the list of representations.
+    ///
+    /// # Errors
+    /// - if there are multiple representations with the same dialect.
+    pub fn build(self) -> Result<ViewRepresentations> {
+        let mut seen_dialects = std::collections::HashSet::with_capacity(self.inner.len());
+        for repr in &self.inner {
+            match repr {
+                ViewRepresentation::Sql(sql_repr) => {
+                    if !seen_dialects.insert(sql_repr.dialect.to_lowercase()) {
+                        return Err(invalid_data!(
+                            "Invalid view version: Cannot add multiple queries for dialect {}",
+                            sql_repr.dialect
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(ViewRepresentations(self.inner))
+    }
+}
+
 impl ViewRepresentations {
+    /// Create a new builder for [`ViewRepresentations`].
+    pub fn builder() -> ViewRepresentationsBuilder {
+        ViewRepresentationsBuilder::default()
+    }
+
     #[inline]
     /// Get the number of representations
     pub fn len(&self) -> usize {
