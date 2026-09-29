@@ -120,6 +120,24 @@ impl ManifestFile {
     pub fn has_existing_files(&self) -> bool {
         self.existing_files_count.map(|c| c > 0).unwrap_or(true)
     }
+
+    /// Load the [`Manifest`](crate::spec::Manifest) this entry points at,
+    /// initializing inherited entry values (snapshot id, sequence number).
+    ///
+    /// Note: unlike the scan planner's cached path, this does not decrypt
+    /// encrypted manifests or assign `first_row_id`; it is intended for
+    /// maintenance callers that only need entry status and data-file metadata.
+    pub async fn load_manifest(
+        &self,
+        file_io: &crate::io::FileIO,
+    ) -> Result<crate::spec::Manifest> {
+        let bytes = file_io.new_input(&self.manifest_path)?.read().await?;
+        let (metadata, mut entries) = crate::spec::Manifest::try_from_avro_bytes(&bytes)?;
+        for entry in &mut entries {
+            entry.inherit_data(self);
+        }
+        Ok(crate::spec::Manifest::new(metadata, entries))
+    }
 }
 
 /// The type of files tracked by the manifest, either data or delete files; Data(0) for all v1 manifests

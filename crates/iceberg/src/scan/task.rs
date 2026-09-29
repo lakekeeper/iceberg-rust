@@ -82,7 +82,7 @@ pub struct FileScanTask {
     project_field_ids: Vec<i32>,
     /// The predicate to filter.
     #[builder(default)]
-    predicate: Option<BoundPredicate>,
+    pub predicate: Option<BoundPredicate>,
 
     /// The list of delete files that may need to be applied to this data file
     #[builder(default)]
