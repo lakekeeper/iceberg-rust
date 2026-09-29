@@ -120,6 +120,22 @@ impl ManifestFile {
     pub fn has_existing_files(&self) -> bool {
         self.existing_files_count.map(|c| c > 0).unwrap_or(true)
     }
+
+    /// Load the [`Manifest`](crate::spec::Manifest) this entry points at, the same way the
+    /// scan planner's [`ManifestReader`](crate::spec::ManifestReader) does: the file is read
+    /// (and decrypted) with `file_io`, and the entries inherit this entry's snapshot id,
+    /// sequence numbers and `first_row_id`.
+    ///
+    /// Fork convenience for maintenance callers that hold a [`ManifestFile`] and a `FileIO`
+    /// rather than a `Table`.
+    pub async fn load_manifest(
+        &self,
+        file_io: &crate::io::FileIO,
+    ) -> Result<crate::spec::Manifest> {
+        crate::spec::ManifestReader::new(file_io.clone())
+            .read(self)
+            .await
+    }
 }
 
 /// The type of files tracked by the manifest, either data or delete files; Data(0) for all v1 manifests
