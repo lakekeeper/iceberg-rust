@@ -42,24 +42,24 @@ pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
 pub struct FileScanTask {
     /// The total size of the data file in bytes, from the manifest entry.
     /// Used to skip a stat/HEAD request when reading Parquet footers.
-    file_size_in_bytes: u64,
+    pub file_size_in_bytes: u64,
     /// The start offset of the file to scan.
-    start: u64,
+    pub start: u64,
     /// The length of the file to scan.
-    length: u64,
+    pub length: u64,
     /// The number of records in the file to scan.
     ///
     /// This is an optional field, and only available if we are
     /// reading the entire data file.
     #[builder(default)]
-    record_count: Option<u64>,
+    pub record_count: Option<u64>,
 
     /// The first row id assigned to the data file.
     ///
     /// Used to derive the `_row_id` metadata column: for a row without an
     /// explicit `_row_id`, it is this value plus the row's ordinal position.
     #[builder(default)]
-    first_row_id: Option<i64>,
+    pub first_row_id: Option<i64>,
 
     /// The data sequence number of the file, as opposed to its file sequence
     /// number: the sequence number preserved when a file is carried forward
@@ -68,43 +68,43 @@ pub struct FileScanTask {
     ///
     /// Used to derive the `_last_updated_sequence_number` metadata column.
     #[builder(default)]
-    data_sequence_number: Option<i64>,
+    pub data_sequence_number: Option<i64>,
 
     /// The data file path corresponding to the task.
-    data_file_path: String,
+    pub data_file_path: String,
 
     /// The format of the file to scan.
-    data_file_format: DataFileFormat,
+    pub data_file_format: DataFileFormat,
 
     /// The schema of the file to scan.
-    schema: SchemaRef,
+    pub schema: SchemaRef,
     /// The field ids to project.
-    project_field_ids: Vec<i32>,
+    pub project_field_ids: Vec<i32>,
     /// The predicate to filter.
     #[builder(default)]
     pub predicate: Option<BoundPredicate>,
 
     /// The list of delete files that may need to be applied to this data file
     #[builder(default)]
-    deletes: Vec<FileScanTaskDeleteFile>,
+    pub deletes: Vec<FileScanTaskDeleteFile>,
 
     /// Partition data from the manifest entry, used to identify which columns can use
     /// constant values from partition metadata vs. reading from the data file.
     /// Per the Iceberg spec, only identity-transformed partition fields should use constants.
     #[builder(default)]
-    partition: Option<Struct>,
+    pub partition: Option<Struct>,
 
     /// The partition spec for this file, used to distinguish identity transforms
     /// (which use partition metadata constants) from non-identity transforms like
     /// bucket/truncate (which must read source columns from the data file).
     #[builder(default)]
-    partition_spec: Option<Arc<PartitionSpec>>,
+    pub partition_spec: Option<Arc<PartitionSpec>>,
 
     /// Name mapping from table metadata (property: schema.name-mapping.default),
     /// used to resolve field IDs from column names when Parquet files lack field IDs
     /// or have field ID conflicts.
     #[builder(default)]
-    name_mapping: Option<Arc<NameMapping>>,
+    pub name_mapping: Option<Arc<NameMapping>>,
 
     /// The unified partition type across all specs in the table.
     /// When `RESERVED_FIELD_ID_PARTITION` is in the projected field IDs, the reader
@@ -115,7 +115,7 @@ pub struct FileScanTask {
     /// so that readers are self-contained without needing back-pointers to table
     /// metadata. The cost is one Arc clone per task.
     #[builder(default)]
-    unified_partition_type: Option<Arc<StructType>>,
+    pub unified_partition_type: Option<Arc<StructType>>,
 
     /// The raw `sort_order_id` recorded on the data file (spec field 140), carried through
     /// unresolved. See [`DataFile::sort_order_id()`](crate::spec::DataFile::sort_order_id).
@@ -126,7 +126,7 @@ pub struct FileScanTask {
     /// as physically sorted, which a consumer such as the DataFusion sorted-scan optimizer
     /// needs even when the order definition itself is unavailable.
     #[builder(default)]
-    sort_order_id: Option<i32>,
+    pub sort_order_id: Option<i32>,
 
     /// The sort order that this file's rows are sorted by, resolved from the data file's
     /// [`sort_order_id`](Self::sort_order_id) against the table's known sort orders. `Some`
@@ -135,10 +135,10 @@ pub struct FileScanTask {
     /// (the reserved unsorted order, id 0 per the spec). Use [`sort_order_id`](Self::sort_order_id)
     /// to tell those cases apart.
     #[builder(default)]
-    sort_order: Option<SortOrderRef>,
+    pub sort_order: Option<SortOrderRef>,
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
-    case_sensitive: bool,
+    pub case_sensitive: bool,
 
     /// Key metadata for encrypted data files (Parquet Modular Encryption).
     /// When present, the reader uses this to build `FileDecryptionProperties`.
@@ -149,7 +149,7 @@ pub struct FileScanTask {
     /// of the serialized scan plan should these tasks ever be serialized and sent
     /// over the network.
     #[builder(default)]
-    key_metadata: Option<Box<[u8]>>,
+    pub key_metadata: Option<Box<[u8]>>,
 }
 
 impl FileScanTask {
