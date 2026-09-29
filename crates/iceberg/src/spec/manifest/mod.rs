@@ -54,7 +54,7 @@ pub struct Manifest {
 impl Manifest {
     /// Parse manifest metadata and entries from bytes of avro file. `location`
     /// names the manifest in warnings.
-    pub(crate) fn try_from_avro_bytes(
+    pub fn try_from_avro_bytes(
         bs: &[u8],
         location: Option<&str>,
     ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
