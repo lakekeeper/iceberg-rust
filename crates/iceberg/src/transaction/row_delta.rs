@@ -125,6 +125,7 @@ impl TransactionAction for RowDeltaAction {
             .with_commit_uuid(self.commit_uuid.unwrap_or_else(Uuid::now_v7))
             .with_snapshot_properties(self.snapshot_properties.clone())
             .with_added_data_files(self.added_data_files.clone())
+            .with_removed_data_files(self.removed_data_files.clone())
             .build();
 
         // Validate newly added data files (partition value type-checks, etc.).
@@ -169,6 +170,11 @@ impl SnapshotProduceOperation for RowDeltaOperation {
         Ok(vec![])
     }
 
+    /// A row delta replaces only the removed files, so the table totals carry over.
+    fn truncate_full_table(&self) -> bool {
+        false
+    }
+
     /// Returns manifest files for the new snapshot.
     ///
     /// For each manifest in the previous snapshot:
@@ -179,7 +185,7 @@ impl SnapshotProduceOperation for RowDeltaOperation {
     /// This matches Java's `ManifestFilterManager.filterManifestWithDeletedFiles` logic.
     async fn existing_manifest(
         &self,
-        snapshot_produce: &mut SnapshotProducer<'_>,
+        snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
             return Ok(vec![]);
@@ -221,8 +227,11 @@ impl SnapshotProduceOperation for RowDeltaOperation {
 
             // Rewrite: deleted files → DELETED (new snapshot_id, original seq nums preserved),
             // surviving files → EXISTING (all original fields preserved).
-            let mut writer = snapshot_produce
-                .new_manifest_writer(ManifestContentType::Data, manifest_file.partition_spec_id)?;
+            let mut writer = snapshot_produce.new_manifest_writer(
+                ManifestContentType::Data,
+                manifest.metadata().schema.clone(),
+                Arc::new(manifest.metadata().partition_spec.clone()),
+            )?;
             for entry in manifest.entries() {
                 if deleted_paths.contains(entry.data_file().file_path()) {
                     writer.add_delete_entry((**entry).clone())?;
@@ -234,10 +243,6 @@ impl SnapshotProduceOperation for RowDeltaOperation {
         }
 
         Ok(result)
-    }
-
-    fn removed_data_files(&self) -> &[DataFile] {
-        &self.removed_data_files
     }
 }
 
