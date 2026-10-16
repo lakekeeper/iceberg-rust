@@ -35,6 +35,7 @@ use parquet::arrow::{
 };
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
+use super::predicate_visitor::residual_for_missing_fields;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
@@ -526,6 +527,16 @@ impl FileScanTaskReader {
                 record_batch_stream_builder.schema(),
                 &predicate,
                 use_position_fallback,
+            )?;
+            // Apply the residual before the row filter and every pruning layer below, so they all
+            // see the same predicate.
+            let predicate = residual_for_missing_fields(
+                predicate,
+                &iceberg_field_ids,
+                &field_id_map,
+                task.schema(),
+                task.partition_spec().map(Arc::as_ref),
+                task.partition(),
             )?;
 
             row_filter_predicates.push(ArrowReader::build_scan_predicate(
