@@ -2887,6 +2887,8 @@ impl core::fmt::Debug for iceberg::spec::TableMetadataBuilder
 pub fn iceberg::spec::TableMetadataBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::spec::TableProperties<'properties>
 impl iceberg::spec::TableProperties<'_>
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u64
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT: u64
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS: &'static str
@@ -2963,6 +2965,7 @@ pub fn iceberg::spec::TableProperties<'properties>::cdc_enabled(&self) -> iceber
 pub fn iceberg::spec::TableProperties<'properties>::cdc_max_chunk_size(&self) -> iceberg::Result<usize>
 pub fn iceberg::spec::TableProperties<'properties>::cdc_min_chunk_size(&self) -> iceberg::Result<usize>
 pub fn iceberg::spec::TableProperties<'properties>::cdc_norm_level(&self) -> iceberg::Result<i32>
+pub fn iceberg::spec::TableProperties<'properties>::commit_manifest_target_size_bytes(&self) -> iceberg::Result<u64>
 pub fn iceberg::spec::TableProperties<'properties>::commit_max_retry_wait_ms(&self) -> iceberg::Result<u64>
 pub fn iceberg::spec::TableProperties<'properties>::commit_min_retry_wait_ms(&self) -> iceberg::Result<u64>
 pub fn iceberg::spec::TableProperties<'properties>::commit_num_retries(&self) -> iceberg::Result<usize>
@@ -3345,6 +3348,10 @@ impl iceberg::transaction::RewriteFilesAction
 pub fn iceberg::transaction::RewriteFilesAction::add_file(self, file: iceberg::spec::DataFile) -> Self
 pub fn iceberg::transaction::RewriteFilesAction::data_sequence_number(self, sequence_number: i64) -> Self
 pub fn iceberg::transaction::RewriteFilesAction::delete_file(self, file: iceberg::spec::DataFile) -> Self
+pub struct iceberg::transaction::RewriteManifestsAction
+impl iceberg::transaction::RewriteManifestsAction
+pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::set_target_size_bytes(self, target_size_bytes: u64) -> Self
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction
 pub async fn iceberg::transaction::Transaction::commit(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
@@ -3353,6 +3360,7 @@ pub fn iceberg::transaction::Transaction::fast_append(&self) -> iceberg::transac
 pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> Self
 pub fn iceberg::transaction::Transaction::replace_sort_order(&self) -> iceberg::transaction::ReplaceSortOrderAction
 pub fn iceberg::transaction::Transaction::rewrite_files(&self) -> iceberg::transaction::RewriteFilesAction
+pub fn iceberg::transaction::Transaction::rewrite_manifests(&self) -> iceberg::transaction::RewriteManifestsAction
 pub fn iceberg::transaction::Transaction::update_location(&self) -> iceberg::transaction::UpdateLocationAction
 pub fn iceberg::transaction::Transaction::update_schema(&self) -> iceberg::transaction::UpdateSchemaAction
 pub fn iceberg::transaction::Transaction::update_statistics(&self) -> iceberg::transaction::UpdateStatisticsAction

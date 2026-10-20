@@ -36,6 +36,14 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const FALLBACK_BYTES_PER_ENTRY: u64 = 256;
 
+/// A transaction action that compacts the data manifests of the current snapshot.
+///
+/// Live `DataFile` entries from manifests bound to the default partition spec are
+/// grouped by partition and rewritten into new manifests rolled at
+/// [`RewriteManifestsAction::set_target_size_bytes`], preserving each entry's
+/// sequence numbers. The result is committed as a
+/// [`Operation::Replace`](crate::spec::Operation::Replace) snapshot, mirroring
+/// Java's `BaseRewriteManifests`.
 pub struct RewriteManifestsAction {
     target_size_bytes: Option<u64>,
     snapshot_properties: HashMap<String, String>,
@@ -49,11 +57,16 @@ impl RewriteManifestsAction {
         }
     }
 
+    /// Sets the target size in bytes for each rewritten manifest.
+    ///
+    /// Defaults to the table property `commit.manifest.target-size-bytes`
+    /// (8 MiB when unset).
     pub fn set_target_size_bytes(mut self, target_size_bytes: u64) -> Self {
         self.target_size_bytes = Some(target_size_bytes);
         self
     }
 
+    /// Sets additional key/value properties to record in the new snapshot's summary.
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
         self
@@ -71,13 +84,12 @@ impl TransactionAction for RewriteManifestsAction {
             ));
         };
 
-        let target_size_bytes = self.target_size_bytes.unwrap_or_else(|| {
-            metadata
-                .properties()
-                .get(TableProperties::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES)
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(TableProperties::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT)
-        });
+        let target_size_bytes = match self.target_size_bytes {
+            Some(target_size_bytes) => target_size_bytes,
+            None => {
+                TableProperties::new(metadata.properties()).commit_manifest_target_size_bytes()?
+            }
+        };
         let default_spec_id = metadata.default_partition_spec_id();
         let format_version = metadata.format_version();
 
@@ -118,8 +130,8 @@ impl TransactionAction for RewriteManifestsAction {
 
         let loaded: Vec<_> = stream::iter(to_rewrite)
             .map(|m| {
-                let file_io = table.file_io().clone();
-                async move { m.load_manifest(&file_io).await }
+                let reader = table.manifest_reader();
+                async move { reader.read(&m).await }
             })
             .buffer_unordered(16)
             .try_collect()
@@ -458,7 +470,7 @@ mod tests {
         let total_entries: usize = {
             let mut n = 0;
             for m in post_list.entries() {
-                let manifest = m.load_manifest(table.file_io()).await.unwrap();
+                let manifest = table.manifest_reader().read(m).await.unwrap();
                 n += manifest.entries().len();
             }
             n
@@ -467,7 +479,7 @@ mod tests {
 
         let mut seen_seqs: Vec<i64> = Vec::new();
         for m in post_list.entries() {
-            let manifest = m.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(m).await.unwrap();
             for entry in manifest.entries() {
                 seen_seqs.push(entry.sequence_number().unwrap());
             }
@@ -551,7 +563,7 @@ mod tests {
 
         let mut total = 0;
         for m in post_list.entries() {
-            let manifest = m.load_manifest(t.file_io()).await.unwrap();
+            let manifest = t.manifest_reader().read(m).await.unwrap();
             let n = manifest.entries().len();
             assert!(
                 n <= 2,
@@ -610,8 +622,9 @@ mod tests {
 
         let mut total = 0;
         for m in post_list.entries() {
-            total += m
-                .load_manifest(table.file_io())
+            total += table
+                .manifest_reader()
+                .read(m)
                 .await
                 .unwrap()
                 .entries()
@@ -636,7 +649,7 @@ mod tests {
                 .unwrap();
             let mut v = Vec::new();
             for m in list.entries() {
-                let manifest = m.load_manifest(t.file_io()).await.unwrap();
+                let manifest = t.manifest_reader().read(m).await.unwrap();
                 for entry in manifest.entries() {
                     v.push((
                         entry.data_file().file_path().to_string(),
@@ -788,7 +801,7 @@ mod tests {
         let post_list = table.manifest_list_reader(snap).load().await.unwrap();
         assert_eq!(post_list.entries().len(), 2);
         for m in post_list.entries() {
-            let manifest = m.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(m).await.unwrap();
             let partitions: std::collections::HashSet<Struct> = manifest
                 .entries()
                 .iter()

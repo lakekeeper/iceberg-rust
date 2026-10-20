@@ -135,6 +135,13 @@ pub struct TableProperties {
         getter
     )]
     commit_total_retry_timeout_ms: u64,
+    /// The target manifest file size for manifest-rewrite/compaction actions.
+    #[property(
+        key = Self::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES,
+        default = Self::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
+        getter
+    )]
+    commit_manifest_target_size_bytes: u64,
     /// The default format for files.
     #[property(
         key = Self::PROPERTY_DEFAULT_FILE_FORMAT,
@@ -419,7 +426,7 @@ impl TableProperties<'_> {
     pub const PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT: u64 = 30 * 60 * 1000; // 30 minutes
 
     /// Target manifest file size in bytes used by manifest-rewrite/compaction actions.
-    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES: &str =
+    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES: &'static str =
         "commit.manifest.target-size-bytes";
     /// Default target manifest file size: 8 MiB (matches Java).
     pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
