@@ -821,7 +821,7 @@ mod tests {
         let mut data_manifests = 0;
         let mut delete_manifests = 0;
         for mf in &manifests {
-            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(mf).await.unwrap();
             // Every entry in a deleted manifest must have Deleted status.
             for entry in manifest.entries() {
                 assert_eq!(
@@ -885,7 +885,7 @@ mod tests {
 
         assert_eq!(manifest_file.content, ManifestContentType::Deletes);
 
-        let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+        let manifest = table.manifest_reader().read(&manifest_file).await.unwrap();
         assert_eq!(manifest.entries().len(), 1);
         let entry = &manifest.entries()[0];
         assert_eq!(entry.status(), ManifestStatus::Added);
