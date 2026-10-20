@@ -368,8 +368,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeStringArray,
-        RecordBatch, StringArray,
+        LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
@@ -2615,8 +2614,10 @@ mod tests {
             .with_file_path(pos_del_path.clone())
             .with_file_size_in_bytes(std::fs::metadata(&pos_del_path).unwrap().len())
             .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Parquet)
             .with_partition_spec_id(0)
-            .build();
+            .build()
+            .unwrap();
 
         for row_selection_enabled in [false, true] {
             let predicate = Reference::new("id")
@@ -2857,7 +2858,7 @@ mod tests {
     // `OrderedFloat`, whose `Hash`/`Eq` canonicalise NaN and signed zero.
     // A NaN key therefore matches NaN data, and a -0.0 key also removes 0.0.
     #[tokio::test]
-    async fn test_eq_delete_double_column_canonicalises_nan_and_signed_zero() {
+    async fn test_eq_delete_double_column_matches_nan_and_keeps_signed_zeros_distinct() {
         let tmp = TempDir::new().unwrap();
         let loc = tmp.path().to_str().unwrap();
 
@@ -2885,8 +2886,9 @@ mod tests {
             ],
         );
 
-        // A NaN key matches the NaN row (IEEE-754 says NaN != NaN; OrderedFloat says
-        // otherwise), and a -0.0 key removes both signed zeros.
+        // Literal equality follows Java's Double.compare (#3327): a NaN key matches the NaN
+        // row even though IEEE-754 says NaN != NaN, and a -0.0 key removes only the -0.0 row,
+        // not 0.0.
         let del_path = format!("{loc}/eq-del.parquet");
         eqd_write(
             &del_path,
@@ -2905,7 +2907,7 @@ mod tests {
         )])
         .await;
 
-        assert_eq!(eqd_collect_i64(&result, 0), vec![1, 5]);
+        assert_eq!(eqd_collect_i64(&result, 0), vec![1, 3, 5]);
     }
 
     #[tokio::test]
