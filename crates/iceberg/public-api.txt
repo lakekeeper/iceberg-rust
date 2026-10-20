@@ -3352,6 +3352,14 @@ pub struct iceberg::transaction::RewriteManifestsAction
 impl iceberg::transaction::RewriteManifestsAction
 pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
 pub fn iceberg::transaction::RewriteManifestsAction::set_target_size_bytes(self, target_size_bytes: u64) -> Self
+pub struct iceberg::transaction::RowDeltaAction
+impl iceberg::transaction::RowDeltaAction
+pub fn iceberg::transaction::RowDeltaAction::add_data_files(self, data_files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::add_delete_files(self, delete_files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::remove_data_files(self, data_files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
+pub fn iceberg::transaction::RowDeltaAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::validate_from_snapshot(self, snapshot_id: i64) -> Self
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction
 pub async fn iceberg::transaction::Transaction::commit(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
@@ -3361,6 +3369,7 @@ pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> 
 pub fn iceberg::transaction::Transaction::replace_sort_order(&self) -> iceberg::transaction::ReplaceSortOrderAction
 pub fn iceberg::transaction::Transaction::rewrite_files(&self) -> iceberg::transaction::RewriteFilesAction
 pub fn iceberg::transaction::Transaction::rewrite_manifests(&self) -> iceberg::transaction::RewriteManifestsAction
+pub fn iceberg::transaction::Transaction::row_delta(&self) -> iceberg::transaction::RowDeltaAction
 pub fn iceberg::transaction::Transaction::update_location(&self) -> iceberg::transaction::UpdateLocationAction
 pub fn iceberg::transaction::Transaction::update_schema(&self) -> iceberg::transaction::UpdateSchemaAction
 pub fn iceberg::transaction::Transaction::update_statistics(&self) -> iceberg::transaction::UpdateStatisticsAction

@@ -203,8 +203,10 @@ impl SnapshotProduceOperation for RowDeltaOperation {
                 continue;
             }
 
-            let manifest = manifest_file
-                .load_manifest(snapshot_produce.table.file_io())
+            let manifest = snapshot_produce
+                .table
+                .manifest_reader()
+                .read(manifest_file)
                 .await?;
 
             let needs_rewrite = manifest
@@ -456,8 +458,9 @@ mod tests {
         let mut found_added_c = false;
 
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file
-                .load_manifest(table_s1.file_io())
+            let manifest = table_s1
+                .manifest_reader()
+                .read(manifest_file)
                 .await
                 .unwrap();
             for entry in manifest.entries() {
