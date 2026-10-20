@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -71,18 +71,6 @@ impl FastAppendAction {
         self.snapshot_properties = snapshot_properties;
         self
     }
-
-    /// Collapse files sharing a path to their first occurrence, so a single
-    /// manifest never references the same file twice. Always runs (unlike the
-    /// `check_duplicate`-gated cross-snapshot check) since it is in-memory only.
-    fn dedupe_added_files(&self) -> Vec<DataFile> {
-        let mut seen = HashSet::with_capacity(self.added_data_files.len());
-        self.added_data_files
-            .iter()
-            .filter(|data_file| seen.insert(data_file.file_path.as_str()))
-            .cloned()
-            .collect()
-    }
 }
 
 #[async_trait]
@@ -92,7 +80,7 @@ impl TransactionAction for FastAppendAction {
             .with_table(table)
             .with_commit_uuid(self.commit_uuid.unwrap_or_else(Uuid::now_v7))
             .with_snapshot_properties(self.snapshot_properties.clone())
-            .with_added_data_files(self.dedupe_added_files())
+            .with_added_data_files(self.added_data_files.clone())
             .build();
 
         // validate added files

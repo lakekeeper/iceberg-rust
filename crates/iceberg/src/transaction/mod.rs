@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 mod merging;
+mod overwrite;
 mod rewrite;
 mod rewrite_manifests;
 mod row_delta;
@@ -79,6 +80,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::overwrite::OverwriteAction;
 pub use crate::transaction::rewrite::RewriteFilesAction;
 pub use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
@@ -156,6 +158,11 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates an overwrite action.
+    pub fn overwrite(&self) -> OverwriteAction {
+        OverwriteAction::new()
     }
 
     /// Creates a rewrite files action for compaction.

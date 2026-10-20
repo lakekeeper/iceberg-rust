@@ -154,6 +154,21 @@ pub(crate) struct SnapshotProducer<'a> {
 }
 
 impl<'a> SnapshotProducer<'a> {
+    /// Collapses files sharing a path to their first occurrence, so a manifest never
+    /// references the same file twice.
+    fn dedupe_data_files(files: Vec<DataFile>) -> Vec<DataFile> {
+        let mut seen = HashSet::with_capacity(files.len());
+        let keep: Vec<bool> = files
+            .iter()
+            .map(|f| seen.insert(f.file_path.as_str()))
+            .collect();
+        files
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(file, keep)| keep.then_some(file))
+            .collect()
+    }
+
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
         for data_file in &self.added_data_files {
             if data_file.content_type() != DataContentType::Data {
@@ -410,7 +425,7 @@ impl<'a> SnapshotProducer<'a> {
         &mut self,
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
-    ) -> Result<Vec<ManifestFile>> {
+    ) -> Result<(Vec<ManifestFile>, Summary)> {
         // Check if there's any content to add to the new snapshot
         let delete_entries = snapshot_produce_operation.delete_entries(self).await?;
         let has_delete_entries = !delete_entries.is_empty();
@@ -434,6 +449,9 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
+        let summary = self.summary(snapshot_produce_operation).map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        })?;
         let mut manifest_files = existing_manifests;
 
         // Process added entries.
@@ -469,7 +487,7 @@ impl<'a> SnapshotProducer<'a> {
         );
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
-        Ok(manifest_files)
+        Ok((manifest_files, summary))
     }
 
     // Returns a `Summary` of the current snapshot
@@ -581,14 +599,13 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
-        // Calling self.summary() before self.produce_manifests() is important because self.added_data_files
-        // will be set to an empty vec after self.produce_manifests() returns, resulting in an empty summary
-        // being generated.
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
-            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        })?;
+        self.added_data_files = Self::dedupe_data_files(std::mem::take(&mut self.added_data_files));
+        self.removed_data_files =
+            Self::dedupe_data_files(std::mem::take(&mut self.removed_data_files));
 
-        let new_manifests = self
+        // The manifests are produced first so the summary can count the entries the operation
+        // actually marked Deleted.
+        let (new_manifests, summary) = self
             .produce_manifests(&snapshot_produce_operation, &process)
             .await?;
 
