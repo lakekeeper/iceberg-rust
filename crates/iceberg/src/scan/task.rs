@@ -334,7 +334,7 @@ impl TryFrom<&DeleteFileContext> for FileScanTaskDeleteFile {
             .with_file_format(ctx.manifest_entry.data_file().file_format())
             .with_partition_spec_id(ctx.partition_spec_id)
             .with_equality_ids(ctx.manifest_entry.data_file.equality_ids.clone())
-            .with_referenced_data_file(ctx.manifest_entry.data_file.referenced_data_file.clone())
+            .with_referenced_data_file(ctx.manifest_entry.data_file().single_referenced_data_file())
             .with_content_offset(to_offset(
                 ctx.manifest_entry.data_file.content_offset,
                 "content_offset",
@@ -383,8 +383,12 @@ pub struct FileScanTaskDeleteFile {
     #[builder(default)]
     pub equality_ids: Option<Vec<i32>>,
 
-    /// For a deletion vector, the location of the data file whose rows it deletes. Required for
-    /// deletion vectors, and may also be set on a position delete file scoped to one data file.
+    /// The single data file this delete file is scoped to, if any. Required for deletion vectors.
+    /// For a position delete file this is the manifest's explicit `referenced_data_file` field or,
+    /// when that is absent, the path inferred from equal `file_path` column bounds (see
+    /// [`DataFile::single_referenced_data_file`](crate::spec::DataFile::single_referenced_data_file)).
+    /// `Some` on a position delete therefore means the file is file-scoped; `None` means it may
+    /// apply to every data file in its partition.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]

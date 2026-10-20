@@ -24,10 +24,9 @@ use futures::channel::mpsc::{Sender, channel};
 use tokio::sync::Notify;
 
 use crate::error::invalid_data;
-use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
 use crate::runtime::Runtime;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
-use crate::spec::{DataContentType, DataFile, DataFileFormat, PrimitiveLiteral, Struct};
+use crate::spec::{DataContentType, DataFile, DataFileFormat, Struct};
 use crate::{Error, Result};
 
 /// Index of delete files
@@ -62,36 +61,6 @@ struct PopulatedDeleteFileIndex {
     // one exists per data file per snapshot, and when one applies it supersedes any position
     // delete files for that data file, partition-scoped or path-scoped alike.
     dvs_by_referenced_data_file: HashMap<String, Arc<DeleteFileContext>>,
-}
-
-/// Determines the single data file referenced by a position delete file, if any.
-///
-/// Checks the explicit `referenced_data_file` field first. Falls back to the
-/// lower and upper bounds of the delete file's `file_path` column: when both
-/// bounds are present and equal, the delete file references exactly one data
-/// file. Unequal or missing bounds mean the delete file may reference multiple
-/// data files, so no single path can be inferred. A bound that is not a string
-/// literal is treated the same way.
-fn referenced_data_file(data_file: &DataFile) -> Option<String> {
-    if let Some(path) = data_file.referenced_data_file() {
-        return Some(path);
-    }
-
-    let lower_bound = data_file
-        .lower_bounds()
-        .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
-    let upper_bound = data_file
-        .upper_bounds()
-        .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
-
-    if lower_bound != upper_bound {
-        return None;
-    }
-
-    match lower_bound.literal() {
-        PrimitiveLiteral::String(path) => Some(path.clone()),
-        _ => None,
-    }
 }
 
 /// Rebuilds an owned `Error` from the boxed `Error` cached in `DeleteFileIndexState::Failed`.
@@ -237,7 +206,7 @@ impl PopulatedDeleteFileIndex {
                         continue;
                     }
 
-                    if let Some(path) = referenced_data_file(data_file) {
+                    if let Some(path) = data_file.single_referenced_data_file() {
                         pos_deletes_by_path.entry(path).or_default().push(arc_ctx);
                     } else {
                         pos_deletes_by_partition
@@ -384,6 +353,7 @@ mod tests {
 
     use super::*;
     use crate::ErrorKind;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
         ManifestStatus, Struct,
@@ -999,6 +969,47 @@ mod tests {
             task.referenced_data_file(),
             Some("s3://bucket/data/part-0.parquet")
         );
+    }
+
+    #[test]
+    fn test_pos_delete_context_carries_referenced_data_file_inferred_from_bounds() {
+        // A position delete scoped to one data file only through equal file_path bounds must
+        // surface that file as referenced_data_file on the scan task, so consumers can tell it
+        // apart from a partition-scoped delete file without re-reading the manifest entry.
+        let pos_delete =
+            build_pos_delete_with_path_bounds("s3://bucket/a.parquet", "s3://bucket/a.parquet");
+        let ctx = DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
+            partition_spec_id: 0,
+        };
+        let task = FileScanTaskDeleteFile::try_from(&ctx).unwrap();
+        assert_eq!(task.referenced_data_file(), Some("s3://bucket/a.parquet"));
+    }
+
+    #[test]
+    fn test_pos_delete_context_with_explicit_referenced_data_file() {
+        let pos_delete = build_pos_delete_referencing("s3://bucket/a.parquet");
+        let ctx = DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
+            partition_spec_id: 0,
+        };
+        let task = FileScanTaskDeleteFile::try_from(&ctx).unwrap();
+        assert_eq!(task.referenced_data_file(), Some("s3://bucket/a.parquet"));
+    }
+
+    #[test]
+    fn test_partition_scoped_pos_delete_context_has_no_referenced_data_file() {
+        let unequal =
+            build_pos_delete_with_path_bounds("s3://bucket/a.parquet", "s3://bucket/z.parquet");
+        let no_bounds = build_unpartitioned_pos_delete();
+        for pos_delete in [unequal, no_bounds] {
+            let ctx = DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
+                partition_spec_id: 0,
+            };
+            let task = FileScanTaskDeleteFile::try_from(&ctx).unwrap();
+            assert_eq!(task.referenced_data_file(), None);
+        }
     }
 
     #[test]

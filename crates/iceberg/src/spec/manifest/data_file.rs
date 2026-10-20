@@ -29,7 +29,8 @@ use super::{
 };
 use crate::Error;
 use crate::error::{Result, invalid_data};
-use crate::spec::{DEFAULT_PARTITION_SPEC_ID, Struct, StructType, Type};
+use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
+use crate::spec::{DEFAULT_PARTITION_SPEC_ID, PrimitiveLiteral, Struct, StructType, Type};
 
 /// Data file carries data file path, partition tuple, metrics, …
 #[derive(Debug, PartialEq, Clone, Eq, Builder)]
@@ -276,6 +277,40 @@ impl DataFile {
     pub fn referenced_data_file(&self) -> Option<String> {
         self.referenced_data_file.clone()
     }
+    /// Get the single data file this delete file is scoped to, if any.
+    ///
+    /// Returns the explicit `referenced_data_file` field when it is set. For a position delete
+    /// file without the field, falls back to the lower and upper bounds of its `file_path`
+    /// column: when both are present, equal, and string literals, the delete file references
+    /// exactly that one data file. This is the same inference Iceberg Java makes in
+    /// `ContentFileUtil.referencedDataFile`.
+    ///
+    /// Returns `None` for data files, for equality deletes without the explicit field, and for
+    /// position deletes whose bounds are missing, unequal, or not strings. Such a delete file
+    /// may reference several data files and is partition-scoped.
+    pub fn single_referenced_data_file(&self) -> Option<String> {
+        match self.content {
+            DataContentType::Data => return None,
+            DataContentType::EqualityDeletes => return self.referenced_data_file.clone(),
+            DataContentType::PositionDeletes => {}
+        }
+
+        if let Some(path) = &self.referenced_data_file {
+            return Some(path.clone());
+        }
+
+        let lower_bound = self.lower_bounds.get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
+        let upper_bound = self.upper_bounds.get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
+
+        if lower_bound != upper_bound {
+            return None;
+        }
+
+        match lower_bound.literal() {
+            PrimitiveLiteral::String(path) => Some(path.clone()),
+            _ => None,
+        }
+    }
     /// Get the offset in the file where the blob content starts.
     /// Only meaningful for puffin blobs, and required for deletion vectors.
     pub fn content_offset(&self) -> Option<i64> {
@@ -417,7 +452,110 @@ impl std::fmt::Display for DataFileFormat {
 
 #[cfg(test)]
 mod test {
-    use crate::spec::DataContentType;
+    use std::collections::HashMap;
+
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
+    use crate::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Struct};
+
+    fn delete_file(
+        content: DataContentType,
+        referenced_data_file: Option<&str>,
+        bounds: Option<(Datum, Datum)>,
+    ) -> DataFile {
+        let (lower, upper) = match bounds {
+            Some((lower, upper)) => (
+                HashMap::from([(RESERVED_FIELD_ID_DELETE_FILE_PATH, lower)]),
+                HashMap::from([(RESERVED_FIELD_ID_DELETE_FILE_PATH, upper)]),
+            ),
+            None => (HashMap::new(), HashMap::new()),
+        };
+        DataFileBuilder::default()
+            .file_path("delete.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(content)
+            .record_count(1)
+            .referenced_data_file(referenced_data_file.map(str::to_string))
+            .partition(Struct::empty())
+            .file_size_in_bytes(100)
+            .lower_bounds(lower)
+            .upper_bounds(upper)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_single_referenced_data_file_prefers_explicit_field() {
+        let file = delete_file(
+            DataContentType::PositionDeletes,
+            Some("a.parquet"),
+            Some((Datum::string("b.parquet"), Datum::string("b.parquet"))),
+        );
+        assert_eq!(
+            file.single_referenced_data_file().as_deref(),
+            Some("a.parquet")
+        );
+    }
+
+    #[test]
+    fn test_single_referenced_data_file_from_equal_bounds() {
+        let file = delete_file(
+            DataContentType::PositionDeletes,
+            None,
+            Some((Datum::string("a.parquet"), Datum::string("a.parquet"))),
+        );
+        assert_eq!(
+            file.single_referenced_data_file().as_deref(),
+            Some("a.parquet")
+        );
+    }
+
+    #[test]
+    fn test_single_referenced_data_file_unequal_bounds_is_none() {
+        let file = delete_file(
+            DataContentType::PositionDeletes,
+            None,
+            Some((Datum::string("a.parquet"), Datum::string("z.parquet"))),
+        );
+        assert_eq!(file.single_referenced_data_file(), None);
+    }
+
+    #[test]
+    fn test_single_referenced_data_file_one_sided_bounds_is_none() {
+        let mut file = delete_file(
+            DataContentType::PositionDeletes,
+            None,
+            Some((Datum::string("a.parquet"), Datum::string("a.parquet"))),
+        );
+        file.upper_bounds = HashMap::new();
+        assert_eq!(file.single_referenced_data_file(), None);
+    }
+
+    #[test]
+    fn test_single_referenced_data_file_non_string_bounds_is_none() {
+        let file = delete_file(
+            DataContentType::PositionDeletes,
+            None,
+            Some((Datum::long(1), Datum::long(1))),
+        );
+        assert_eq!(file.single_referenced_data_file(), None);
+    }
+
+    #[test]
+    fn test_single_referenced_data_file_ignores_bounds_on_equality_deletes() {
+        let file = delete_file(
+            DataContentType::EqualityDeletes,
+            None,
+            Some((Datum::string("a.parquet"), Datum::string("a.parquet"))),
+        );
+        assert_eq!(file.single_referenced_data_file(), None);
+    }
+
+    #[test]
+    fn test_single_referenced_data_file_is_none_for_data_files() {
+        let file = delete_file(DataContentType::Data, Some("a.parquet"), None);
+        assert_eq!(file.single_referenced_data_file(), None);
+    }
+
     #[test]
     fn test_data_content_type_default() {
         assert_eq!(DataContentType::default(), DataContentType::Data);
