@@ -29,12 +29,23 @@ use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
     Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
+    SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata, TableProperties,
     update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
+
+/// The retention settings of the `main` branch. `SetSnapshotRef` replaces the
+/// whole reference, so a commit to `main` passes them on, as Java does.
+pub(crate) fn main_branch_retention(metadata: &TableMetadata) -> SnapshotRetention {
+    match metadata.refs().get(MAIN_BRANCH) {
+        Some(reference) if matches!(reference.retention, SnapshotRetention::Branch { .. }) => {
+            reference.retention.clone()
+        }
+        _ => SnapshotRetention::branch(None, None, None),
+    }
+}
 
 pub(crate) fn generate_unique_snapshot_id(table: &Table) -> i64 {
     let generate_random_id = || -> i64 {
@@ -732,7 +743,7 @@ impl<'a> SnapshotProducer<'a> {
                 ref_name: MAIN_BRANCH.to_string(),
                 reference: SnapshotReference::new(
                     self.snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
+                    main_branch_retention(self.table.metadata()),
                 ),
             },
         ]]
@@ -757,12 +768,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, Manifest, ManifestContentType,
         ManifestEntry, ManifestStatus, NestedField, PartitionSpec, PrimitiveType, Schema, Struct,
         Transform, Type,
     };
-    use crate::transaction::tests::{make_v2_minimal_table, make_v2_table};
+    use crate::transaction::tests::{
+        make_v2_minimal_table, make_v2_minimal_table_in_catalog, make_v2_table, set_main_retention,
+    };
+    use crate::transaction::{ApplyTransactionAction, Transaction};
 
     fn make_entry(
         path: &str,
@@ -796,6 +811,63 @@ mod tests {
             .with_table(table)
             .with_commit_uuid(Uuid::now_v7())
             .build()
+    }
+
+    #[tokio::test]
+    async fn test_commit_keeps_main_branch_retention() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let file = |path: &str| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .build()
+                .unwrap()
+        };
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .add_data_files(vec![file("test/1.parquet")])
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        let retention =
+            SnapshotRetention::branch(Some(9), Some(3_456_000_000), Some(2_592_000_000));
+        let table = set_main_retention(&catalog, &table, retention.clone()).await;
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .add_data_files(vec![file("test/2.parquet")])
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(table.metadata().refs()[MAIN_BRANCH].retention, retention);
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .rewrite_files()
+            .delete_file(file("test/1.parquet"))
+            .add_file(file("test/3.parquet"))
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(table.metadata().refs()[MAIN_BRANCH].retention, retention);
+        assert_eq!(
+            table.metadata().refs()[MAIN_BRANCH].snapshot_id,
+            table.metadata().current_snapshot_id().unwrap()
+        );
     }
 
     #[tokio::test]
