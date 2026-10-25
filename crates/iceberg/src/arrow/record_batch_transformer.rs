@@ -24,7 +24,7 @@ use arrow_array::{
     Array as ArrowArray, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
     RecordBatchOptions, RunArray, StructArray,
 };
-use arrow_cast::cast;
+use arrow_cast::{CastOptions, cast, cast_with_options};
 use arrow_schema::{
     DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     SchemaRef,
@@ -399,7 +399,24 @@ impl PromotePlan {
     fn apply(&self, array: &ArrayRef) -> Result<ArrayRef> {
         match self {
             PromotePlan::PassThrough => Ok(Arc::clone(array)),
-            PromotePlan::Cast(target_type) => Ok(cast(array.as_ref(), target_type)?),
+            // A value outside the target type's range fails the read, as the spec requires;
+            // the default cast would turn it into NULL.
+            PromotePlan::Cast(target_type) => {
+                cast_with_options(array.as_ref(), target_type, &CastOptions {
+                    safe: false,
+                    ..CastOptions::default()
+                })
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot promote {} to {target_type}: a value is out of range",
+                            array.data_type()
+                        ),
+                    )
+                    .with_source(e)
+                })
+            }
             PromotePlan::Struct { fields, children } => {
                 let source = array
                     .as_struct_opt()

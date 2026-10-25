@@ -2757,4 +2757,62 @@ message schema {
             }
         }
     }
+
+    /// A promoted value outside the range of the table type fails the read: `date` 200000 is in
+    /// the year 2517, after the last `timestamp_ns`.
+    #[tokio::test]
+    async fn test_read_promoted_value_out_of_range_fails() {
+        use arrow_array::Date32Array;
+
+        use crate::arrow::schema_to_arrow_schema;
+
+        let schema = |d| {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "d", Type::Primitive(d)).into(),
+                ])
+                .build()
+                .unwrap()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&schema(PrimitiveType::Date)).unwrap()),
+            vec![Arc::new(Date32Array::from(vec![18000, 200000]))],
+        )
+        .unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/date.parquet", tmp_dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(file_path)
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(Arc::new(schema(PrimitiveType::TimestampNs)))
+                .with_project_field_ids(vec![1])
+                .with_case_sensitive(false)
+                .build()
+                .unwrap())]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let err = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "DataInvalid => Cannot promote Date32 to Timestamp(ns): a value is out of range, \
+             source: Arithmetic overflow: Overflow happened on: 200000 * 86400000000000"
+        );
+    }
 }
