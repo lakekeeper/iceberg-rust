@@ -482,6 +482,36 @@ mod tests {
         assert_eq!(actual, data_files);
     }
 
+    #[test]
+    fn test_data_file_avro_round_trip_with_invalid_partition_names() {
+        let partition_type = StructType::new(vec![
+            NestedField::optional(1000, "v1.day", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(1001, "größe", Type::Primitive(PrimitiveType::String)).into(),
+        ]);
+        let mut data_files = data_files();
+        data_files[0].partition =
+            Struct::from_iter([Some(Literal::int(3)), Some(Literal::string("a"))]);
+        let mut buffer = Vec::new();
+        write_data_files_to_avro(
+            &mut buffer,
+            data_files.clone(),
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+
+        let actual = read_data_files_from_avro(
+            &mut Cursor::new(buffer),
+            &schema(),
+            0,
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+
+        assert_eq!(actual, data_files);
+    }
+
     #[tokio::test]
     async fn test_data_file_serialize_deserialize_v1_data_on_v2_reader() {
         let schema = schema();

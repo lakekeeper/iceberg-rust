@@ -77,6 +77,31 @@ pub(crate) fn sanitize_avro_name(name: &str) -> String {
     sanitized
 }
 
+/// The Avro name of a field: `name` if Avro allows it, else sanitized.
+fn avro_field_name(name: &str) -> String {
+    if is_valid_avro_name(name) {
+        name.to_string()
+    } else {
+        sanitize_avro_name(name)
+    }
+}
+
+/// `struct_type` with its field names as [`schema_to_avro_schema`] writes them,
+/// for values serialized against that schema.
+pub(crate) fn with_avro_field_names(struct_type: &StructType) -> StructType {
+    StructType::new(
+        struct_type
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut field = field.as_ref().clone();
+                field.name = avro_field_name(&field.name);
+                field.into()
+            })
+            .collect(),
+    )
+}
+
 struct SchemaToAvroSchema {
     schema: String,
     /// Names of the `fixed` types defined so far. Avro allows one definition per
@@ -153,7 +178,7 @@ impl SchemaVisitor for SchemaToAvroSchema {
         };
 
         let mut avro_record_field = AvroRecordField {
-            name: field.name.clone(),
+            name: avro_field_name(&field.name),
             schema: field_schema,
             doc: field.doc.clone(),
             aliases: Vec::new(),
@@ -161,6 +186,12 @@ impl SchemaVisitor for SchemaToAvroSchema {
             custom_attributes: Default::default(),
         };
 
+        if avro_record_field.name != field.name {
+            avro_record_field.custom_attributes.insert(
+                ICEBERG_FIELD_NAME_PROP.to_string(),
+                Value::String(field.name.clone()),
+            );
+        }
         avro_record_field.custom_attributes.insert(
             FIELD_ID_PROP.to_string(),
             Value::Number(Number::from(field.id)),
@@ -1457,5 +1488,29 @@ mod tests {
             assert_eq!(is_valid_avro_name(name), valid, "{name}");
             assert_eq!(sanitize_avro_name(name), sanitized, "{name}");
         }
+    }
+
+    #[test]
+    fn test_schema_to_avro_schema_sanitizes_invalid_field_names() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "valid", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "my-col", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let avro_schema = schema_to_avro_schema("r", &schema).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&avro_schema).unwrap(),
+            serde_json::json!({"type": "record", "name": "r", "fields": [
+                {"name": "valid", "type": "int", "field-id": 1},
+                {"name": "my_x2Dcol", "type": ["null", "int"], "default": null,
+                 "iceberg-field-name": "my-col", "field-id": 2},
+            ]})
+        );
+        // A strict Avro reader accepts the names.
+        AvroSchema::parse_str(&serde_json::to_string(&avro_schema).unwrap()).unwrap();
     }
 }
