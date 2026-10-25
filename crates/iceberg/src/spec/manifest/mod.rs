@@ -2493,10 +2493,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_written_manifest_with_invalid_partition_names() {
+    async fn test_write_manifest_sanitizes_invalid_partition_names() {
         let metadata = invalid_partition_names_test_metadata();
-        let mut entry = expected_entry(invalid_partition_names_expected_partition());
-        entry.snapshot_id = None;
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("manifest.avro");
         let output_file = FileIO::new_with_fs()
@@ -2509,16 +2507,41 @@ mod tests {
             metadata.partition_spec.clone(),
         )
         .build_v2_data();
-        writer.add_entry(entry).unwrap();
+        writer
+            .add_entry(expected_entry(invalid_partition_names_expected_partition()))
+            .unwrap();
         writer.write_manifest_file().await.unwrap();
+        let bs = fs::read(path).unwrap();
 
-        let manifest = Manifest::parse_avro(&fs::read(path).unwrap()).unwrap();
-
+        // `apache-avro` reads the header as written, and Java finds the fields by
+        // field ID.
+        let reader = AvroReader::new(bs.as_slice()).unwrap();
+        let mut writer_schema = serde_json::to_value(reader.writer_schema()).unwrap();
+        let partition_fields = writer_schema_field(&mut writer_schema, &["data_file", "partition"])
+            ["type"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| {
+                (
+                    field["name"].clone(),
+                    field["iceberg-field-name"].clone(),
+                    field["field-id"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(partition_fields, vec![
+            ("event_x2Ets_day".into(), "event.ts_day".into(), 1000.into()),
+            ("my_x2Dcol".into(), "my-col".into(), 1001.into()),
+            ("_1st".into(), "1st".into(), 1002.into()),
+            ("a_x20b".into(), "a b".into(), 1003.into()),
+            ("gr_xF6_xDFe".into(), "größe".into(), 1004.into()),
+        ]);
         assert_eq!(
-            manifest,
-            Manifest::new(metadata, vec![expected_entry(
-                invalid_partition_names_expected_partition()
-            )])
+            Manifest::parse_avro(&bs).unwrap().entries()[0]
+                .data_file()
+                .partition(),
+            &invalid_partition_names_expected_partition()
         );
     }
 
