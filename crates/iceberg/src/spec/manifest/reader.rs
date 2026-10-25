@@ -19,18 +19,30 @@ use super::Manifest;
 use crate::encryption::{EncryptedInputFile, StandardKeyMetadata};
 use crate::error::{Result, invalid_data};
 use crate::io::FileIO;
-use crate::spec::{ManifestContentType, ManifestEntry, ManifestFile};
+use crate::spec::{ManifestContentType, ManifestEntry, ManifestFile, TableMetadataRef};
 
 /// Reads a manifest file referenced by a manifest list entry, transparently
 /// decrypting it when the entry records key metadata.
 pub struct ManifestReader {
     file_io: FileIO,
+    table_metadata: Option<TableMetadataRef>,
 }
 
 impl ManifestReader {
     /// Create a manifest reader.
     pub(crate) fn new(file_io: FileIO) -> Self {
-        Self { file_io }
+        Self {
+            file_io,
+            table_metadata: None,
+        }
+    }
+
+    /// Prefer this table metadata's schema and partition spec over the
+    /// manifest's own self-described `schema` / `partition-spec` keys (see
+    /// [`ManifestMetadata::parse_with`](crate::spec::ManifestMetadata::parse_with)).
+    pub(crate) fn with_table_metadata(mut self, table_metadata: TableMetadataRef) -> Self {
+        self.table_metadata = Some(table_metadata);
+        self
     }
 
     /// Read, decrypt, parse and return the manifest described by
@@ -51,8 +63,11 @@ impl ManifestReader {
             None => input_file.read().await?,
         };
 
-        let (metadata, mut entries) =
-            Manifest::try_from_avro_bytes(&bytes, Some(&manifest_file.manifest_path))?;
+        let (metadata, mut entries) = Manifest::try_from_avro_bytes_with(
+            &bytes,
+            Some(&manifest_file.manifest_path),
+            self.table_metadata.as_ref(),
+        )?;
 
         for entry in &mut entries {
             entry.inherit_data(manifest_file);

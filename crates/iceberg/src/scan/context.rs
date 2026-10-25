@@ -46,6 +46,7 @@ pub(crate) struct ManifestFileContext {
     bound_predicates: Option<Arc<BoundPredicates>>,
     object_cache: Arc<ObjectCache>,
     snapshot_schema: SchemaRef,
+    table_metadata: TableMetadataRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     delete_file_index: DeleteFileIndex,
     name_mapping: Option<Arc<NameMapping>>,
@@ -105,6 +106,7 @@ impl ManifestFileContext {
             manifest_file,
             bound_predicates,
             snapshot_schema,
+            table_metadata,
             field_ids,
             mut sender,
             expression_evaluator_cache,
@@ -116,7 +118,9 @@ impl ManifestFileContext {
             sort_orders,
         } = self;
 
-        let manifest = object_cache.get_manifest(&manifest_file).await?;
+        let manifest = object_cache
+            .get_manifest(&manifest_file, &table_metadata)
+            .await?;
 
         // A manifest written under an older schema stores partition values in that
         // schema's (narrower) types. When the current partition type widens the one the
@@ -387,6 +391,7 @@ impl PlanContext {
             sender,
             object_cache: self.object_cache.clone(),
             snapshot_schema: self.snapshot_schema.clone(),
+            table_metadata: self.table_metadata.clone(),
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,

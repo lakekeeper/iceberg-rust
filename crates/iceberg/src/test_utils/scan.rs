@@ -874,6 +874,14 @@ impl TableTestFixture {
             .fields()
             .to_vec();
         fields.push(NestedField::optional(9, "d", PrimitiveType::Date.into()).into());
+        // The schema the data manifest was written under: the partition source `x` still
+        // `int`. It is a table schema, so the manifest records an id the table resolves.
+        let mut written_fields = fields.clone();
+        written_fields[0] = NestedField::required(1, "x", PrimitiveType::Int.into()).into();
+        let written_struct = Schema::builder()
+            .with_fields(written_fields)
+            .build()
+            .unwrap();
         let date_schema = Schema::builder().with_fields(fields).build().unwrap();
         let date_spec = PartitionSpec::builder(date_schema.clone())
             .add_partition_field("x", "x", Transform::Identity)
@@ -883,6 +891,8 @@ impl TableTestFixture {
             .build()
             .unwrap();
         let metadata = TableMetadataBuilder::new_from_metadata(self.table.metadata().clone(), None)
+            .add_schema(written_struct.clone())
+            .unwrap()
             .add_current_schema(date_schema)
             .unwrap()
             .add_default_partition_spec(date_spec.into_unbound())
@@ -890,6 +900,11 @@ impl TableTestFixture {
             .build()
             .unwrap()
             .metadata;
+        let written_schema = metadata
+            .schemas_iter()
+            .find(|schema| schema.as_struct() == written_struct.as_struct())
+            .unwrap()
+            .clone();
         self.table = self.table.clone().with_metadata(Arc::new(metadata));
 
         let current_snapshot = self.table.metadata().current_snapshot().unwrap();
@@ -898,18 +913,6 @@ impl TableTestFixture {
             .unwrap();
         let current_schema = self.table.metadata().current_schema().clone();
         let current_partition_spec = self.table.metadata().default_partition_spec();
-
-        // The schema the data manifest was written under: the partition source `x` still
-        // `int`.
-        let mut fields = current_schema.as_struct().fields().to_vec();
-        fields[0] = NestedField::required(1, "x", PrimitiveType::Int.into()).into();
-        let written_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(0)
-                .with_fields(fields)
-                .build()
-                .unwrap(),
-        );
 
         // Data manifest under the old (int) schema; an Existing entry from the parent
         // snapshot so its sequence number is below the equality delete's.
