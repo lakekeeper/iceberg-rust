@@ -17,6 +17,7 @@
 
 //! Conversion between iceberg and avro schema.
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write;
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{
@@ -34,12 +35,47 @@ use crate::spec::{
 use crate::{Error, ErrorKind, Result, ensure_data_valid};
 
 const ELEMENT_ID: &str = "element-id";
-const FIELD_ID_PROP: &str = "field-id";
+pub(crate) const FIELD_ID_PROP: &str = "field-id";
+/// Holds the Iceberg name of a field whose Avro name was sanitized, as Java writes it.
+pub(crate) const ICEBERG_FIELD_NAME_PROP: &str = "iceberg-field-name";
 const KEY_ID: &str = "key-id";
 const VALUE_ID: &str = "value-id";
 const MAP_LOGICAL_TYPE: &str = "map";
 // This const may better to maintain in avro-rs.
 const LOGICAL_TYPE: &str = "logicalType";
+
+/// Whether `name` is a valid Avro name: `[A-Za-z_][A-Za-z0-9_]*`.
+pub(crate) fn is_valid_avro_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Makes `name` a valid Avro name with the escapes of Java's
+/// `AvroSchemaUtil.sanitize`: a leading digit gets a `_` prefix, and any other
+/// character not allowed becomes `_x` and its UTF-16 code unit in hex. Java
+/// keeps non-ASCII letters and digits, which Avro does not allow, so they are
+/// escaped here.
+pub(crate) fn sanitize_avro_name(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    for (i, unit) in name.encode_utf16().enumerate() {
+        match char::from_u32(u32::from(unit)) {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => sanitized.push(c),
+            Some(c) if c.is_ascii_digit() => {
+                if i == 0 {
+                    sanitized.push('_');
+                }
+                sanitized.push(c);
+            }
+            _ => {
+                let _ = write!(sanitized, "_x{unit:X}");
+            }
+        }
+    }
+    sanitized
+}
 
 struct SchemaToAvroSchema {
     schema: String,
@@ -1403,5 +1439,23 @@ mod tests {
             .unwrap();
         let err = schema_to_avro_schema("t", &schema).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::FeatureUnsupported, "{err}");
+    }
+
+    #[test]
+    fn test_sanitize_avro_name() {
+        // Java's `AvroSchemaUtil.sanitize` gives the same names for ASCII input.
+        for (name, valid, sanitized) in [
+            ("event_ts", true, "event_ts"),
+            ("_1st", true, "_1st"),
+            ("event.ts_day", false, "event_x2Ets_day"),
+            ("my-col", false, "my_x2Dcol"),
+            ("1st", false, "_1st"),
+            ("a b", false, "a_x20b"),
+            ("größe", false, "gr_xF6_xDFe"),
+            ("a😀", false, "a_xD83D_xDE00"),
+        ] {
+            assert_eq!(is_valid_avro_name(name), valid, "{name}");
+            assert_eq!(sanitize_avro_name(name), sanitized, "{name}");
+        }
     }
 }
