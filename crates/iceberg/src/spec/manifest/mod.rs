@@ -35,8 +35,8 @@ use apache_avro::schema::RecordField;
 pub use writer::*;
 
 use super::{
-    Datum, FormatVersion, ManifestContentType, PartitionSpec, PrimitiveType, Schema, Struct, Type,
-    UNASSIGNED_SEQUENCE_NUMBER,
+    Datum, FormatVersion, ManifestContentType, PartitionSpec, PrimitiveType, Schema, Struct,
+    TableMetadataRef, Type, UNASSIGNED_SEQUENCE_NUMBER,
 };
 use crate::avro::{
     FIELD_ID_PROP, ICEBERG_FIELD_NAME_PROP, Resolved, define_named_types_once, sanitize_field_names,
@@ -61,6 +61,18 @@ impl Manifest {
         bs: &[u8],
         location: Option<&str>,
     ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
+        Self::try_from_avro_bytes_with(bs, location, None)
+    }
+
+    /// Like [`Self::try_from_avro_bytes`], but prefers the provided table
+    /// metadata's schema and partition spec over the manifest's own
+    /// self-described `schema` / `partition-spec` keys (see
+    /// [`ManifestMetadata::parse_with`]).
+    pub(crate) fn try_from_avro_bytes_with(
+        bs: &[u8],
+        location: Option<&str>,
+        table_metadata: Option<&TableMetadataRef>,
+    ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
         let rewritten;
         let reader = match AvroReader::new(bs) {
             Ok(reader) => reader,
@@ -72,7 +84,7 @@ impl Manifest {
 
         // Parse manifest metadata
         let meta = reader.user_metadata();
-        let metadata = ManifestMetadata::parse(meta)?;
+        let metadata = ManifestMetadata::parse_with(meta, table_metadata)?;
 
         // Parse manifest entries
         let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
