@@ -2059,4 +2059,59 @@ mod tests {
             .collect();
         assert_eq!(positions, vec![1, 3]);
     }
+
+    // A task waiting for a positional delete file whose load is cancelled, for example
+    // because a sibling delete file of the loading task failed, loads the file itself
+    // and gets all its deletes.
+    #[tokio::test]
+    async fn test_pos_del_waiter_loads_the_file_when_the_load_it_waits_for_is_cancelled() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-del.parquet");
+        let path = path.to_str().unwrap();
+        let batch = RecordBatch::try_new(
+            crate::arrow::delete_filter::tests::create_pos_del_schema(),
+            vec![
+                Arc::new(StringArray::from_iter_values(["data.parquet"; 3])),
+                Arc::new(Int64Array::from_iter_values([1, 3, 5])),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let pos_del = FileScanTaskDeleteFile::builder()
+            .with_file_path(path.to_string())
+            .with_file_size_in_bytes(std::fs::metadata(path).unwrap().len())
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .build()
+            .unwrap();
+        let schema = Arc::new(Schema::builder().build().unwrap());
+        let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 10, Runtime::current());
+
+        let PosDelLoadAction::Load(guard) = loader.delete_filter.try_start_pos_del_load(path)
+        else {
+            panic!("expected Load for a new file");
+        };
+        let waiter = loader.load_deletes(std::slice::from_ref(&pos_del), schema);
+        // On this single-thread runtime, the spawned load runs until it waits for `guard`.
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        let filter = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must be woken")
+            .unwrap()
+            .unwrap();
+        let positions: Vec<u64> = filter
+            .get_delete_vector_for_path("data.parquet")
+            .expect("the waiter must load the deletes")
+            .lock()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(positions, vec![1, 3, 5]);
+    }
 }
