@@ -345,6 +345,10 @@ impl MergingSnapshotProducer {
         self.data_sequence_number = Some(sequence_number);
     }
 
+    pub(crate) fn data_sequence_number(&self) -> Option<i64> {
+        self.data_sequence_number
+    }
+
     pub(crate) fn delete_data_file(&mut self, file: DataFile) {
         self.filter_manager.delete_data_file(&file);
         self.deleted_data_files.push(file);

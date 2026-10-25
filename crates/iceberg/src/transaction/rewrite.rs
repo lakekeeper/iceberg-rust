@@ -30,10 +30,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::{Result, invalid_data};
-use crate::spec::{DataContentType, DataFile, ManifestContentType, Operation};
+use crate::spec::{DataContentType, DataFile, Literal, ManifestContentType, Operation, Struct};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::util::snapshot::ancestors_of;
 
 /// A transaction action that rewrites (replaces) data files and removes
 /// delete files.
@@ -56,16 +57,28 @@ use crate::transaction::{ActionCommit, TransactionAction};
 ///
 /// # Concurrent deletes
 ///
-/// The action records the table's current snapshot when it is created, and
-/// refuses to commit if the table gained a delete manifest after it. Java
-/// narrows that to the files being replaced in
-/// `validateNoNewDeletesForDataFiles`; until that exists here the check is
-/// table-wide, so a delete committed to an unrelated partition while the
-/// rewrite ran also fails the commit with
-/// [`ErrorKind::DataInvalid`](crate::ErrorKind::DataInvalid). So do a
-/// rewrite planned against a table that had no snapshot yet, and one whose
-/// starting snapshot has since been expired: neither can rule out a delete.
-/// Replan the rewrite against the current table and run it again.
+/// The action records the table's current snapshot when it is created; a
+/// delete committed after that snapshot is new. The commit is refused with
+/// [`ErrorKind::DataInvalid`](crate::ErrorKind::DataInvalid) in these cases:
+///
+/// 1. a new position delete or deletion vector names a replaced file;
+/// 2. a new partition-scoped position delete is in a replaced file's partition;
+/// 3. a new equality delete is in a replaced file's partition, or in an
+///    unpartitioned spec. It is skipped when
+///    [`data_sequence_number`](RewriteFilesAction::data_sequence_number) is
+///    set, the delete is newer than that number, and the delete is in an
+///    unpartitioned spec or every added file is in its spec, because the
+///    delete then still applies to the added files. A delete whose spec is
+///    not in the table metadata is never skipped;
+/// 4. always, with or without new deletes, when the rewrite was planned
+///    against a table that had no snapshot yet, or its starting snapshot has
+///    since been expired or is no longer an ancestor of the current one.
+///
+/// This follows Java's `validateNoNewDeletesForDataFiles`, but does not prune
+/// by column bounds and refuses equality deletes whose added files left their
+/// spec. A rewrite that only removes delete files is checked only for its
+/// starting snapshot. Replan a refused rewrite against the current table and
+/// run it again.
 ///
 /// Deletes that were already committed when the rewrite was planned are not
 /// covered by this check. Either apply them while rewriting, or keep them
@@ -74,7 +87,7 @@ use crate::transaction::{ActionCommit, TransactionAction};
 pub struct RewriteFilesAction {
     producer: MergingSnapshotProducer,
     /// The snapshot the rewrite was planned against, if the table had one.
-    /// Deletes newer than it fail the commit.
+    /// Deletes newer than it that can apply to a replaced file fail the commit.
     starting_snapshot_id: Option<i64>,
 }
 
@@ -126,7 +139,8 @@ impl RewriteFilesAction {
     ///
     /// Without this the added files inherit the sequence number of the new
     /// snapshot. A compaction that must not shadow concurrently written
-    /// deletes sets the sequence number of the files it replaces instead.
+    /// deletes sets the sequence number of the snapshot it was planned
+    /// against.
     /// V1 manifest entries carry no sequence number, so this has no effect on
     /// a V1 table.
     pub fn data_sequence_number(mut self, sequence_number: i64) -> Self {
@@ -171,13 +185,8 @@ impl RewriteFilesAction {
         Ok(())
     }
 
-    /// Reject the rewrite when a delete manifest was added after the snapshot
-    /// it was planned against.
-    ///
-    /// Java re-checks those deletes file by file in
-    /// `validateNoNewDeletesForDataFiles`. Until that exists here the commit
-    /// fails closed, because a rewritten file carries the deletes of the files
-    /// it replaces only if nothing was deleted from them in the meantime.
+    /// Reject the rewrite when a delete committed after the snapshot it was
+    /// planned against can apply to a replaced data file.
     async fn validate_no_new_deletes(&self, table: &Table) -> Result<()> {
         // Nothing has been committed, so there is nothing to conflict with.
         // The filter rejects the rewrite for its missing sources instead.
@@ -198,22 +207,118 @@ impl RewriteFilesAction {
                 "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is no longer in the table, so deletes added since it cannot be ruled out."
             ));
         };
+        // Sequence numbers tell new deletes from old ones only along the
+        // starting snapshot's own history.
+        if !ancestors_of(&table.metadata_ref(), current_snapshot.snapshot_id())
+            .any(|snapshot| snapshot.snapshot_id() == starting_snapshot_id)
+        {
+            return Err(invalid_data!(
+                "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is not an ancestor of the current snapshot {}, so deletes added since it cannot be ruled out.",
+                current_snapshot.snapshot_id()
+            ));
+        }
+        // A rewrite that replaces no data file cannot lose a delete.
+        if self.producer.deleted_data_files().is_empty() {
+            return Ok(());
+        }
         let starting_sequence_number = starting_snapshot.sequence_number();
 
+        // A delete committed after the start has a data sequence number above
+        // the start's, in a manifest written after the start. It stays so when
+        // a later snapshot rewrites that manifest and lists it as `Existing`.
         let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
-        let conflict = manifest_list.entries().iter().find(|entry| {
-            entry.content == ManifestContentType::Deletes
-                && entry.sequence_number > starting_sequence_number
+        let new_delete_manifests = manifest_list.entries().iter().filter(|manifest_file| {
+            manifest_file.content == ManifestContentType::Deletes
+                && manifest_file.sequence_number > starting_sequence_number
         });
+        for manifest_file in new_delete_manifests {
+            let manifest = table.manifest_reader().read(manifest_file).await?;
+            let new_deletes = manifest.entries().iter().filter(|entry| {
+                entry.is_alive()
+                    && entry
+                        .sequence_number()
+                        .is_none_or(|sequence_number| sequence_number > starting_sequence_number)
+            });
+            for entry in new_deletes {
+                let delete = entry.data_file();
+                let delete_sequence_number = entry
+                    .sequence_number()
+                    .unwrap_or(manifest_file.sequence_number);
+                if let Some(replaced) =
+                    self.replaced_file_affected_by(table, delete, delete_sequence_number)
+                {
+                    return Err(invalid_data!(
+                        "Cannot rewrite files: the {:?} file {} was added after the starting snapshot {starting_snapshot_id} and can apply to the replaced data file {}.",
+                        delete.content_type(),
+                        delete.file_path,
+                        replaced.file_path
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 
-        match conflict {
-            Some(entry) => Err(invalid_data!(
-                "Cannot rewrite files: delete manifest {} was added after the starting snapshot {starting_snapshot_id}.",
-                entry.manifest_path,
-            )),
-            None => Ok(()),
+    /// The first replaced data file that `delete` can apply to.
+    fn replaced_file_affected_by(
+        &self,
+        table: &Table,
+        delete: &DataFile,
+        delete_sequence_number: i64,
+    ) -> Option<&DataFile> {
+        let mut replaced = self.producer.deleted_data_files().iter();
+        let same_partition = |file: &&DataFile| {
+            file.partition_spec_id == delete.partition_spec_id
+                && may_be_same_partition(&file.partition, &delete.partition)
+        };
+        match delete.content_type() {
+            DataContentType::EqualityDeletes => {
+                // Without its spec the delete's scope is unknown.
+                let Some(spec) = table
+                    .metadata()
+                    .partition_spec_by_id(delete.partition_spec_id)
+                else {
+                    return replaced.next();
+                };
+                let global = spec.is_unpartitioned();
+                // The delete still applies to the added files when they are
+                // older than it and in its spec.
+                let applies_to_added = self
+                    .producer
+                    .data_sequence_number()
+                    .is_some_and(|sequence_number| delete_sequence_number > sequence_number)
+                    && (global
+                        || self
+                            .producer
+                            .added_data_files()
+                            .iter()
+                            .all(|file| file.partition_spec_id == delete.partition_spec_id));
+                if applies_to_added {
+                    return None;
+                }
+                replaced.find(|file| global || same_partition(file))
+            }
+            DataContentType::PositionDeletes => match delete.single_referenced_data_file() {
+                Some(path) => replaced.find(|file| file.file_path == path),
+                None => replaced.find(same_partition),
+            },
+            DataContentType::Data => None,
         }
     }
+}
+
+/// False only when the partition tuples certainly differ. Values of different
+/// types (int to long, float to double promotion) count as equal.
+fn may_be_same_partition(a: &Struct, b: &Struct) -> bool {
+    a.fields().len() != b.fields().len()
+        || a.iter().zip(b.iter()).all(|pair| match pair {
+            (None, None) => true,
+            (None, Some(_)) | (Some(_), None) => false,
+            (Some(Literal::Primitive(x)), Some(Literal::Primitive(y))) => {
+                std::mem::discriminant(x) != std::mem::discriminant(y) || x == y
+            }
+            (Some(_), Some(_)) => true,
+        })
 }
 
 #[async_trait]
@@ -236,9 +341,10 @@ mod tests {
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
-        ManifestEntry, ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus,
-        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, SnapshotRef, Struct,
-        Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
+        MAIN_BRANCH, ManifestEntry, ManifestEntryRef, ManifestFile, ManifestListWriter,
+        ManifestStatus, ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema,
+        SnapshotRef, SnapshotReference, SnapshotRetention, Struct, Transform, Type,
+        UnboundPartitionField, UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::transaction::snapshot::{
@@ -708,37 +814,6 @@ mod tests {
         delete_manifest_path
     }
 
-    /// Add a delete manifest, attributed to the table's current snapshot, to
-    /// that snapshot's manifest list.
-    async fn add_delete_manifest(table: &Table) -> String {
-        let snapshot = table.metadata().current_snapshot().unwrap();
-        let output = table
-            .file_io()
-            .new_output(format!(
-                "{}/deletes-{}.avro",
-                table.metadata().metadata_location().unwrap(),
-                Uuid::new_v4()
-            ))
-            .unwrap();
-        let mut writer = ManifestWriterBuilder::new(
-            output,
-            Some(snapshot.snapshot_id()),
-            table.metadata().current_schema().clone(),
-            table.metadata().default_partition_spec().as_ref().clone(),
-        )
-        .build_v3_deletes();
-        let mut delete_file = make_data_file(table, "test/1-deletes.parquet", 1, 100);
-        delete_file.content = DataContentType::PositionDeletes;
-        writer
-            .add_file(delete_file, snapshot.sequence_number())
-            .unwrap();
-        let delete_manifest = writer.write_manifest_file().await.unwrap();
-        let delete_manifest_path = delete_manifest.manifest_path.clone();
-
-        append_to_manifest_list(table, delete_manifest).await;
-        delete_manifest_path
-    }
-
     /// Rewrite the manifest list of the table's current snapshot so it also
     /// contains `manifest`.
     async fn append_to_manifest_list(table: &Table, manifest: ManifestFile) {
@@ -772,34 +847,45 @@ mod tests {
         manifest_list_writer.close().await.unwrap();
     }
 
-    /// A delete manifest added after the snapshot the rewrite was planned
-    /// against must stop the commit.
+    /// Sequence numbers order deletes only along one history, so a starting
+    /// snapshot that a rollback took off the branch rules nothing out.
     #[tokio::test]
-    async fn test_rewrite_files_rejects_deletes_added_after_starting_snapshot() {
+    async fn test_rewrite_files_rejects_starting_snapshot_off_the_branch() {
         let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
 
         let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
         let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
         let table = append_files(&catalog, &table, vec![f1.clone()]).await;
-
-        // Plan the rewrite against this snapshot, then let another commit land.
-        let tx = Transaction::new(&table);
-        let merged = make_data_file(&table, "test/merged.parquet", 10, 100);
-        let action = Arc::new(tx.rewrite_files().delete_file(f1).add_file(merged));
-
+        let rolled_back_to = table.metadata().current_snapshot().unwrap().snapshot_id();
         let table = append_files(&catalog, &table, vec![f2]).await;
-        let delete_manifest_path = add_delete_manifest(&table).await;
+        let starting_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        let tx = Transaction::new(&table);
+        let action = Arc::new(tx.rewrite_files().delete_file(f1));
+
+        let rollback = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string(),
+                reference: SnapshotReference::new(
+                    rolled_back_to,
+                    SnapshotRetention::branch(None, None, None),
+                ),
+            }])
+            .build();
+        let table = catalog.update_table(rollback).await.unwrap();
 
         let Err(err) = action.commit(&table).await else {
-            panic!("a delete manifest newer than the starting snapshot must be rejected");
+            panic!("a starting snapshot that is not an ancestor must be rejected");
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.to_string().contains(&format!(
-                "delete manifest {delete_manifest_path} was added after"
-            )),
-            "{err}"
+        assert_eq!(
+            err.message(),
+            format!(
+                "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is not an ancestor of the current snapshot {rolled_back_to}, so deletes added since it cannot be ruled out."
+            )
         );
     }
 
@@ -823,10 +909,9 @@ mod tests {
             panic!("a rewrite planned against an empty table must be rejected");
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.to_string()
-                .contains("planned against a table with no snapshot"),
-            "{err}"
+        assert_eq!(
+            err.message(),
+            "Cannot rewrite files: the rewrite was planned against a table with no snapshot, and the table has been committed to since."
         );
     }
 
@@ -867,11 +952,11 @@ mod tests {
             panic!("an expired starting snapshot must be rejected");
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.to_string().contains(&format!(
-                "the starting snapshot {starting_snapshot_id} is no longer in the table"
-            )),
-            "{err}"
+        assert_eq!(
+            err.message(),
+            format!(
+                "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is no longer in the table, so deletes added since it cannot be ruled out."
+            )
         );
     }
 
@@ -1794,5 +1879,429 @@ mod tests {
             (Some(4), Some(40), ManifestStatus::Deleted),
             (Some(44), Some(40), ManifestStatus::Existing),
         ]);
+    }
+
+    // Concurrent deletes: a rewrite is planned, then delete files are committed
+    // before it.
+
+    /// The partition `x=value` of spec 0 of the minimal tables.
+    fn x(value: i64) -> Struct {
+        Struct::from_iter([Some(Literal::long(value))])
+    }
+
+    /// A file named `path`, of spec `spec_id`, scoped to the data file
+    /// `referenced` if given.
+    fn file_in_spec(
+        path: &str,
+        content: DataContentType,
+        spec_id: i32,
+        partition: Struct,
+        referenced: Option<&str>,
+    ) -> DataFile {
+        let mut file = DataFileBuilder::default()
+            .content(content)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(partition)
+            .partition_spec_id(spec_id)
+            .build()
+            .unwrap();
+        file.referenced_data_file = referenced.map(str::to_string);
+        if content == DataContentType::EqualityDeletes {
+            file.equality_ids = Some(vec![1]);
+        }
+        file
+    }
+
+    /// Make `spec` the default and check that it got `spec_id`.
+    async fn set_default_spec(
+        catalog: &impl Catalog,
+        table: &Table,
+        spec: UnboundPartitionSpec,
+        spec_id: i32,
+    ) -> Table {
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![
+                TableUpdate::AddSpec { spec },
+                TableUpdate::SetDefaultSpec { spec_id: -1 },
+            ])
+            .build();
+        let table = catalog.update_table(commit).await.unwrap();
+        assert_eq!(table.metadata().default_partition_spec_id(), spec_id);
+        table
+    }
+
+    /// When an unpartitioned spec (spec id 1) becomes the default, relative to
+    /// the concurrent delete.
+    enum SpecChange {
+        None,
+        BeforeDelete,
+        AfterDelete,
+        /// Before the delete, and spec 0 is the default again after it.
+        AroundDelete,
+    }
+
+    /// The data sequence number the rewrite gives its added files.
+    enum SequenceNumber {
+        New,
+        Start,
+        AboveStart,
+    }
+
+    struct Case {
+        name: &'static str,
+        spec_change: SpecChange,
+        sequence_number: SequenceNumber,
+        output: Option<DataFile>,
+        delete: DataFile,
+        /// The content type named by the refusal, if refused.
+        refused: Option<&'static str>,
+    }
+
+    /// A rewrite of `test/1.parquet` (spec 0, partition `x=1`) is refused only
+    /// for a new delete that can apply to it. `test/2.parquet` shares the
+    /// partition and stays.
+    #[tokio::test]
+    async fn test_rewrite_files_rejects_only_new_deletes_for_replaced_files() {
+        use DataContentType::{EqualityDeletes, PositionDeletes};
+        let deletes = "test/new-deletes.parquet";
+        let output = || {
+            Some(file_in_spec(
+                "test/out.parquet",
+                DataContentType::Data,
+                0,
+                x(1),
+                None,
+            ))
+        };
+        let unpartitioned_output = || {
+            Some(file_in_spec(
+                "test/out.parquet",
+                DataContentType::Data,
+                1,
+                Struct::empty(),
+                None,
+            ))
+        };
+        let cases = [
+            Case {
+                name: "equality delete in the partition, start sequence number",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::Start,
+                output: output(),
+                delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
+                refused: None,
+            },
+            Case {
+                name: "equality delete in the partition, new sequence number",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::New,
+                output: output(),
+                delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
+                refused: Some("EqualityDeletes"),
+            },
+            Case {
+                name: "equality delete in the partition, sequence number above the start",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::AboveStart,
+                output: output(),
+                delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
+                refused: Some("EqualityDeletes"),
+            },
+            Case {
+                name: "equality delete in the partition, output in an unpartitioned spec, start sequence number",
+                spec_change: SpecChange::AfterDelete,
+                sequence_number: SequenceNumber::Start,
+                output: unpartitioned_output(),
+                delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
+                refused: Some("EqualityDeletes"),
+            },
+            Case {
+                name: "equality delete in another partition, new sequence number",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::New,
+                output: output(),
+                delete: file_in_spec(deletes, EqualityDeletes, 0, x(2), None),
+                refused: None,
+            },
+            Case {
+                name: "equality delete in an unpartitioned spec, output in another spec, start sequence number",
+                spec_change: SpecChange::AroundDelete,
+                sequence_number: SequenceNumber::Start,
+                output: output(),
+                delete: file_in_spec(deletes, EqualityDeletes, 1, Struct::empty(), None),
+                refused: None,
+            },
+            Case {
+                name: "equality delete in an unpartitioned spec, output in another spec, new sequence number",
+                spec_change: SpecChange::AroundDelete,
+                sequence_number: SequenceNumber::New,
+                output: output(),
+                delete: file_in_spec(deletes, EqualityDeletes, 1, Struct::empty(), None),
+                refused: Some("EqualityDeletes"),
+            },
+            Case {
+                name: "equality delete in the partition, no output, start sequence number",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::Start,
+                output: None,
+                delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
+                refused: None,
+            },
+            Case {
+                name: "equality delete in the partition, no output, new sequence number",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::New,
+                output: None,
+                delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
+                refused: Some("EqualityDeletes"),
+            },
+            Case {
+                name: "position delete for the replaced file",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::Start,
+                output: output(),
+                delete: file_in_spec(deletes, PositionDeletes, 0, x(1), Some("test/1.parquet")),
+                refused: Some("PositionDeletes"),
+            },
+            Case {
+                name: "position delete for another file of the partition",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::Start,
+                output: output(),
+                delete: file_in_spec(deletes, PositionDeletes, 0, x(1), Some("test/2.parquet")),
+                refused: None,
+            },
+            Case {
+                name: "partition-scoped position delete in the partition",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::Start,
+                output: output(),
+                delete: file_in_spec(deletes, PositionDeletes, 0, x(1), None),
+                refused: Some("PositionDeletes"),
+            },
+            Case {
+                name: "partition-scoped position delete in another partition",
+                spec_change: SpecChange::None,
+                sequence_number: SequenceNumber::Start,
+                output: output(),
+                delete: file_in_spec(deletes, PositionDeletes, 0, x(2), None),
+                refused: None,
+            },
+            Case {
+                name: "partition-scoped position delete of another spec",
+                spec_change: SpecChange::BeforeDelete,
+                sequence_number: SequenceNumber::Start,
+                output: unpartitioned_output(),
+                delete: file_in_spec(deletes, PositionDeletes, 1, Struct::empty(), None),
+                refused: None,
+            },
+        ];
+        for case in cases {
+            let catalog = new_memory_catalog().await;
+            let table = make_v2_minimal_table_in_catalog(&catalog).await;
+            let replaced = make_data_file(&table, "test/1.parquet", 10, 100);
+            let other = make_data_file(&table, "test/2.parquet", 10, 100);
+            let mut table = append_files(&catalog, &table, vec![replaced.clone(), other]).await;
+            let starting_snapshot = table.metadata().current_snapshot().unwrap().clone();
+
+            let mut action = Transaction::new(&table)
+                .rewrite_files()
+                .delete_file(replaced);
+            if let Some(output) = case.output {
+                action = action.add_file(output);
+            }
+            let action = match case.sequence_number {
+                SequenceNumber::New => action,
+                SequenceNumber::Start => {
+                    action.data_sequence_number(starting_snapshot.sequence_number())
+                }
+                SequenceNumber::AboveStart => {
+                    action.data_sequence_number(starting_snapshot.sequence_number() + 1)
+                }
+            };
+            let action = Arc::new(action);
+            let partitioned = table.metadata().default_partition_spec().as_ref().clone();
+            let unpartitioned = UnboundPartitionSpec::builder().build();
+            if let SpecChange::BeforeDelete | SpecChange::AroundDelete = case.spec_change {
+                table = set_default_spec(&catalog, &table, unpartitioned.clone(), 1).await;
+            }
+            table = stage_delete_files(&catalog, &table, vec![case.delete]).await;
+            match case.spec_change {
+                SpecChange::AfterDelete => {
+                    table = set_default_spec(&catalog, &table, unpartitioned, 1).await;
+                }
+                SpecChange::AroundDelete => {
+                    table = set_default_spec(&catalog, &table, partitioned.into(), 0).await;
+                }
+                SpecChange::None | SpecChange::BeforeDelete => {}
+            }
+
+            let outcome = action.commit(&table).await.map(|_| ()).map_err(|err| {
+                assert_eq!(err.kind(), ErrorKind::DataInvalid, "{}", case.name);
+                err.message().to_string()
+            });
+            let expected = case.refused.map_or(Ok(()), |content| {
+                Err(format!(
+                    "Cannot rewrite files: the {content} file {deletes} was added after the starting snapshot {} and can apply to the replaced data file test/1.parquet.",
+                    starting_snapshot.snapshot_id()
+                ))
+            });
+            assert_eq!(outcome, expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_may_be_same_partition() {
+        let tuple = |value: Option<Literal>| Struct::from_iter([value]);
+        let cases = [
+            (Some(Literal::int(1)), Some(Literal::long(1)), true),
+            (Some(Literal::long(1)), Some(Literal::long(2)), false),
+            (None, Some(Literal::long(1)), false),
+            (None, None, true),
+            (
+                Some(Literal::float(1.5_f32)),
+                Some(Literal::double(1.5_f64)),
+                true,
+            ),
+        ];
+        for (a, b, expected) in cases {
+            let case = format!("{a:?} / {b:?}");
+            assert_eq!(
+                may_be_same_partition(&tuple(a), &tuple(b)),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// Removing a delete file after the start rewrites its delete manifest
+    /// under a new sequence number; the deletes it keeps are as old as before
+    /// and do not stop the rewrite.
+    #[tokio::test]
+    async fn test_rewrite_files_ignores_delete_manifests_rewritten_since_the_start() {
+        use DataContentType::PositionDeletes;
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let replaced = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![replaced.clone()]).await;
+        let removed = file_in_spec(
+            "test/1-deletes-a.parquet",
+            PositionDeletes,
+            0,
+            x(1),
+            Some("test/1.parquet"),
+        );
+        let kept = file_in_spec(
+            "test/1-deletes-b.parquet",
+            PositionDeletes,
+            0,
+            x(1),
+            Some("test/1.parquet"),
+        );
+        let table = stage_delete_files(&catalog, &table, vec![removed.clone(), kept]).await;
+        let starting_sequence_number = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .delete_file(replaced)
+            .data_sequence_number(starting_sequence_number);
+        let action = Arc::new(action);
+
+        let tx = Transaction::new(&table);
+        let removal = tx.rewrite_files().delete_delete_file(removed);
+        let table = removal.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let delete_manifests = manifests_of(&table, ManifestContentType::Deletes).await;
+        assert_eq!(delete_manifests.len(), 1);
+        assert_eq!(
+            delete_manifests[0].sequence_number,
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number()
+        );
+
+        action.commit(&table).await.unwrap();
+    }
+
+    /// A delete added after the start is still new once a later snapshot has
+    /// rewritten its manifest and lists it as `Existing`, as a Java writer's
+    /// manifest merge does.
+    #[tokio::test]
+    async fn test_rewrite_files_rejects_new_deletes_in_rewritten_delete_manifests() {
+        use DataContentType::PositionDeletes;
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let replaced = make_data_file(&table, "test/1.parquet", 10, 100);
+        let other = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![replaced.clone(), other]).await;
+        let starting_snapshot = table.metadata().current_snapshot().unwrap().clone();
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .delete_file(replaced)
+            .data_sequence_number(starting_snapshot.sequence_number());
+        let action = Arc::new(action);
+
+        let new = file_in_spec(
+            "test/1-deletes.parquet",
+            PositionDeletes,
+            0,
+            x(1),
+            Some("test/1.parquet"),
+        );
+        let removed = file_in_spec(
+            "test/2-deletes.parquet",
+            PositionDeletes,
+            0,
+            x(1),
+            Some("test/2.parquet"),
+        );
+        let table = stage_delete_files(&catalog, &table, vec![new, removed.clone()]).await;
+        let staged = table.metadata().current_snapshot().unwrap().clone();
+        let tx = Transaction::new(&table);
+        let removal = tx.rewrite_files().delete_delete_file(removed);
+        let table = removal.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let removal_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let delete_manifests = manifests_of(&table, ManifestContentType::Deletes).await;
+        assert_eq!(delete_manifests.len(), 1);
+        let staged_seq = Some(staged.sequence_number());
+        assert_eq!(entries_of(&table, &delete_manifests[0]).await, vec![
+            (
+                "test/1-deletes.parquet".to_string(),
+                ManifestStatus::Existing,
+                Some(staged.snapshot_id()),
+                staged_seq,
+                staged_seq,
+            ),
+            (
+                "test/2-deletes.parquet".to_string(),
+                ManifestStatus::Deleted,
+                Some(removal_snapshot_id),
+                staged_seq,
+                staged_seq,
+            ),
+        ]);
+
+        let Err(err) = action.commit(&table).await else {
+            panic!("a new delete for the replaced file must be rejected");
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            format!(
+                "Cannot rewrite files: the PositionDeletes file test/1-deletes.parquet was added after the starting snapshot {} and can apply to the replaced data file test/1.parquet.",
+                starting_snapshot.snapshot_id()
+            )
+        );
     }
 }
