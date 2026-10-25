@@ -267,20 +267,14 @@ impl DeleteFilter {
         *entry.lock().unwrap() |= delete_vector;
     }
 
+    /// Stores the equality delete set that `eq_del` delivers, and wakes the tasks
+    /// waiting on `notify`, the notifier from [`Self::try_start_eq_del_load`].
     pub(crate) fn insert_equality_delete(
         &self,
         delete_file_path: &str,
+        notify: Arc<Notify>,
         eq_del: Receiver<Arc<EqDeleteSet>>,
     ) {
-        let notify = Arc::new(Notify::new());
-        {
-            let mut state = self.state.write().unwrap();
-            state.equality_deletes.insert(
-                delete_file_path.to_string(),
-                EqDelState::Loading(notify.clone()),
-            );
-        }
-
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         self.runtime.cpu().spawn(async move {
@@ -593,9 +587,36 @@ pub(crate) mod tests {
     }
 
     fn insert_set(filter: &DeleteFilter, path: &str, set: EqDeleteSet) {
+        let notify = filter.try_start_eq_del_load(path).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete(path, rx);
+        filter.insert_equality_delete(path, notify, rx);
         tx.send(Arc::new(set)).unwrap();
+    }
+
+    // A task that finds the load started before the loader stores its receiver
+    // must be woken when the set arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_equality_delete_waiter_wakes_when_it_starts_waiting_before_insert() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "eq-a.parquet";
+        let notify = filter.try_start_eq_del_load(path).unwrap();
+        let waiter = filter.get_equality_delete_set_for_delete_file_path(path);
+        tokio::pin!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        filter.insert_equality_delete(path, notify, rx);
+        let set = Arc::new(EqDeleteSet {
+            keys: HashSet::from([EqDeleteKey(vec![Some(Datum::long(1))])]),
+            fields: vec![("id".to_string(), 1, Type::Primitive(PrimitiveType::Long))],
+        });
+        tx.send(set.clone()).unwrap();
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must be woken")
+            .unwrap();
+        assert!(Arc::ptr_eq(&loaded, &set));
     }
 
     // Delete files that key on different equality columns must not be merged.
