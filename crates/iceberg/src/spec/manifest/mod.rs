@@ -31,13 +31,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use apache_avro::Reader as AvroReader;
 use apache_avro::error::Details;
+use apache_avro::schema::RecordField;
 pub use writer::*;
 
 use super::{
     Datum, FormatVersion, ManifestContentType, PartitionSpec, PrimitiveType, Schema, Struct, Type,
     UNASSIGNED_SEQUENCE_NUMBER,
 };
-use crate::avro::{Resolved, define_named_types_once};
+use crate::avro::{
+    FIELD_ID_PROP, ICEBERG_FIELD_NAME_PROP, Resolved, define_named_types_once, sanitize_field_names,
+};
 use crate::error::{Error, Result, invalid_data};
 
 /// Whether a manifest with repeated Avro named type definitions was logged at
@@ -61,43 +64,10 @@ impl Manifest {
         let rewritten;
         let reader = match AvroReader::new(bs) {
             Ok(reader) => reader,
-            // iceberg-rust repeated `decimal` definitions before
-            // `schema_to_avro_schema` defined each named type once, so this
-            // fallback stays while tables can contain manifests it wrote.
-            Err(e) if matches!(e.details(), Details::AmbiguousSchemaDefinition(_)) => {
-                let (bs, repeated) = match define_named_types_once(bs) {
-                    Ok(Some(rewrite)) => rewrite,
-                    Ok(None) => return Err(e.into()),
-                    Err(rewrite_error) => {
-                        return Err(Error::from(e).with_context(
-                            "error defining each named type once",
-                            rewrite_error.to_string(),
-                        ));
-                    }
-                };
-                rewritten = bs;
-                let reader = AvroReader::new(rewritten.as_slice()).map_err(|retry_error| {
-                    Error::from(e).with_context(
-                        "error after defining each named type once",
-                        retry_error.to_string(),
-                    )
-                })?;
-                let location = location.unwrap_or("<unknown location>");
-                if WARNED_REPEATED_DEFINITIONS.swap(true, Ordering::Relaxed) {
-                    tracing::debug!(
-                        "Manifest {location} defines Avro named types {repeated:?} more than once."
-                    );
-                } else {
-                    tracing::warn!(
-                        "Manifest {location} defines Avro named types {repeated:?} more than once, \
-                         which the Avro specification doesn't allow. Reading it with each repeated \
-                         definition replaced by a reference to the first. Later manifests like \
-                         this are logged at debug level."
-                    );
-                }
-                reader
+            Err(e) => {
+                rewritten = rewrite_rejected_header(bs, e, location)?;
+                AvroReader::new(rewritten.as_slice())?
             }
-            Err(e) => return Err(e.into()),
         };
 
         // Parse manifest metadata
@@ -109,7 +79,11 @@ impl Manifest {
         // Wrap the partition type once and share it across all entries: the
         // per-entry conversion needs a `&Type`, and building it here keeps the
         // lazily-populated field-name lookup from being rebuilt for every entry.
-        let partition_struct_type = Type::Struct(partition_type.clone());
+        // Its fields carry the writer's names; the resulting partition is positional.
+        let partition_struct_type = Type::Struct(writer_partition_type(
+            reader.writer_schema(),
+            &partition_type,
+        ));
 
         let entries = match metadata.format_version {
             FormatVersion::V1 => reader
@@ -169,6 +143,142 @@ impl Manifest {
     }
 }
 
+/// Rewrites the header of a manifest that `apache-avro` rejected with `error`,
+/// and returns the rewritten file once `apache-avro` reads its header.
+fn rewrite_rejected_header(
+    bs: &[u8],
+    error: apache_avro::Error,
+    location: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut rewritten = bs.to_vec();
+    let mut renamed = None;
+    let mut repeated = None;
+    let mut retry_error: Option<apache_avro::Error> = None;
+    loop {
+        let rewrite = match retry_error.as_ref().unwrap_or(&error).details() {
+            // Java writes non-ASCII field names as they are, and iceberg-rust
+            // wrote partition field names as they are.
+            Details::FieldName(_) if renamed.is_none() => {
+                sanitize_field_names(&rewritten).map(|rewrite| {
+                    rewrite.map(|(bs, names)| {
+                        renamed = Some(names);
+                        bs
+                    })
+                })
+            }
+            // iceberg-rust repeated `decimal` definitions before
+            // `schema_to_avro_schema` defined each named type once, so this
+            // fallback stays while tables can contain manifests it wrote.
+            Details::AmbiguousSchemaDefinition(_) if repeated.is_none() => {
+                define_named_types_once(&rewritten).map(|rewrite| {
+                    rewrite.map(|(bs, names)| {
+                        repeated = Some(names);
+                        bs
+                    })
+                })
+            }
+            _ => {
+                return Err(match retry_error {
+                    None => error.into(),
+                    Some(retry_error) => Error::from(error).with_context(
+                        "error after rewriting the Avro header",
+                        retry_error.to_string(),
+                    ),
+                });
+            }
+        };
+        match rewrite {
+            Ok(Some(bs)) => rewritten = bs,
+            Ok(None) => return Err(error.into()),
+            Err(rewrite_error) => {
+                return Err(Error::from(error)
+                    .with_context("error rewriting the Avro header", rewrite_error.to_string()));
+            }
+        }
+        if let Err(e) = AvroReader::new(rewritten.as_slice()) {
+            retry_error = Some(e);
+            continue;
+        }
+        let location = location.unwrap_or("<unknown location>");
+        if let Some(renamed) = renamed {
+            tracing::debug!(
+                "Manifest {location} has Avro field names {renamed:?} that Avro doesn't allow. \
+                 Reading it with the names sanitized."
+            );
+        }
+        if let Some(repeated) = repeated {
+            if WARNED_REPEATED_DEFINITIONS.swap(true, Ordering::Relaxed) {
+                tracing::debug!(
+                    "Manifest {location} defines Avro named types {repeated:?} more than once."
+                );
+            } else {
+                tracing::warn!(
+                    "Manifest {location} defines Avro named types {repeated:?} more than once, \
+                     which the Avro specification doesn't allow. Reading it with each repeated \
+                     definition replaced by a reference to the first. Later manifests like \
+                     this are logged at debug level."
+                );
+            }
+        }
+        return Ok(rewritten);
+    }
+}
+
+/// `partition_type` with each field named as the writer's Avro field. Java
+/// renames fields whose names Avro does not allow and keeps the field ID, so a
+/// field is matched by field ID, then by `iceberg-field-name`, then by name.
+fn writer_partition_type(
+    writer_schema: &apache_avro::Schema,
+    partition_type: &super::StructType,
+) -> super::StructType {
+    let writer_fields = record_field(writer_schema, "data_file")
+        .and_then(|data_file| record_field(&data_file.schema, "partition"))
+        .and_then(|partition| match &partition.schema {
+            apache_avro::Schema::Record(record) => Some(record.fields.as_slice()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    super::StructType::new(
+        partition_type
+            .fields()
+            .iter()
+            .map(|field| {
+                writer_fields
+                    .iter()
+                    .find(|w| {
+                        w.custom_attributes
+                            .get(FIELD_ID_PROP)
+                            .and_then(serde_json::Value::as_i64)
+                            == Some(i64::from(field.id))
+                    })
+                    .or_else(|| {
+                        writer_fields.iter().find(|w| {
+                            w.custom_attributes
+                                .get(ICEBERG_FIELD_NAME_PROP)
+                                .and_then(serde_json::Value::as_str)
+                                == Some(field.name.as_str())
+                        })
+                    })
+                    .map_or_else(
+                        || field.clone(),
+                        |w| {
+                            let mut field = field.as_ref().clone();
+                            field.name = w.name.clone();
+                            field.into()
+                        },
+                    )
+            })
+            .collect(),
+    )
+}
+
+fn record_field<'a>(schema: &'a apache_avro::Schema, name: &str) -> Option<&'a RecordField> {
+    match schema {
+        apache_avro::Schema::Record(record) => record.fields.iter().find(|f| f.name == name),
+        _ => None,
+    }
+}
+
 /// Serialize a DataFile to a JSON string.
 pub fn serialize_data_file_to_json(
     data_file: DataFile,
@@ -211,7 +321,7 @@ mod tests {
     use super::*;
     use crate::ErrorKind;
     use crate::io::FileIO;
-    use crate::spec::{Literal, NestedField, PrimitiveType, Struct, Transform, Type};
+    use crate::spec::{Literal, NestedField, PrimitiveType, Struct, StructType, Transform, Type};
 
     #[tokio::test]
     async fn test_parse_manifest_v2_unpartition() {
@@ -2224,6 +2334,209 @@ mod tests {
             })
             .collect();
         assert_eq!(manifest, Manifest::new(metadata, entries));
+    }
+
+    /// Metadata for the partition name tests: a V2 data manifest whose partition
+    /// field names Avro does not allow, as Spark names them.
+    fn invalid_partition_names_test_metadata() -> ManifestMetadata {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(
+                        1,
+                        "event",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                2,
+                                "ts",
+                                Type::Primitive(PrimitiveType::Timestamp),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::optional(3, "my-col", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(4, "1st", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(5, "a b", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(6, "größe", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("event.ts", "event.ts_day", Transform::Day)
+            .unwrap()
+            .add_partition_field("my-col", "my-col", Transform::Identity)
+            .unwrap()
+            .add_partition_field("1st", "1st", Transform::Identity)
+            .unwrap()
+            .add_partition_field("a b", "a b", Transform::Identity)
+            .unwrap()
+            .add_partition_field("größe", "größe", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        ManifestMetadata {
+            schema_id: 0,
+            schema,
+            partition_spec,
+            content: ManifestContentType::Data,
+            format_version: FormatVersion::V2,
+        }
+    }
+
+    fn invalid_partition_names_expected_partition() -> Struct {
+        Struct::from_iter([
+            Some(Literal::date(20459)),
+            Some(Literal::string("m2")),
+            Some(Literal::int(7)),
+            Some(Literal::string("sp2")),
+            Some(Literal::long(8)),
+        ])
+    }
+
+    /// Renames record fields in the header of an Avro file, to write names that
+    /// `apache-avro` refuses to parse.
+    fn rename_header_fields(bs: &[u8], renames: &[(&str, &str)]) -> Vec<u8> {
+        fn rename(schema: &mut Value, renames: &[(&str, &str)]) {
+            match schema {
+                Value::Array(schemas) => schemas.iter_mut().for_each(|s| rename(s, renames)),
+                Value::Object(object) => {
+                    if let Some(Value::Array(fields)) = object.get_mut("fields") {
+                        for field in fields.iter_mut() {
+                            if let Some((_, to)) =
+                                renames.iter().find(|(from, _)| field["name"] == *from)
+                            {
+                                field["name"] = Value::from(*to);
+                            }
+                        }
+                    }
+                    object.values_mut().for_each(|s| rename(s, renames));
+                }
+                _ => {}
+            }
+        }
+        crate::avro::rewrite_schema(bs, |schema| {
+            rename(schema, renames);
+            Some(())
+        })
+        .unwrap()
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn test_parse_manifest_with_java_sanitized_partition_names() {
+        // Java renames fields that Avro does not allow and keeps the field ID and
+        // the original name. It writes non-ASCII letters as they are. The writer
+        // orders the fields differently from the spec.
+        let metadata = invalid_partition_names_test_metadata();
+        let writer_schema = v2_writer_schema(serde_json::json!([
+            {"name": "_1st", "type": ["null", "int"], "default": null,
+             "iceberg-field-name": "1st", "field-id": 1002},
+            {"name": "event_x2Ets_day", "type": ["null", {"type": "int", "logicalType": "date"}],
+             "default": null, "iceberg-field-name": "event.ts_day", "field-id": 1000},
+            {"name": "my_x2Dcol", "type": ["null", "string"], "default": null,
+             "iceberg-field-name": "my-col", "field-id": 1001},
+            {"name": "a_x20b", "type": ["null", "string"], "default": null,
+             "iceberg-field-name": "a b", "field-id": 1003},
+            {"name": "groesse", "type": ["null", "long"], "default": null, "field-id": 1004},
+        ]));
+        let bs = write_with_writer_schema(&metadata, &writer_schema, vec![v2_entry(
+            serde_json::json!({"_1st": 7, "event_x2Ets_day": 20459, "my_x2Dcol": "m2",
+                               "a_x20b": "sp2", "groesse": 8}),
+        )]);
+        let bs = rename_header_fields(&bs, &[("groesse", "größe")]);
+
+        let manifest = Manifest::parse_avro(&bs).unwrap();
+
+        assert_eq!(
+            manifest,
+            Manifest::new(metadata, vec![expected_entry(
+                invalid_partition_names_expected_partition()
+            )])
+        );
+    }
+
+    #[test]
+    fn test_parse_manifest_with_unsanitized_partition_names() {
+        // Partition field names as they are, without field IDs.
+        let metadata = invalid_partition_names_test_metadata();
+        let writer_schema = v2_writer_schema(serde_json::json!([
+            {"name": "f0", "type": ["null", {"type": "int", "logicalType": "date"}], "default": null},
+            {"name": "f1", "type": ["null", "string"], "default": null},
+            {"name": "f2", "type": ["null", "int"], "default": null},
+            {"name": "f3", "type": ["null", "string"], "default": null},
+            {"name": "f4", "type": ["null", "long"], "default": null},
+        ]));
+        let bs = write_with_writer_schema(&metadata, &writer_schema, vec![v2_entry(
+            serde_json::json!({"f0": 20459, "f1": "m2", "f2": 7, "f3": "sp2", "f4": 8}),
+        )]);
+        let bs = rename_header_fields(&bs, &[
+            ("f0", "event.ts_day"),
+            ("f1", "my-col"),
+            ("f2", "1st"),
+            ("f3", "a b"),
+            ("f4", "größe"),
+        ]);
+
+        let manifest = Manifest::parse_avro(&bs).unwrap();
+
+        assert_eq!(
+            manifest,
+            Manifest::new(metadata, vec![expected_entry(
+                invalid_partition_names_expected_partition()
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_written_manifest_with_invalid_partition_names() {
+        let metadata = invalid_partition_names_test_metadata();
+        let mut entry = expected_entry(invalid_partition_names_expected_partition());
+        entry.snapshot_id = None;
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("manifest.avro");
+        let output_file = FileIO::new_with_fs()
+            .new_output(path.to_str().unwrap())
+            .unwrap();
+        let mut writer = ManifestWriterBuilder::new(
+            output_file,
+            Some(7),
+            metadata.schema.clone(),
+            metadata.partition_spec.clone(),
+        )
+        .build_v2_data();
+        writer.add_entry(entry).unwrap();
+        writer.write_manifest_file().await.unwrap();
+
+        let manifest = Manifest::parse_avro(&fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(
+            manifest,
+            Manifest::new(metadata, vec![expected_entry(
+                invalid_partition_names_expected_partition()
+            )])
+        );
+    }
+
+    #[test]
+    fn test_parse_manifest_with_invalid_partition_names_and_repeated_named_types() {
+        let bs = fs::read(format!(
+            "{}/testdata/manifests/repeated-decimal-type-definitions.avro",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let bs = rename_header_fields(&bs, &[("d2", "d.2")]);
+
+        let manifest = Manifest::parse_avro(&bs).unwrap();
+
+        assert_eq!(
+            *manifest.entries()[0].data_file().partition(),
+            Struct::from_iter([Some(Literal::decimal(12345)), Some(Literal::decimal(-678))])
+        );
     }
 
     #[test]

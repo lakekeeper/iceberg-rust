@@ -20,7 +20,7 @@ mod deserializer;
 mod named_types;
 mod schema;
 pub(crate) use deserializer::Resolved;
-pub(crate) use named_types::define_named_types_once;
+pub(crate) use named_types::{define_named_types_once, sanitize_field_names};
 #[cfg(test)]
-pub(crate) use named_types::define_named_types_repeatedly;
+pub(crate) use named_types::{define_named_types_repeatedly, rewrite_schema};
 pub(crate) use schema::*;

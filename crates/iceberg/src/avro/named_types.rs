@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reading Avro files whose schema defines a named type more than once.
+//! Reading Avro files whose header `apache-avro` rejects.
 //!
 //! The Avro specification allows one definition per full name. iceberg-rust
 //! wrote manifests that define a `fixed` or `decimal` type once for every field
@@ -23,6 +23,11 @@
 //! rejects such a file's header. Rewriting each repeated definition as a
 //! reference to the first one keeps those files readable, because a reference
 //! decodes the same bytes as the definition it refers to.
+//!
+//! Java writes field names with non-ASCII letters as they are, and iceberg-rust
+//! wrote any partition field name as it is, while `apache-avro` accepts only
+//! `[A-Za-z_][A-Za-z0-9_]*`. Field names don't change how a record is encoded,
+//! so renaming them in the header keeps those files readable.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -34,6 +39,7 @@ use apache_avro::types::Value as AvroValue;
 use apache_avro::writer::datum::GenericDatumWriter;
 use serde_json::{Map, Value as JsonValue};
 
+use super::{ICEBERG_FIELD_NAME_PROP, is_valid_avro_name, sanitize_avro_name};
 use crate::Result;
 use crate::error::invalid_data;
 
@@ -48,10 +54,57 @@ pub(crate) fn define_named_types_once(bs: &[u8]) -> Result<Option<(Vec<u8>, Vec<
     rewrite_schema(bs, reference_repeated_definitions)
 }
 
+/// Rewrites the header of an Avro object container file so that each record
+/// field name that Avro does not allow is sanitized, with the original name in
+/// `iceberg-field-name` unless the field has one. Returns the rewritten file and
+/// the original names, or `None` if all names are valid.
+pub(crate) fn sanitize_field_names(bs: &[u8]) -> Result<Option<(Vec<u8>, Vec<String>)>> {
+    rewrite_schema(bs, |schema| {
+        let mut renamed = Vec::new();
+        sanitize_record_field_names(schema, &mut renamed);
+        (!renamed.is_empty()).then_some(renamed)
+    })
+}
+
+fn sanitize_record_field_names(schema: &mut JsonValue, renamed: &mut Vec<String>) {
+    match schema {
+        JsonValue::Array(schemas) => schemas
+            .iter_mut()
+            .for_each(|schema| sanitize_record_field_names(schema, renamed)),
+        JsonValue::Object(object) => {
+            if let Some(JsonValue::Array(fields)) = object.get_mut("fields") {
+                for field in fields.iter_mut().filter_map(JsonValue::as_object_mut) {
+                    let Some(name) = field.get("name").and_then(JsonValue::as_str) else {
+                        continue;
+                    };
+                    if is_valid_avro_name(name) {
+                        continue;
+                    }
+                    let name = name.to_string();
+                    field.insert(
+                        "name".to_string(),
+                        JsonValue::String(sanitize_avro_name(&name)),
+                    );
+                    field
+                        .entry(ICEBERG_FIELD_NAME_PROP)
+                        .or_insert_with(|| JsonValue::String(name.clone()));
+                    renamed.push(name);
+                }
+            }
+            for key in ["type", "items", "values", "fields"] {
+                if let Some(child) = object.get_mut(key) {
+                    sanitize_record_field_names(child, renamed);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Rewrites the schema in the header of an Avro object container file with
 /// `rewrite`, leaving the data blocks as they are. Returns `None` if `rewrite`
 /// does.
-fn rewrite_schema<T>(
+pub(crate) fn rewrite_schema<T>(
     bs: &[u8],
     rewrite: impl FnOnce(&mut JsonValue) -> Option<T>,
 ) -> Result<Option<(Vec<u8>, T)>> {
