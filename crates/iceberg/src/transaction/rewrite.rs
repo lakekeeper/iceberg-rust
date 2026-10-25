@@ -19,7 +19,8 @@
 //!
 //! [`RewriteFilesAction`] replaces a set of data files with a new set while
 //! keeping the logical table contents unchanged. This is used for compaction —
-//! merging many small files into fewer large ones.
+//! merging many small files into fewer large ones — and for removing delete
+//! files that no longer apply to any live data file.
 //!
 //! The resulting snapshot uses [`Operation::Replace`] to indicate that files
 //! were reorganised without changing the data.
@@ -29,12 +30,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::{Result, invalid_data};
-use crate::spec::{DataFile, ManifestContentType, Operation};
+use crate::spec::{DataContentType, DataFile, ManifestContentType, Operation};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
 use crate::transaction::{ActionCommit, TransactionAction};
 
-/// A transaction action that rewrites (replaces) data files.
+/// A transaction action that rewrites (replaces) data files and removes
+/// delete files.
 ///
 /// This is the Rust equivalent of Java's `BaseRewriteFiles`. It uses
 /// `MergingSnapshotProducer` to handle manifest filtering and creation,
@@ -87,9 +89,28 @@ impl RewriteFilesAction {
     /// Register a data file to be removed from the table.
     ///
     /// The file must exist in the current snapshot; otherwise the commit
-    /// will fail with a validation error.
+    /// will fail with a validation error. Remove delete files with
+    /// [`delete_delete_file`](Self::delete_delete_file).
     pub fn delete_file(mut self, file: DataFile) -> Self {
         self.producer.delete_data_file(file);
+        self
+    }
+
+    /// Register a delete file to be removed from the table: a position or
+    /// equality delete file, or a deletion vector.
+    ///
+    /// The file must be live in the current snapshot; otherwise the commit
+    /// will fail with a validation error. A deletion vector is matched by
+    /// path, content offset and size, so other vectors in the same Puffin
+    /// file stay.
+    ///
+    /// The action does not check that the delete still applies to no live
+    /// data file. [`Transaction::commit`](crate::transaction::Transaction::commit)
+    /// retries a conflict on the newer snapshot without re-checking. A caller
+    /// that removes deletes because they no longer apply should commit the
+    /// action's updates once and re-plan on conflict.
+    pub fn delete_delete_file(mut self, file: DataFile) -> Self {
+        self.producer.delete_delete_file(file);
         self
     }
 
@@ -114,9 +135,37 @@ impl RewriteFilesAction {
     }
 
     fn validate(&self) -> Result<()> {
-        if !self.producer.has_deleted_data_files() {
+        let deleted_data_files = self.producer.deleted_data_files();
+        let deleted_delete_files = self.producer.deleted_delete_files();
+        if let Some(file) = deleted_data_files
+            .iter()
+            .find(|file| file.content_type() != DataContentType::Data)
+        {
+            return Err(invalid_data!(
+                "Cannot rewrite files: {} is a {:?} file, remove it with delete_delete_file",
+                file.file_path,
+                file.content_type()
+            ));
+        }
+        if let Some(file) = deleted_delete_files
+            .iter()
+            .find(|file| file.content_type() == DataContentType::Data)
+        {
+            return Err(invalid_data!(
+                "Cannot rewrite files: {} is a data file, remove it with delete_file",
+                file.file_path
+            ));
+        }
+        if deleted_data_files.is_empty() && deleted_delete_files.is_empty() {
             return Err(invalid_data!(
                 "Rewrite files requires at least one file to delete"
+            ));
+        }
+        // As in Java: data added by a `replace` snapshot that replaces no data
+        // would be skipped by incremental readers.
+        if deleted_data_files.is_empty() && !self.producer.added_data_files().is_empty() {
+            return Err(invalid_data!(
+                "Data files to add must be empty because there's no data file to be rewritten"
             ));
         }
         Ok(())
@@ -187,11 +236,14 @@ mod tests {
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
-        ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
-        NestedField, Operation, PrimitiveType, Schema, SnapshotRef, Struct, Transform, Type,
-        UnboundPartitionField, UnboundPartitionSpec,
+        ManifestEntry, ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, SnapshotRef, Struct,
+        Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
     };
     use crate::table::Table;
+    use crate::transaction::snapshot::{
+        DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    };
     use crate::transaction::tests::{
         append_files, make_data_file, make_v1_minimal_table_in_catalog,
         make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
@@ -1361,5 +1413,386 @@ mod tests {
             vec!["ts=2026-08-24+09%3A30%3A00+UTC", "ts_day=2026-08-24"],
             "{summary:?}"
         );
+    }
+
+    // Removing delete files: the writer side is staged with `SnapshotProducer`,
+    // which also records the delete totals the removal lowers.
+
+    /// Adds delete files and keeps every live manifest, as a merge-on-read
+    /// writer does.
+    struct AddDeletesOperation;
+
+    impl SnapshotProduceOperation for AddDeletesOperation {
+        fn operation(&self) -> Operation {
+            Operation::Overwrite
+        }
+
+        fn truncate_full_table(&self) -> bool {
+            false
+        }
+
+        async fn delete_entries(&self, _: &SnapshotProducer<'_>) -> Result<Vec<ManifestEntry>> {
+            Ok(vec![])
+        }
+
+        async fn existing_manifest(
+            &self,
+            producer: &SnapshotProducer<'_>,
+        ) -> Result<Vec<ManifestFile>> {
+            let snapshot = producer.table.metadata().current_snapshot().unwrap();
+            let manifest_list = producer.table.manifest_list_reader(snapshot).load().await?;
+            Ok(manifest_list
+                .consume_entries()
+                .into_iter()
+                .filter(|m| m.has_added_files() || m.has_existing_files())
+                .collect())
+        }
+    }
+
+    /// Commit `delete_files` in one new delete manifest.
+    async fn stage_delete_files(
+        catalog: &impl Catalog,
+        table: &Table,
+        delete_files: Vec<DataFile>,
+    ) -> Table {
+        let mut commit = SnapshotProducer::builder()
+            .with_table(table)
+            .with_commit_uuid(Uuid::now_v7())
+            .with_added_delete_files(delete_files)
+            .build()
+            .commit(AddDeletesOperation, DefaultManifestProcess)
+            .await
+            .unwrap();
+        let table_commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .updates(commit.take_updates())
+            .requirements(commit.take_requirements())
+            .build();
+        catalog.update_table(table_commit).await.unwrap()
+    }
+
+    fn make_delete_file(
+        table: &Table,
+        path: &str,
+        content: DataContentType,
+        records: u64,
+    ) -> DataFile {
+        let mut file = make_data_file(table, path, records, 100);
+        file.content = content;
+        if content == DataContentType::EqualityDeletes {
+            file.equality_ids = Some(vec![1]);
+        }
+        file
+    }
+
+    /// A v2 table with one data file and one staged position delete file.
+    async fn table_with_position_delete(catalog: &impl Catalog) -> (Table, DataFile, DataFile) {
+        let table = make_v2_minimal_table_in_catalog(catalog).await;
+        let data = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(catalog, &table, vec![data.clone()]).await;
+        let deletes = make_delete_file(
+            &table,
+            "test/1-deletes.parquet",
+            DataContentType::PositionDeletes,
+            2,
+        );
+        let table = stage_delete_files(catalog, &table, vec![deletes.clone()]).await;
+        (table, data, deletes)
+    }
+
+    async fn manifests_of(table: &Table, content: ManifestContentType) -> Vec<ManifestFile> {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        manifest_list
+            .consume_entries()
+            .into_iter()
+            .filter(|m| m.content == content)
+            .collect()
+    }
+
+    fn properties(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// Path, status, snapshot id, data and file sequence number of an entry.
+    type EntryIds = (
+        String,
+        ManifestStatus,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    /// The entries of `manifest_file`, sorted by path.
+    async fn entries_of(table: &Table, manifest_file: &ManifestFile) -> Vec<EntryIds> {
+        let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+        let mut entries: Vec<_> = manifest
+            .entries()
+            .iter()
+            .map(|e| {
+                (
+                    e.file_path().to_string(),
+                    e.status(),
+                    e.snapshot_id(),
+                    e.sequence_number(),
+                    e.file_sequence_number,
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// Removing one of two position delete files rewrites their delete
+    /// manifest as a delete manifest: the survivor keeps its ids, the removed
+    /// file is recorded with its own sequence numbers, and data manifests stay.
+    #[tokio::test]
+    async fn test_rewrite_files_removes_a_position_delete_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let data = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![data]).await;
+        let removed = make_delete_file(
+            &table,
+            "test/1-deletes-a.parquet",
+            DataContentType::PositionDeletes,
+            2,
+        );
+        let kept = make_delete_file(
+            &table,
+            "test/1-deletes-b.parquet",
+            DataContentType::PositionDeletes,
+            3,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![removed.clone(), kept]).await;
+        let staged = table.metadata().current_snapshot().unwrap().clone();
+        let data_manifests = manifests_of(&table, ManifestContentType::Data).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_delete_file(removed);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Replace);
+        assert_eq!(
+            snapshot.summary().additional_properties,
+            properties(&[
+                ("changed-partition-count", "1"),
+                ("removed-delete-files", "1"),
+                ("removed-files-size", "100"),
+                ("removed-position-delete-files", "1"),
+                ("removed-position-deletes", "2"),
+                ("total-data-files", "1"),
+                ("total-delete-files", "1"),
+                ("total-equality-deletes", "0"),
+                ("total-files-size", "200"),
+                ("total-position-deletes", "3"),
+                ("total-records", "10"),
+            ])
+        );
+
+        assert_eq!(
+            manifests_of(&table, ManifestContentType::Data).await,
+            data_manifests
+        );
+        let delete_manifests = manifests_of(&table, ManifestContentType::Deletes).await;
+        assert_eq!(delete_manifests.len(), 1);
+        let staged_seq = Some(staged.sequence_number());
+        assert_eq!(entries_of(&table, &delete_manifests[0]).await, vec![
+            (
+                "test/1-deletes-a.parquet".to_string(),
+                ManifestStatus::Deleted,
+                Some(snapshot.snapshot_id()),
+                staged_seq,
+                staged_seq,
+            ),
+            (
+                "test/1-deletes-b.parquet".to_string(),
+                ManifestStatus::Existing,
+                Some(staged.snapshot_id()),
+                staged_seq,
+                staged_seq,
+            ),
+        ]);
+    }
+
+    /// Removing the only entry of an equality delete manifest keeps that
+    /// manifest with just the deleted entry, as the data path does, and passes
+    /// the other delete manifest through.
+    #[tokio::test]
+    async fn test_rewrite_files_removes_an_equality_delete_file() {
+        let catalog = new_memory_catalog().await;
+        let (table, _, _) = table_with_position_delete(&catalog).await;
+        let position_manifests = manifests_of(&table, ManifestContentType::Deletes).await;
+        let equality = make_delete_file(
+            &table,
+            "test/eq-deletes.parquet",
+            DataContentType::EqualityDeletes,
+            4,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![equality.clone()]).await;
+        let staged = table.metadata().current_snapshot().unwrap().clone();
+
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_delete_file(equality);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(
+            snapshot.summary().additional_properties,
+            properties(&[
+                ("changed-partition-count", "1"),
+                ("removed-delete-files", "1"),
+                ("removed-equality-delete-files", "1"),
+                ("removed-equality-deletes", "4"),
+                ("removed-files-size", "100"),
+                ("total-data-files", "1"),
+                ("total-delete-files", "1"),
+                ("total-equality-deletes", "0"),
+                ("total-files-size", "200"),
+                ("total-position-deletes", "2"),
+                ("total-records", "10"),
+            ])
+        );
+
+        let delete_manifests = manifests_of(&table, ManifestContentType::Deletes).await;
+        assert_eq!(delete_manifests.len(), 2);
+        assert_eq!(delete_manifests[0], position_manifests[0]);
+        let emptied = &delete_manifests[1];
+        assert!(!emptied.has_added_files() && !emptied.has_existing_files());
+        let staged_seq = Some(staged.sequence_number());
+        assert_eq!(entries_of(&table, emptied).await, vec![(
+            "test/eq-deletes.parquet".to_string(),
+            ManifestStatus::Deleted,
+            Some(snapshot.snapshot_id()),
+            staged_seq,
+            staged_seq,
+        )]);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_missing_delete_file() {
+        let catalog = new_memory_catalog().await;
+        let (table, _, _) = table_with_position_delete(&catalog).await;
+        let ghost = make_delete_file(
+            &table,
+            "test/ghost-deletes.parquet",
+            DataContentType::PositionDeletes,
+            1,
+        );
+
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_delete_file(ghost);
+        let err = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "Failed to find the following files to delete in the current snapshot: test/ghost-deletes.parquet"
+        );
+    }
+
+    /// A delete-only rewrite refuses what Java refuses, and a file given to
+    /// the method of the other content is refused instead of removed.
+    #[tokio::test]
+    async fn test_rewrite_files_refuses_invalid_delete_file_removals() {
+        let catalog = new_memory_catalog().await;
+        let (table, data, deletes) = table_with_position_delete(&catalog).await;
+        let added = make_data_file(&table, "test/added.parquet", 10, 100);
+
+        let cases: [(&str, RewriteFilesAction, &str); 3] = [
+            (
+                "data file given to delete_delete_file",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(data.clone()),
+                "Cannot rewrite files: test/1.parquet is a data file, remove it with delete_file",
+            ),
+            (
+                "delete file given to delete_file",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_file(deletes.clone()),
+                "Cannot rewrite files: test/1-deletes.parquet is a PositionDeletes file, remove it with delete_delete_file",
+            ),
+            (
+                "data file added without a data file removed",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(deletes)
+                    .add_file(added),
+                "Data files to add must be empty because there's no data file to be rewritten",
+            ),
+        ];
+        for (case, action, message) in cases {
+            let Err(err) = Arc::new(action).commit(&table).await else {
+                panic!("{case}: the rewrite must be refused");
+            };
+            assert_eq!(err.kind(), ErrorKind::DataInvalid, "{case}");
+            assert_eq!(err.message(), message, "{case}");
+        }
+    }
+
+    /// Removing one of two deletion vectors in the same Puffin file leaves the
+    /// other one live.
+    #[tokio::test]
+    async fn test_rewrite_files_removes_one_deletion_vector_of_a_puffin_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let data_1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let data_2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![data_1, data_2]).await;
+        let dv = |referenced: &str, offset: i64| {
+            let mut file = make_delete_file(
+                &table,
+                "test/dvs.puffin",
+                DataContentType::PositionDeletes,
+                1,
+            );
+            file.file_format = DataFileFormat::Puffin;
+            file.referenced_data_file = Some(referenced.to_string());
+            file.content_offset = Some(offset);
+            file.content_size_in_bytes = Some(40);
+            file
+        };
+        let removed = dv("test/1.parquet", 4);
+        let kept = dv("test/2.parquet", 44);
+        let table = stage_delete_files(&catalog, &table, vec![removed.clone(), kept]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_delete_file(removed);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let delete_manifests = manifests_of(&table, ManifestContentType::Deletes).await;
+        assert_eq!(delete_manifests.len(), 1);
+        let manifest = table
+            .manifest_reader()
+            .read(&delete_manifests[0])
+            .await
+            .unwrap();
+        let mut entries: Vec<_> = manifest
+            .entries()
+            .iter()
+            .map(|e| {
+                (
+                    e.data_file().content_offset(),
+                    e.data_file().content_size_in_bytes(),
+                    e.status(),
+                )
+            })
+            .collect();
+        entries.sort_by_key(|(offset, _, _)| *offset);
+        assert_eq!(entries, vec![
+            (Some(4), Some(40), ManifestStatus::Deleted),
+            (Some(44), Some(40), ManifestStatus::Existing),
+        ]);
     }
 }

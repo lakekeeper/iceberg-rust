@@ -71,32 +71,66 @@ fn new_manifest_writer(
     }
 }
 
-/// Filters existing manifests by removing entries for deleted data files.
+/// Names a file to remove, as Java's `DataFileWrapper` and `DeleteFileWrapper`
+/// do. Data files are matched by path in data manifests. Delete files are
+/// matched in delete manifests by path, content offset and size, because a
+/// deletion vector is one blob of a Puffin file that other vectors can share.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RemovedFileKey {
+    manifest_content: ManifestContentType,
+    path: String,
+    content_offset: Option<i64>,
+    content_size_in_bytes: Option<i64>,
+}
+
+impl RemovedFileKey {
+    fn new(manifest_content: ManifestContentType, file: &DataFile) -> Self {
+        let (content_offset, content_size_in_bytes) = match manifest_content {
+            ManifestContentType::Data => (None, None),
+            ManifestContentType::Deletes => (file.content_offset, file.content_size_in_bytes),
+        };
+        Self {
+            manifest_content,
+            path: file.file_path.clone(),
+            content_offset,
+            content_size_in_bytes,
+        }
+    }
+}
+
+/// Filters existing manifests by removing entries for deleted files.
 ///
 /// This is equivalent to Java's `ManifestFilterManager`. When a rewrite or
 /// overwrite operation deletes files, the filter manager rewrites affected
 /// manifests so that deleted entries are dropped and surviving entries are
 /// re-emitted with [`ManifestStatus::Existing`].
 pub(crate) struct ManifestFilterManager {
-    deleted_file_paths: HashSet<String>,
+    deleted_files: HashSet<RemovedFileKey>,
     fail_missing_delete_paths: bool,
 }
 
 impl ManifestFilterManager {
     pub(crate) fn new(fail_missing_delete_paths: bool) -> Self {
         Self {
-            deleted_file_paths: HashSet::new(),
+            deleted_files: HashSet::new(),
             fail_missing_delete_paths,
         }
     }
 
-    pub(crate) fn add_delete(&mut self, path: String) {
-        self.deleted_file_paths.insert(path);
+    pub(crate) fn delete_data_file(&mut self, file: &DataFile) {
+        self.deleted_files
+            .insert(RemovedFileKey::new(ManifestContentType::Data, file));
     }
 
-    /// Filter `manifests` by removing entries whose file path is in the delete
-    /// set. Returns the surviving manifests plus a [`SnapshotSummaryCollector`]
-    /// that recorded metrics for every removed file.
+    pub(crate) fn delete_delete_file(&mut self, file: &DataFile) {
+        self.deleted_files
+            .insert(RemovedFileKey::new(ManifestContentType::Deletes, file));
+    }
+
+    /// Filter `manifests` by removing the live entries of the files to delete,
+    /// each from the manifests of its own content type. Returns the surviving
+    /// manifests plus a [`SnapshotSummaryCollector`] that recorded metrics for
+    /// every removed file.
     pub(crate) async fn filter_manifests(
         &self,
         table: &Table,
@@ -105,28 +139,37 @@ impl ManifestFilterManager {
         commit_uuid: Uuid,
         manifest_counter: &AtomicU64,
     ) -> Result<(Vec<ManifestFile>, SnapshotSummaryCollector)> {
-        if self.deleted_file_paths.is_empty() {
+        if self.deleted_files.is_empty() {
             return Ok((manifests, SnapshotSummaryCollector::default()));
         }
 
         let mut result: Vec<ManifestFile> = Vec::with_capacity(manifests.len());
         let mut removed_collector = SnapshotSummaryCollector::default();
-        let mut found_paths: HashSet<String> = HashSet::new();
+        let mut found_files: HashSet<RemovedFileKey> = HashSet::new();
+        let target_contents: HashSet<ManifestContentType> = self
+            .deleted_files
+            .iter()
+            .map(|key| key.manifest_content)
+            .collect();
 
         for manifest_file in &manifests {
-            // Only filter data manifests; pass delete manifests through unchanged.
-            if manifest_file.content != ManifestContentType::Data {
+            // A manifest that cannot hold any file to delete is not read.
+            if !target_contents.contains(&manifest_file.content) {
                 result.push(manifest_file.clone());
                 continue;
             }
 
             let manifest = table.manifest_reader().read(manifest_file).await?;
+            let is_removed = |entry: &ManifestEntry| {
+                entry.is_alive()
+                    && self.deleted_files.contains(&RemovedFileKey::new(
+                        manifest_file.content,
+                        entry.data_file(),
+                    ))
+            };
 
             // Check whether this manifest contains any files we want to delete.
-            let has_deletes = manifest
-                .entries()
-                .iter()
-                .any(|e| e.is_alive() && self.deleted_file_paths.contains(e.file_path()));
+            let has_deletes = manifest.entries().iter().any(|e| is_removed(e));
 
             if !has_deletes {
                 // Manifest is unaffected — pass through verbatim.
@@ -155,9 +198,12 @@ impl ManifestFilterManager {
             let mut surviving_entries: Vec<ManifestEntry> = Vec::new();
             let mut removed_entries: Vec<ManifestEntry> = Vec::new();
             for entry in manifest.entries() {
-                if entry.is_alive() && self.deleted_file_paths.contains(entry.file_path()) {
+                if is_removed(entry) {
                     // Record removal metrics.
-                    found_paths.insert(entry.file_path().to_string());
+                    found_files.insert(RemovedFileKey::new(
+                        manifest_file.content,
+                        entry.data_file(),
+                    ));
                     removed_collector.remove_file(
                         entry.data_file(),
                         schema.clone(),
@@ -214,7 +260,7 @@ impl ManifestFilterManager {
                 table,
                 output_file,
                 Some(snapshot_id),
-                ManifestContentType::Data,
+                manifest_file.content,
                 schema.clone(),
                 manifest_spec.as_ref().clone(),
             )?;
@@ -234,10 +280,9 @@ impl ManifestFilterManager {
         // Validate that every delete target was found.
         if self.fail_missing_delete_paths {
             let missing: Vec<&str> = self
-                .deleted_file_paths
-                .iter()
-                .filter(|p| !found_paths.contains(p.as_str()))
-                .map(String::as_str)
+                .deleted_files
+                .difference(&found_files)
+                .map(|key| key.path.as_str())
                 .collect();
             if !missing.is_empty() {
                 return Err(invalid_data!(
@@ -251,7 +296,7 @@ impl ManifestFilterManager {
     }
 }
 
-/// Shared engine for operations that both add and remove data files.
+/// Shared engine for operations that both add and remove files.
 ///
 /// This struct is the Rust equivalent of Java's `MergingSnapshotProducer`.
 /// It manages:
@@ -268,6 +313,7 @@ pub(crate) struct MergingSnapshotProducer {
     operation: Operation,
     added_data_files: Vec<DataFile>,
     deleted_data_files: Vec<DataFile>,
+    deleted_delete_files: Vec<DataFile>,
     filter_manager: ManifestFilterManager,
     commit_uuid: Uuid,
     data_sequence_number: Option<i64>,
@@ -283,6 +329,7 @@ impl MergingSnapshotProducer {
             operation,
             added_data_files: Vec::new(),
             deleted_data_files: Vec::new(),
+            deleted_delete_files: Vec::new(),
             filter_manager: ManifestFilterManager::new(true),
             commit_uuid: Uuid::now_v7(),
             data_sequence_number: None,
@@ -299,12 +346,25 @@ impl MergingSnapshotProducer {
     }
 
     pub(crate) fn delete_data_file(&mut self, file: DataFile) {
-        self.filter_manager.add_delete(file.file_path.clone());
+        self.filter_manager.delete_data_file(&file);
         self.deleted_data_files.push(file);
     }
 
-    pub(crate) fn has_deleted_data_files(&self) -> bool {
-        !self.deleted_data_files.is_empty()
+    pub(crate) fn delete_delete_file(&mut self, file: DataFile) {
+        self.filter_manager.delete_delete_file(&file);
+        self.deleted_delete_files.push(file);
+    }
+
+    pub(crate) fn added_data_files(&self) -> &[DataFile] {
+        &self.added_data_files
+    }
+
+    pub(crate) fn deleted_data_files(&self) -> &[DataFile] {
+        &self.deleted_data_files
+    }
+
+    pub(crate) fn deleted_delete_files(&self) -> &[DataFile] {
+        &self.deleted_delete_files
     }
 
     /// Reject a data sequence number above the one the new snapshot will carry.
