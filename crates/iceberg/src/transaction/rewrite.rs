@@ -335,6 +335,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use futures::TryStreamExt;
     use uuid::Uuid;
 
     use super::*;
@@ -1240,6 +1241,205 @@ mod tests {
         live
     }
 
+    /// After `p` is promoted from int to long, a rewrite that removes one of two files
+    /// written before the promotion rewrites their manifest and keeps both tuples as `Int(5)`.
+    #[tokio::test]
+    async fn test_rewrite_files_rewrites_a_manifest_written_before_a_promotion() {
+        let catalog = new_memory_catalog().await;
+        let namespace = NamespaceIdent::new(format!("ns1-{}", Uuid::new_v4()));
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = |p_type: PrimitiveType| {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "p", Type::Primitive(p_type)).into(),
+                ])
+                .build()
+                .unwrap()
+        };
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![2])
+                    .name("p")
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .build();
+        let creation = TableCreation::builder()
+            .name("events".to_string())
+            .schema(schema(PrimitiveType::Int))
+            .partition_spec(spec)
+            .format_version(FormatVersion::V2)
+            .build();
+        let table = catalog.create_table(&namespace, creation).await.unwrap();
+        let replaced = make_file_in_spec("test/replaced.parquet", 10, 0, Literal::int(5));
+        let kept = make_file_in_spec("test/kept.parquet", 10, 0, Literal::int(5));
+        let table = append_files(&catalog, &table, vec![replaced.clone(), kept]).await;
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![
+                TableUpdate::AddSchema {
+                    schema: schema(PrimitiveType::Long),
+                },
+                TableUpdate::SetCurrentSchema { schema_id: -1 },
+            ])
+            .build();
+        let table = catalog.update_table(commit).await.unwrap();
+
+        let added = make_file_in_spec("test/added.parquet", 10, 0, Literal::long(5));
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_file(replaced).add_file(added);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let partitions = data_entry_partitions(&table).await;
+        let int_5 = Struct::from_iter([Some(Literal::int(5))]);
+        assert_eq!(partitions, vec![
+            (
+                "test/added.parquet".to_string(),
+                ManifestStatus::Added,
+                Struct::from_iter([Some(Literal::long(5))])
+            ),
+            (
+                "test/kept.parquet".to_string(),
+                ManifestStatus::Existing,
+                int_5.clone()
+            ),
+            (
+                "test/replaced.parquet".to_string(),
+                ManifestStatus::Deleted,
+                int_5
+            ),
+        ]);
+    }
+
+    /// The old spec's source column `p` was dropped after `identity(q)` replaced it. A rewrite
+    /// of an old file keeps the stored values of its manifest.
+    #[tokio::test]
+    async fn test_rewrite_files_after_dropping_an_old_partition_source() {
+        let catalog = new_memory_catalog().await;
+        let namespace = NamespaceIdent::new(format!("ns1-{}", Uuid::new_v4()));
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let id = || NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into();
+        let int_field = |field_id, name: &str| {
+            NestedField::required(field_id, name, Type::Primitive(PrimitiveType::Int)).into()
+        };
+        let identity_on = |source_id: i32, name: &str| {
+            UnboundPartitionSpec::builder()
+                .add_partition_field(
+                    UnboundPartitionField::builder()
+                        .source_ids(vec![source_id])
+                        .name(name.to_string())
+                        .transform(Transform::Identity)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap()
+                .build()
+        };
+        let creation = TableCreation::builder()
+            .name("events".to_string())
+            .schema(
+                Schema::builder()
+                    .with_fields(vec![id(), int_field(2, "p"), int_field(3, "q")])
+                    .build()
+                    .unwrap(),
+            )
+            .partition_spec(identity_on(2, "p"))
+            .format_version(FormatVersion::V2)
+            .build();
+        let table = catalog.create_table(&namespace, creation).await.unwrap();
+        let replaced = make_file_in_spec("test/replaced.parquet", 10, 0, Literal::int(5));
+        let kept = make_file_in_spec("test/kept.parquet", 10, 0, Literal::int(6));
+        let table = append_files(&catalog, &table, vec![replaced.clone(), kept]).await;
+        let delete = file_in_spec(
+            "test/kept-eq-deletes.parquet",
+            DataContentType::EqualityDeletes,
+            0,
+            Struct::from_iter([Some(Literal::int(6))]),
+            None,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![delete]).await;
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![
+                TableUpdate::AddSpec {
+                    spec: identity_on(3, "q"),
+                },
+                TableUpdate::SetDefaultSpec { spec_id: -1 },
+                TableUpdate::AddSchema {
+                    schema: Schema::builder()
+                        .with_fields(vec![id(), int_field(3, "q")])
+                        .build()
+                        .unwrap(),
+                },
+                TableUpdate::SetCurrentSchema { schema_id: -1 },
+            ])
+            .build();
+        let table = catalog.update_table(commit).await.unwrap();
+
+        let added = make_file_in_spec("test/added.parquet", 10, 1, Literal::int(7));
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_file(replaced).add_file(added);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let partitions = data_entry_partitions(&table).await;
+        assert_eq!(partitions, vec![
+            (
+                "test/added.parquet".to_string(),
+                ManifestStatus::Added,
+                Struct::from_iter([Some(Literal::int(7))])
+            ),
+            (
+                "test/kept.parquet".to_string(),
+                ManifestStatus::Existing,
+                Struct::from_iter([Some(Literal::int(6))])
+            ),
+            (
+                "test/replaced.parquet".to_string(),
+                ManifestStatus::Deleted,
+                Struct::from_iter([Some(Literal::int(5))])
+            ),
+        ]);
+
+        // The equality delete of the old partition still applies to the kept file.
+        let mut attached: Vec<(String, Vec<String>)> = table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .map_ok(|task| {
+                let deletes = task
+                    .deletes()
+                    .iter()
+                    .map(|delete| delete.file_path().to_string())
+                    .collect();
+                (task.data_file_path().to_string(), deletes)
+            })
+            .try_collect()
+            .await
+            .unwrap();
+        attached.sort();
+        assert_eq!(attached, vec![
+            ("test/added.parquet".to_string(), vec![]),
+            ("test/kept.parquet".to_string(), vec![
+                "test/kept-eq-deletes.parquet".to_string()
+            ]),
+        ]);
+    }
+
     /// Two old-spec files and one new-spec file; returns the table and the
     /// snapshot that appended the old-spec files.
     async fn spec_evolved_table_with_files(
@@ -1593,6 +1793,23 @@ mod tests {
             .into_iter()
             .filter(|m| m.content == content)
             .collect()
+    }
+
+    /// Path, status and stored partition of every entry in the data manifests, sorted by path.
+    async fn data_entry_partitions(table: &Table) -> Vec<(String, ManifestStatus, Struct)> {
+        let mut partitions = Vec::new();
+        for manifest_file in manifests_of(table, ManifestContentType::Data).await {
+            let manifest = table.manifest_reader().read(&manifest_file).await.unwrap();
+            for entry in manifest.entries() {
+                partitions.push((
+                    entry.file_path().to_string(),
+                    entry.status(),
+                    entry.data_file().partition().clone(),
+                ));
+            }
+        }
+        partitions.sort_by(|a, b| a.0.cmp(&b.0));
+        partitions
     }
 
     fn properties(pairs: &[(&str, &str)]) -> HashMap<String, String> {

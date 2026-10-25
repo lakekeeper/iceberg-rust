@@ -190,7 +190,9 @@ impl ManifestFilterManager {
                     )
                 })?
                 .clone();
-            let schema = table.metadata().current_schema().clone();
+            // The rewritten manifest keeps the schema it was written with, so its stored
+            // partition values keep fitting their types after a promotion or a dropped column.
+            let schema = manifest.metadata().schema.clone();
 
             // Rewrite: keep surviving entries as EXISTING, and record the
             // removed ones as DELETED so that the file they name can be
