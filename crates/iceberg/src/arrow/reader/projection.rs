@@ -204,31 +204,45 @@ impl ArrowReader {
         );
         let iceberg_schema = arrow_schema_to_schema(&projected_arrow_schema)?;
 
+        let mut unreadable_field = None;
         fields.filter_leaves(|idx, field| {
             let Some(field_id) = parquet_field_id(field) else {
                 return false;
             };
 
-            let iceberg_field = iceberg_schema_of_task.field_by_id(field_id);
-            let parquet_iceberg_field = iceberg_schema.field_by_id(field_id);
-
-            if iceberg_field.is_none() || parquet_iceberg_field.is_none() {
+            let (Some(iceberg_field), Some(parquet_iceberg_field)) = (
+                iceberg_schema_of_task.field_by_id(field_id),
+                iceberg_schema.field_by_id(field_id),
+            ) else {
                 return false;
-            }
+            };
 
+            // Leaving the column out would read it as NULL although the file has values.
             if !type_promotion_is_valid(
-                parquet_iceberg_field
-                    .unwrap()
-                    .field_type
-                    .as_primitive_type(),
-                iceberg_field.unwrap().field_type.as_primitive_type(),
+                parquet_iceberg_field.field_type.as_primitive_type(),
+                iceberg_field.field_type.as_primitive_type(),
             ) {
+                unreadable_field.get_or_insert_with(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot read column {} (field ID {field_id}): the data file stores \
+                             it as {}, which cannot be read as {}",
+                            iceberg_field.name,
+                            parquet_iceberg_field.field_type,
+                            iceberg_field.field_type
+                        ),
+                    )
+                });
                 return false;
             }
 
             column_map.insert(field_id, idx);
             true
         });
+        if let Some(err) = unreadable_field {
+            return Err(err);
+        }
 
         // Schema evolution: New columns may not exist in old Parquet files.
         // We only project existing columns; RecordBatchTransformer adds default/NULL values.
@@ -2661,5 +2675,86 @@ message schema {
             .await
             .unwrap();
         assert_eq!(result, vec![expected]);
+    }
+
+    /// A column whose file type the reader cannot promote to the table type fails the read:
+    /// leaving it out of the projection would fill it with NULL although the file has values.
+    #[tokio::test]
+    async fn test_read_column_with_unpromotable_type_fails() {
+        use arrow_array::{Date32Array, Int32Array, Int64Array};
+
+        use crate::arrow::schema_to_arrow_schema;
+
+        fn schema(c: PrimitiveType) -> Schema {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "c", Type::Primitive(c)).into(),
+                    NestedField::optional(2, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap()
+        }
+
+        let cases: [(PrimitiveType, ArrayRef, PrimitiveType, &str); 2] = [
+            (
+                PrimitiveType::Date,
+                Arc::new(Date32Array::from(vec![18000])),
+                PrimitiveType::String,
+                "DataInvalid => Cannot read column c (field ID 1): the data file stores it as \
+                 date, which cannot be read as string",
+            ),
+            (
+                PrimitiveType::Long,
+                Arc::new(Int64Array::from(vec![1])),
+                PrimitiveType::Int,
+                "DataInvalid => Cannot read column c (field ID 1): the data file stores it as \
+                 long, which cannot be read as int",
+            ),
+        ];
+        for (file_type, values, table_type, expected) in cases {
+            let file_schema = schema(file_type);
+            let batch = RecordBatch::try_new(
+                Arc::new(schema_to_arrow_schema(&file_schema).unwrap()),
+                vec![values, Arc::new(Int32Array::from(vec![7]))],
+            )
+            .unwrap();
+
+            let tmp_dir = TempDir::new().unwrap();
+            let file_path = format!("{}/data.parquet", tmp_dir.path().to_str().unwrap());
+            let mut writer =
+                ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None)
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            // Projected alone and together with a readable column.
+            for project_field_ids in [vec![1], vec![1, 2]] {
+                let reader =
+                    ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+                let tasks = Box::pin(futures::stream::iter(
+                    vec![Ok(FileScanTask::builder()
+                        .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                        .with_start(0)
+                        .with_length(0)
+                        .with_data_file_path(file_path.clone())
+                        .with_data_file_format(DataFileFormat::Parquet)
+                        .with_schema(Arc::new(schema(table_type.clone())))
+                        .with_project_field_ids(project_field_ids.clone())
+                        .with_case_sensitive(false)
+                        .build()
+                        .unwrap())]
+                    .into_iter(),
+                )) as FileScanTaskStream;
+
+                let err = reader
+                    .read(tasks)
+                    .unwrap()
+                    .stream()
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.to_string(), expected, "{project_field_ids:?}");
+            }
+        }
     }
 }
