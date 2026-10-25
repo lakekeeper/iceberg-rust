@@ -38,7 +38,7 @@ use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
-use crate::spec::{Datum, Literal, PrimitiveType, Schema, Type};
+use crate::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, Schema, Type};
 use crate::{Error, ErrorKind};
 
 /// One equality-delete key column of a decoded batch
@@ -91,6 +91,7 @@ impl ArrowReader {
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
         use_position_fallback: bool,
+        partition_constants: &HashMap<i32, Datum>,
     ) -> Result<Vec<Box<dyn ArrowPredicate>>> {
         let field_id_map =
             Self::resolve_field_id_map(parquet_schema, arrow_schema, use_position_fallback)?;
@@ -124,6 +125,25 @@ impl ArrowReader {
                 .map(|leaf| leaf.and_then(|idx| column_indices.binary_search(&idx).ok()))
                 .collect();
 
+            // A key column absent from this file probes as its identity partition value, as
+            // Java's reader fills it, and as null when there is none.
+            let absent_values: Vec<Option<Datum>> = set
+                .fields
+                .iter()
+                .map(|(_, id, ty)| {
+                    partition_constants
+                        .get(id)
+                        .map(|value| match (value.literal(), ty) {
+                            // Delete keys are read back through Arrow, which types a uuid as
+                            // fixed[16].
+                            (
+                                PrimitiveLiteral::UInt128(uuid),
+                                Type::Primitive(PrimitiveType::Fixed(16)),
+                            ) => Datum::fixed(uuid.to_be_bytes()),
+                            _ => value.clone(),
+                        })
+                })
+                .collect();
             let target_types: Vec<Type> = set.fields.iter().map(|(_, _, ty)| ty.clone()).collect();
             let num_cols = set.fields.len();
             let set = set.clone();
@@ -163,11 +183,12 @@ impl ArrowReader {
 
                     // One hash lookup per row.
                     let mut keep = Vec::with_capacity(num_rows);
-                    let mut probe = EqDeleteKey(vec![None; num_cols]);
+                    // Absent columns keep their value for the whole batch; present ones are set
+                    // per row.
+                    let mut probe = EqDeleteKey(absent_values.clone());
                     for row in 0..num_rows {
                         for (i, column) in columns.iter_mut().enumerate() {
                             let Some(column) = column else {
-                                probe.0[i] = None;
                                 continue;
                             };
                             // we can `take` because each cell is probed once.
@@ -2719,6 +2740,253 @@ mod tests {
                 "{label}: absent key column probes as null, so nothing is deleted"
             );
         }
+    }
+
+    // A migrated Hive file stores no identity partition column `p`; a Flink upsert sink
+    // keys its equality deletes on (id, p). The reader fills `p` from the partition value
+    // before the probe, as Java does, so the delete applies.
+    #[tokio::test]
+    async fn test_eq_delete_on_identity_partition_column_absent_from_data_file() {
+        use crate::spec::{PartitionSpec, Struct, Transform};
+
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "p", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_partition_field("p", "p", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "id",
+                DataType::Int64,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        );
+        let del_path = format!("{loc}/eq-del.parquet");
+        eqd_write(
+            &del_path,
+            Arc::new(ArrowSchema::new(vec![
+                eqd_field("id", DataType::Int64, 1, false),
+                eqd_field("p", DataType::Int64, 2, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![2, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(5), None])) as ArrayRef,
+            ],
+        );
+
+        for (partition, expected) in [
+            (Some(Struct::from_iter([Some(Literal::long(5))])), vec![
+                1, 3,
+            ]),
+            (Some(Struct::from_iter([None])), vec![1, 2]),
+            (None, vec![1, 2]),
+        ] {
+            let task = FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&data_path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(data_path.clone())
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1])
+                .with_deletes(vec![eqd_delete_file(&del_path, vec![1, 2])])
+                .with_partition(partition.clone())
+                .with_partition_spec(partition.as_ref().map(|_| spec.clone()))
+                .with_case_sensitive(false)
+                .build()
+                .unwrap();
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+            let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+            let result: Vec<RecordBatch> = reader
+                .read(tasks)
+                .unwrap()
+                .stream()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                eqd_collect_i64(&result, 0),
+                expected,
+                "partition {partition:?}"
+            );
+        }
+    }
+
+    // An absent `uuid` identity partition column probes as the partition value, although the
+    // delete keys come back through Arrow as fixed[16].
+    #[tokio::test]
+    async fn test_eq_delete_on_uuid_partition_column_absent_from_data_file() {
+        use arrow_array::FixedSizeBinaryArray;
+
+        use crate::spec::{PartitionSpec, Struct, Transform};
+
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let u = uuid::Uuid::parse_str("f79c3e09-677c-4bbd-a479-3f349cb785e7").unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Uuid)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_partition_field("u", "u", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "id",
+                DataType::Int64,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        );
+        let del_path = format!("{loc}/eq-del.parquet");
+        eqd_write(
+            &del_path,
+            Arc::new(ArrowSchema::new(vec![
+                eqd_field("id", DataType::Int64, 1, false),
+                eqd_field("u", DataType::FixedSizeBinary(16), 2, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(u.as_bytes().to_vec()))
+                        .unwrap(),
+                ) as ArrayRef,
+            ],
+        );
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&data_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_deletes(vec![eqd_delete_file(&del_path, vec![1, 2])])
+            .with_partition(Some(Struct::from_iter([Some(Literal::uuid(u))])))
+            .with_partition_spec(Some(spec))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result: Vec<RecordBatch> = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(eqd_collect_i64(&result, 0), vec![1, 3]);
+    }
+
+    // A scan task built outside the planner can carry a partition value stored before an
+    // int->long promotion; the absent column still probes as the widened value.
+    #[tokio::test]
+    async fn test_eq_delete_on_absent_partition_column_with_unwidened_value() {
+        use crate::spec::{PartitionSpec, Struct, Transform};
+
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "p", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_partition_field("p", "p", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "id",
+                DataType::Int64,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        );
+        let del_path = format!("{loc}/eq-del.parquet");
+        eqd_write(
+            &del_path,
+            Arc::new(ArrowSchema::new(vec![
+                eqd_field("id", DataType::Int64, 1, false),
+                eqd_field("p", DataType::Int64, 2, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![5])) as ArrayRef,
+            ],
+        );
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&data_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_deletes(vec![eqd_delete_file(&del_path, vec![1, 2])])
+            .with_partition(Some(Struct::from_iter([Some(Literal::int(5))])))
+            .with_partition_spec(Some(spec))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result: Vec<RecordBatch> = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(eqd_collect_i64(&result, 0), vec![1, 3]);
     }
 
     #[tokio::test]

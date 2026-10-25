@@ -75,7 +75,7 @@ fn field_with_id(
 /// # References
 /// - Spec: https://iceberg.apache.org/spec/#column-projection
 /// - Java: core/src/main/java/org/apache/iceberg/util/PartitionUtil.java:constantsMap()
-fn constants_map(
+pub(crate) fn constants_map(
     partition_spec: &PartitionSpec,
     partition_data: &Struct,
     schema: &IcebergSchema,
@@ -115,8 +115,10 @@ fn constants_map(
                     continue;
                 }
                 Some(Literal::Primitive(value)) => {
-                    // Create a Datum from the primitive type and value
-                    let datum = Datum::new(prim_type.clone(), value.clone());
+                    // A value stored before an int->long or float->double promotion is widened
+                    // to the current type, as the planner widens the partition tuple.
+                    let value = value.promote_to(prim_type).unwrap_or_else(|| value.clone());
+                    let datum = Datum::new(prim_type.clone(), value);
                     constants.insert(field.source_id, datum);
                 }
                 Some(literal) => {
