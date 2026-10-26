@@ -478,7 +478,10 @@ impl FileScanTaskReader {
         }
 
         let delete_filter = delete_filter_rx.await.unwrap()?;
-        let eq_delete_sets = delete_filter.build_equality_delete_sets(&task).await?;
+        let eq_delete_sets = self
+            .delete_file_loader
+            .build_equality_delete_sets(&task)
+            .await?;
 
         // Equality deletes are applied as a row-filter predicate based on a hash-set (see below),
         // so the scan-predicate carries only the optional predicate

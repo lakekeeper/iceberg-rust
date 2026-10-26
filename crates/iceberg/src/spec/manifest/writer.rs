@@ -26,6 +26,7 @@ use super::{
     Datum, FormatVersion, ManifestContentType, PartitionSpec, PrimitiveType,
     UNASSIGNED_SEQUENCE_NUMBER,
 };
+use crate::avro::with_avro_field_names;
 use crate::encryption::EncryptedOutputFile;
 use crate::error::{Result, invalid_data};
 use crate::io::{FileMetadata, FileWrite, OutputFile};
@@ -416,8 +417,9 @@ impl ManifestWriter {
             .partition_spec
             .partition_type(&self.metadata.schema)?;
         // Wrap once and reuse for every entry so the per-entry conversion does
-        // not rebuild the partition type's field-name lookup on each call.
-        let partition_struct_type = Type::Struct(partition_type.clone());
+        // not rebuild the partition type's field-name lookup on each call. The
+        // entries carry the partition field names of the Avro schema.
+        let partition_struct_type = Type::Struct(with_avro_field_names(&partition_type));
         let table_schema = &self.metadata.schema;
         let avro_schema = match self.metadata.format_version {
             FormatVersion::V1 => manifest_schema_v1(&partition_type)?,

@@ -288,17 +288,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::catalog::MockCatalog;
+    use crate::catalog::{MockCatalog, TableCommit};
     use crate::io::FileIO;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct, TableMetadata,
-        TableProperties,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        SnapshotReference, SnapshotRetention, Struct, TableMetadata, TableProperties,
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
     use crate::transaction::{ApplyTransactionAction, Transaction};
-    use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
+    use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent, TableUpdate};
 
     /// Create a test data file with the given path, record count, and file size.
     pub(crate) fn make_data_file(table: &Table, path: &str, records: u64, size: u64) -> DataFile {
@@ -410,6 +410,30 @@ mod tests {
             crate::spec::FormatVersion::V3,
         )
         .await
+    }
+
+    /// Sets the retention of `main` at its current snapshot.
+    pub(crate) async fn set_main_retention(
+        catalog: &impl Catalog,
+        table: &Table,
+        retention: SnapshotRetention,
+    ) -> Table {
+        catalog
+            .update_table(
+                TableCommit::builder()
+                    .ident(table.identifier().clone())
+                    .requirements(vec![])
+                    .updates(vec![TableUpdate::SetSnapshotRef {
+                        ref_name: MAIN_BRANCH.to_string(),
+                        reference: SnapshotReference::new(
+                            table.metadata().current_snapshot_id().unwrap(),
+                            retention,
+                        ),
+                    }])
+                    .build(),
+            )
+            .await
+            .unwrap()
     }
 
     async fn make_minimal_table_in_catalog(

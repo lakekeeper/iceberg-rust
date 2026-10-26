@@ -17,7 +17,7 @@
 
 //! The module contains the file writer for parquet file format.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
@@ -318,6 +318,8 @@ pub struct ParquetWriter {
 struct MinMaxColAggregator {
     lower_bounds: HashMap<i32, Datum>,
     upper_bounds: HashMap<i32, Datum>,
+    /// Columns with a column chunk whose values are not bounded by its statistics.
+    unbounded: HashSet<i32>,
     schema: SchemaRef,
 }
 
@@ -327,8 +329,15 @@ impl MinMaxColAggregator {
         Self {
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
+            unbounded: HashSet::new(),
             schema,
         }
+    }
+
+    /// Drops the bounds of a column that has a column chunk whose values its
+    /// statistics do not bound.
+    fn drop_bounds(&mut self, field_id: i32) {
+        self.unbounded.insert(field_id);
     }
 
     fn update_state_min(&mut self, field_id: i32, datum: Datum) {
@@ -353,8 +362,12 @@ impl MinMaxColAggregator {
             .or_insert(datum);
     }
 
-    /// Update statistics
-    fn update(&mut self, field_id: i32, value: &Statistics) -> Result<()> {
+    /// Update statistics of a column chunk with `num_values` values, nulls
+    /// included. Min and max that Parquet marks as not exact still bound the
+    /// values: a truncated min is a prefix of the min, and a truncated max is
+    /// incremented. A chunk that may hold non-null values but has no usable min
+    /// or max drops the column's bounds.
+    fn update(&mut self, field_id: i32, value: &Statistics, num_values: u64) -> Result<()> {
         let Some(ty) = self
             .schema
             .field_by_id(field_id)
@@ -371,33 +384,65 @@ impl MinMaxColAggregator {
             ));
         };
 
-        if value.min_is_exact() {
-            let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, value)? else {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Statistics {value} is not match with field type {ty}."),
-                ));
-            };
-
-            self.update_state_min(field_id, min_datum);
-        }
-
-        if value.max_is_exact() {
-            let Some(max_datum) = get_parquet_stat_max_as_datum(&ty, value)? else {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Statistics {value} is not match with field type {ty}."),
-                ));
-            };
-
-            self.update_state_max(field_id, max_datum);
+        let mismatch = || {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Statistics {value} is not match with field type {ty}."),
+            )
+        };
+        // Only a variable-length type holds a truncated value. Deprecated min/max
+        // (parquet-mr before 1.10) compare bytes as signed, so they bound nothing.
+        let usable = |is_set: bool, exact: bool| {
+            is_set
+                && (exact
+                    || (matches!(ty, PrimitiveType::String | PrimitiveType::Binary)
+                        && !value.is_min_max_deprecated()))
+        };
+        // A truncated string value that is not valid UTF-8 drops the bounds.
+        let datum = |datum: Result<Option<Datum>>, exact: bool| match datum {
+            Ok(datum) => datum.ok_or_else(mismatch).map(Some),
+            Err(_) if !exact => Ok(None),
+            Err(err) => Err(err),
+        };
+        let min = if usable(value.min_bytes_opt().is_some(), value.min_is_exact()) {
+            datum(
+                get_parquet_stat_min_as_datum(&ty, value),
+                value.min_is_exact(),
+            )?
+        } else {
+            None
+        };
+        let max = if usable(value.max_bytes_opt().is_some(), value.max_is_exact()) {
+            datum(
+                get_parquet_stat_max_as_datum(&ty, value),
+                value.max_is_exact(),
+            )?
+        } else {
+            None
+        };
+        match (min, max) {
+            (Some(min), Some(max)) => {
+                self.update_state_min(field_id, min);
+                self.update_state_max(field_id, max);
+            }
+            _ if value.null_count_opt() == Some(num_values) => {}
+            // The writer leaves NaN out of min and max, so a float chunk without them
+            // holds only NaN and nulls, which bounds do not cover.
+            _ if matches!(ty, PrimitiveType::Float | PrimitiveType::Double)
+                && value.min_bytes_opt().is_none()
+                && value.max_bytes_opt().is_none() => {}
+            _ => self.drop_bounds(field_id),
         }
 
         Ok(())
     }
 
     /// Returns lower and upper bounds
-    fn produce(self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
+    fn produce(mut self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
+        for field_id in &self.unbounded {
+            self.lower_bounds.remove(field_id);
+            self.upper_bounds.remove(field_id);
+        }
         (self.lower_bounds, self.upper_bounds)
     }
 }
@@ -460,6 +505,8 @@ impl ParquetWriter {
             let mut per_col_size: HashMap<i32, u64> = HashMap::new();
             let mut per_col_val_num: HashMap<i32, u64> = HashMap::new();
             let mut per_col_null_val_num: HashMap<i32, u64> = HashMap::new();
+            // Columns with a column chunk without a null count, as in Java.
+            let mut unknown_null_counts: HashSet<i32> = HashSet::new();
             let mut min_max_agg = MinMaxColAggregator::new(schema);
 
             for row_group in metadata.row_groups() {
@@ -470,20 +517,29 @@ impl ParquetWriter {
                         continue;
                     };
 
+                    let num_values = column_chunk_metadata.num_values() as u64;
                     *per_col_size.entry(field_id).or_insert(0) +=
                         column_chunk_metadata.compressed_size() as u64;
-                    *per_col_val_num.entry(field_id).or_insert(0) +=
-                        column_chunk_metadata.num_values() as u64;
+                    *per_col_val_num.entry(field_id).or_insert(0) += num_values;
 
-                    if let Some(statistics) = column_chunk_metadata.statistics() {
-                        if let Some(null_count) = statistics.null_count_opt() {
-                            *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
+                    let null_count = column_chunk_metadata
+                        .statistics()
+                        .and_then(Statistics::null_count_opt);
+                    match null_count {
+                        Some(null_count) => {
+                            *per_col_null_val_num.entry(field_id).or_insert(0) += null_count
                         }
-
-                        min_max_agg.update(field_id, statistics)?;
+                        None => {
+                            unknown_null_counts.insert(field_id);
+                        }
+                    }
+                    match column_chunk_metadata.statistics() {
+                        Some(statistics) => min_max_agg.update(field_id, statistics, num_values)?,
+                        None => min_max_agg.drop_bounds(field_id),
                     }
                 }
             }
+            per_col_null_val_num.retain(|field_id, _| !unknown_null_counts.contains(field_id));
             (
                 per_col_size,
                 per_col_val_num,
@@ -751,8 +807,8 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder, MapBuilder};
     use arrow_array::types::{Float32Type, Int64Type};
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, ListArray, MapArray, RecordBatch, StructArray,
+        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array,
+        Int32Array, Int64Array, ListArray, MapArray, RecordBatch, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;
@@ -760,8 +816,11 @@ mod tests {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+    use parquet::data_type::{ByteArray, FixedLenByteArray};
+    use parquet::file::metadata::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
     use parquet::file::statistics::ValueStatistics;
-    use parquet::schema::types::ColumnPath;
+    use parquet::schema::parser::parse_message_type;
+    use parquet::schema::types::{ColumnPath, SchemaDescriptor};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -2497,39 +2556,312 @@ mod tests {
         assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
     }
 
+    #[tokio::test]
+    async fn test_truncated_byte_array_statistics_bound_the_values() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let field = |name, data_type, id: &str| {
+            Field::new(name, data_type, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            field("s", DataType::Utf8, "0"),
+            field("b", DataType::Binary, "1"),
+        ]));
+        // The second row group holds values longer than the truncation length.
+        let long_min = "c".repeat(20);
+        let long_max = "z".repeat(20);
+        let strings = [Some("a"), Some("b"), Some(&long_min), Some(&long_max)];
+        let to_write = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(arrow_array::StringArray::from_iter(strings)) as ArrayRef,
+            Arc::new(BinaryArray::from_iter(
+                strings.map(|s| s.map(str::as_bytes)),
+            )) as ArrayRef,
+        ])
+        .unwrap();
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2))
+                .set_statistics_truncate_length(Some(8))
+                .build(),
+            Arc::new(to_write.schema().as_ref().try_into().unwrap()),
+        )
+        .build(output_file)
+        .await?;
+        pw.write(&to_write).await?;
+        let data_file = pw
+            .close()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            *data_file.lower_bounds(),
+            HashMap::from([(0, Datum::string("a")), (1, Datum::binary(b"a".to_vec()))])
+        );
+        assert_eq!(
+            *data_file.upper_bounds(),
+            HashMap::from([
+                (0, Datum::string("zzzzzzz{")),
+                (1, Datum::binary(b"zzzzzzz{".to_vec()))
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_column_chunk_without_statistics_or_null_count() {
+        let parquet_schema = Arc::new(SchemaDescriptor::new(Arc::new(
+            parse_message_type("message t { optional int32 a; optional int32 b; }").unwrap(),
+        )));
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let stats = |null_count| {
+            Statistics::Int32(ValueStatistics::new(
+                Some(1),
+                Some(2),
+                None,
+                null_count,
+                false,
+            ))
+        };
+        // Column `a` has a row group without statistics, column `b` one without a
+        // null count.
+        let row_group = |a: Option<Statistics>, b: Statistics| {
+            let chunk = |i: usize, statistics: Option<Statistics>| {
+                let builder =
+                    ColumnChunkMetaData::builder(parquet_schema.column(i)).set_num_values(3);
+                match statistics {
+                    Some(statistics) => builder.set_statistics(statistics),
+                    None => builder,
+                }
+                .build()
+                .unwrap()
+            };
+            RowGroupMetaData::builder(parquet_schema.clone())
+                .set_num_rows(3)
+                .set_column_metadata(vec![chunk(0, a), chunk(1, Some(b))])
+                .build()
+                .unwrap()
+        };
+        let metadata = ParquetMetaData::new(
+            FileMetaData::new(1, 6, None, None, parquet_schema.clone(), None),
+            vec![
+                row_group(Some(stats(Some(1))), stats(Some(1))),
+                row_group(None, stats(None)),
+            ],
+        );
+
+        let data_file = ParquetWriter::parquet_to_data_file_builder(
+            schema,
+            Arc::new(metadata),
+            100,
+            "file.parquet".to_string(),
+            HashMap::new(),
+            None,
+        )
+        .unwrap()
+        .partition_spec_id(0)
+        .build()
+        .unwrap();
+
+        assert_eq!(*data_file.value_counts(), HashMap::from([(1, 6), (2, 6)]));
+        assert_eq!(*data_file.null_value_counts(), HashMap::new());
+        assert_eq!(
+            *data_file.lower_bounds(),
+            HashMap::from([(2, Datum::int(1))])
+        );
+        assert_eq!(
+            *data_file.upper_bounds(),
+            HashMap::from([(2, Datum::int(2))])
+        );
+    }
+
     #[test]
     fn test_min_max_aggregator() {
         let schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
-                    NestedField::required(0, "col", Type::Primitive(PrimitiveType::Int))
-                        .with_id(0)
-                        .into(),
+                    NestedField::required(0, "col", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(1, "s", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(2, "f", Type::Primitive(PrimitiveType::Fixed(4))).into(),
+                    NestedField::required(3, "d", Type::Primitive(PrimitiveType::Double)).into(),
                 ])
                 .build()
                 .expect("Failed to create schema"),
         );
-        let mut min_max_agg = MinMaxColAggregator::new(schema);
-        let create_statistics =
-            |min, max| Statistics::Int32(ValueStatistics::new(min, max, None, None, false));
-        min_max_agg
-            .update(0, &create_statistics(None, Some(42)))
-            .unwrap();
-        min_max_agg
-            .update(0, &create_statistics(Some(0), Some(i32::MAX)))
-            .unwrap();
-        min_max_agg
-            .update(0, &create_statistics(Some(i32::MIN), None))
-            .unwrap();
-        min_max_agg
-            .update(0, &create_statistics(None, None))
-            .unwrap();
+        let int = |min, max, null_count| {
+            Statistics::Int32(ValueStatistics::new(min, max, None, null_count, false))
+        };
+        let double =
+            |min, max| Statistics::Double(ValueStatistics::new(min, max, None, Some(0), false));
+        let bytes = |min: &str, max: &str, exact: bool| {
+            ValueStatistics::new(
+                Some(ByteArray::from(min.as_bytes().to_vec())),
+                Some(ByteArray::from(max.as_bytes().to_vec())),
+                None,
+                Some(0),
+                false,
+            )
+            .with_min_is_exact(exact)
+            .with_max_is_exact(exact)
+        };
+        let fixed = |min: &str, max: &str, exact: bool| {
+            let value = |v: &str| FixedLenByteArray::from(ByteArray::from(v.as_bytes().to_vec()));
+            Statistics::FixedLenByteArray(
+                ValueStatistics::new(Some(value(min)), Some(value(max)), None, Some(0), false)
+                    .with_min_is_exact(exact)
+                    .with_max_is_exact(exact),
+            )
+        };
+        // Each case: column chunks as (field id, statistics, value count), then the
+        // expected lower and upper bounds.
+        let cases = [
+            (
+                vec![
+                    (0, int(Some(0), Some(i32::MAX), Some(0)), 2),
+                    (0, int(Some(i32::MIN), Some(7), Some(0)), 2),
+                ],
+                Some((Datum::int(i32::MIN), Datum::int(i32::MAX))),
+            ),
+            // A chunk of nulls has no min and max.
+            (
+                vec![
+                    (0, int(Some(1), Some(2), Some(0)), 2),
+                    (0, int(None, None, Some(3)), 3),
+                ],
+                Some((Datum::int(1), Datum::int(2))),
+            ),
+            // A chunk with values but without min and max, or with an unknown null
+            // count, leaves the values unbounded.
+            (
+                vec![
+                    (0, int(Some(1), Some(2), Some(0)), 2),
+                    (0, int(None, None, Some(1)), 3),
+                ],
+                None,
+            ),
+            (
+                vec![
+                    (0, int(Some(1), Some(2), Some(0)), 2),
+                    (0, int(None, None, None), 3),
+                ],
+                None,
+            ),
+            (vec![(0, int(None, Some(2), Some(0)), 2)], None),
+            // A float chunk of NaN has no min and max.
+            (
+                vec![
+                    (3, double(Some(1.0), Some(2.0)), 2),
+                    (3, double(None, None), 2),
+                ],
+                Some((Datum::double(1.0), Datum::double(2.0))),
+            ),
+            // Truncated string statistics bound the values.
+            (
+                vec![
+                    (1, Statistics::ByteArray(bytes("a", "b", true)), 2),
+                    (1, Statistics::ByteArray(bytes("Zab", "zzz{", false)), 2),
+                ],
+                Some((Datum::string("Zab"), Datum::string("zzz{"))),
+            ),
+            // Deprecated min/max are in signed byte order: "é" sorts before "a".
+            (
+                vec![(
+                    1,
+                    Statistics::ByteArray(
+                        ValueStatistics::new(
+                            Some(ByteArray::from("é")),
+                            Some(ByteArray::from("a")),
+                            None,
+                            Some(0),
+                            true,
+                        )
+                        .with_min_is_exact(false)
+                        .with_max_is_exact(false),
+                    ),
+                    2,
+                )],
+                None,
+            ),
+            // A truncated string max that ends inside a UTF-8 character.
+            (
+                vec![
+                    (1, Statistics::ByteArray(bytes("a", "b", true)), 2),
+                    (
+                        1,
+                        Statistics::ByteArray(
+                            ValueStatistics::new(
+                                Some(ByteArray::from("a")),
+                                Some(ByteArray::from(vec![b'z', 0xC3])),
+                                None,
+                                Some(0),
+                                false,
+                            )
+                            .with_min_is_exact(false)
+                            .with_max_is_exact(false),
+                        ),
+                        2,
+                    ),
+                ],
+                None,
+            ),
+            // A truncated fixed value is not a fixed value of the column's length.
+            (
+                vec![
+                    (2, fixed("aaaa", "bbbb", true), 2),
+                    (2, fixed("cc", "dd", false), 2),
+                ],
+                None,
+            ),
+        ];
 
-        let (lower_bounds, upper_bounds) = min_max_agg.produce();
-
-        assert_eq!(lower_bounds, HashMap::from([(0, Datum::int(i32::MIN))]));
-        assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
+        for (i, (chunks, expected)) in cases.into_iter().enumerate() {
+            let mut min_max_agg = MinMaxColAggregator::new(schema.clone());
+            let field_id = chunks[0].0;
+            for (field_id, statistics, num_values) in chunks {
+                min_max_agg
+                    .update(field_id, &statistics, num_values)
+                    .unwrap();
+            }
+            let (lower_bounds, upper_bounds) = min_max_agg.produce();
+            let (expected_lower, expected_upper) = match expected {
+                Some((lower, upper)) => (
+                    HashMap::from([(field_id, lower)]),
+                    HashMap::from([(field_id, upper)]),
+                ),
+                None => (HashMap::new(), HashMap::new()),
+            };
+            assert_eq!(
+                (lower_bounds, upper_bounds),
+                (expected_lower, expected_upper),
+                "case {i}"
+            );
+        }
     }
 
     fn cdc_test_schema() -> SchemaRef {
