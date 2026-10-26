@@ -426,6 +426,11 @@ impl MinMaxColAggregator {
                 self.update_state_max(field_id, max);
             }
             _ if value.null_count_opt() == Some(num_values) => {}
+            // The writer leaves NaN out of min and max, so a float chunk without them
+            // holds only NaN and nulls, which bounds do not cover.
+            _ if matches!(ty, PrimitiveType::Float | PrimitiveType::Double)
+                && value.min_bytes_opt().is_none()
+                && value.max_bytes_opt().is_none() => {}
             _ => self.drop_bounds(field_id),
         }
 
@@ -2704,6 +2709,7 @@ mod tests {
                     NestedField::required(0, "col", Type::Primitive(PrimitiveType::Int)).into(),
                     NestedField::required(1, "s", Type::Primitive(PrimitiveType::String)).into(),
                     NestedField::required(2, "f", Type::Primitive(PrimitiveType::Fixed(4))).into(),
+                    NestedField::required(3, "d", Type::Primitive(PrimitiveType::Double)).into(),
                 ])
                 .build()
                 .expect("Failed to create schema"),
@@ -2711,6 +2717,8 @@ mod tests {
         let int = |min, max, null_count| {
             Statistics::Int32(ValueStatistics::new(min, max, None, null_count, false))
         };
+        let double =
+            |min, max| Statistics::Double(ValueStatistics::new(min, max, None, Some(0), false));
         let bytes = |min: &str, max: &str, exact: bool| {
             ValueStatistics::new(
                 Some(ByteArray::from(min.as_bytes().to_vec())),
@@ -2765,6 +2773,14 @@ mod tests {
                 None,
             ),
             (vec![(0, int(None, Some(2), Some(0)), 2)], None),
+            // A float chunk of NaN has no min and max.
+            (
+                vec![
+                    (3, double(Some(1.0), Some(2.0)), 2),
+                    (3, double(None, None), 2),
+                ],
+                Some((Datum::double(1.0), Datum::double(2.0))),
+            ),
             // Truncated string statistics bound the values.
             (
                 vec![
