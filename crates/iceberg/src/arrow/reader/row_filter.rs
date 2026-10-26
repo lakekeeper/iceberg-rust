@@ -3831,9 +3831,8 @@ mod tests {
         1_735_603_200_000_000,
     ];
 
-    /// Equality deletes keyed on a column the file stores in nanoseconds match by value. Where
-    /// the UTC flag of the file differs from the table column, the read of the key column fails,
-    /// so those deletes run with the key columns not projected.
+    /// Equality deletes keyed on a column the file stores in nanoseconds match by value, also
+    /// where the UTC flag of the file differs from the table column.
     #[tokio::test]
     async fn test_eq_delete_on_nanosecond_column_in_microsecond_field() {
         use arrow_array::TimestampMicrosecondArray;
@@ -3890,6 +3889,121 @@ mod tests {
                 vec![3],
                 "ts as {ts_type}, tz as {tz_type}"
             );
+        }
+    }
+
+    /// pandas writes `datetime64[ns]` without the UTC flag, also for a `timestamptz` column, and
+    /// `datetime64[ns, UTC]` with it, also for a `timestamp` column. Such columns read, filter
+    /// and match equality deletes by value, projected or not.
+    #[tokio::test]
+    async fn test_nanosecond_column_with_other_utc_flag_in_microsecond_field() {
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let data_path = format!("{loc}/data.parquet");
+        nanosecond_file(&data_path, &NANOSECOND_FILE_MICROS, false);
+        // `ts` stores nanoseconds without UTC, `tz` with UTC.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::optional(3, "tz", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let batches = eqd_read(&data_path, schema.clone(), vec![1, 2, 3], vec![]).await;
+        assert_eq!(batches.len(), 1);
+        for (column, tz) in [(1, Some("+00:00")), (2, None)] {
+            let array = batches[0]
+                .column(column)
+                .as_primitive::<TimestampMicrosecondType>();
+            assert_eq!(array.values(), &NANOSECOND_FILE_MICROS, "column {column}");
+            assert_eq!(array.timezone(), tz, "column {column}");
+        }
+
+        let delete_file = |name: &str, id: i32, tz: Option<Arc<str>>, micros: i64| {
+            let path = format!("{loc}/{name}.parquet");
+            eqd_write(
+                &path,
+                Arc::new(ArrowSchema::new(vec![eqd_field(
+                    name,
+                    DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                    id,
+                    true,
+                )])),
+                vec![Arc::new(
+                    TimestampMicrosecondArray::from(vec![micros]).with_timezone_opt(tz),
+                )],
+            );
+            eqd_delete_file(&path, vec![id])
+        };
+        let deletes = [
+            (
+                "ts",
+                delete_file("ts", 2, Some("+00:00".into()), NANOSECOND_FILE_MICROS[0]),
+                vec![2, 3],
+            ),
+            (
+                "tz",
+                delete_file("tz", 3, None, NANOSECOND_FILE_MICROS[1]),
+                vec![1, 3],
+            ),
+        ];
+        let filters = [
+            (
+                Reference::new("ts").equal_to(Datum::timestamptz_micros(NANOSECOND_FILE_MICROS[0])),
+                vec![1],
+            ),
+            (
+                Reference::new("ts")
+                    .less_than(Datum::timestamptz_micros(NANOSECOND_FILE_MICROS[1])),
+                vec![1],
+            ),
+            (
+                Reference::new("tz").equal_to(Datum::timestamp_micros(NANOSECOND_FILE_MICROS[1])),
+                vec![2],
+            ),
+            (
+                Reference::new("tz")
+                    .greater_than(Datum::timestamp_micros(NANOSECOND_FILE_MICROS[0])),
+                vec![2, 3],
+            ),
+        ];
+        for projection in [vec![1, 2, 3], vec![1]] {
+            for (column, delete, expected) in &deletes {
+                let result = eqd_read(&data_path, schema.clone(), projection.clone(), vec![
+                    delete.clone(),
+                ])
+                .await;
+                assert_eq!(
+                    eqd_collect_i64(&result, 0),
+                    *expected,
+                    "delete on {column}, projection {projection:?}"
+                );
+            }
+            for row_selection_enabled in [false, true] {
+                for (predicate, expected) in &filters {
+                    let result = eqd_read_with(
+                        &data_path,
+                        schema.clone(),
+                        projection.clone(),
+                        vec![],
+                        Some(predicate.clone().bind(schema.clone(), true).unwrap()),
+                        row_selection_enabled,
+                    )
+                    .await;
+                    assert_eq!(
+                        eqd_collect_i64(&result, 0),
+                        *expected,
+                        "{predicate}, projection {projection:?}, row selection \
+                         {row_selection_enabled}"
+                    );
+                }
+            }
         }
     }
 

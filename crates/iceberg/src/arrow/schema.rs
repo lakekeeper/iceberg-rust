@@ -336,10 +336,12 @@ pub(super) fn type_promotion_is_valid(
             Some(PrimitiveType::Date),
             Some(PrimitiveType::Timestamp | PrimitiveType::TimestampNs),
         ) => true,
-        // Nanosecond files in microsecond columns read exactly, or fail on a value with
-        // sub-microsecond digits (`PromotePlan::TimestampNanosToMicros`).
-        (Some(PrimitiveType::TimestampNs), Some(PrimitiveType::Timestamp))
-        | (Some(PrimitiveType::TimestamptzNs), Some(PrimitiveType::Timestamptz)) => true,
+        // Nanosecond files in microsecond columns read exactly, whatever their UTC flag, or fail
+        // on a value with sub-microsecond digits (`PromotePlan::TimestampNanosToMicros`).
+        (
+            Some(PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs),
+            Some(PrimitiveType::Timestamp | PrimitiveType::Timestamptz),
+        ) => true,
         (
             Some(PrimitiveType::Decimal {
                 precision: file_precision,
