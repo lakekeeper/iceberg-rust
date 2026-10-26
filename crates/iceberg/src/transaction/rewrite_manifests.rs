@@ -27,10 +27,10 @@ use crate::error::Result;
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
     ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, SchemaId, SchemaRef,
-    Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary, TableProperties,
+    Snapshot, SnapshotReference, Struct, Summary, TableProperties,
 };
 use crate::table::Table;
-use crate::transaction::snapshot::generate_unique_snapshot_id;
+use crate::transaction::snapshot::{generate_unique_snapshot_id, main_branch_retention};
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
@@ -307,10 +307,7 @@ impl TransactionAction for RewriteManifestsAction {
             },
             TableUpdate::SetSnapshotRef {
                 ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
+                reference: SnapshotReference::new(snapshot_id, main_branch_retention(metadata)),
             },
         ];
         let requirements = vec![
@@ -362,10 +359,13 @@ mod tests {
 
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Operation, Struct,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        Operation, SnapshotRetention, Struct,
     };
     use crate::table::Table;
-    use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table_in_catalog};
+    use crate::transaction::tests::{
+        make_v2_minimal_table, make_v3_minimal_table_in_catalog, set_main_retention,
+    };
     use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
     use crate::{Catalog, TableUpdate};
 
@@ -503,6 +503,37 @@ mod tests {
             ]),
             (1, vec![("test/c.parquet".to_string(), long_5)]),
         ]);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_keeps_main_branch_retention() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_one(&catalog, table, data_file("a", 1, 100, 1)).await;
+        let table = append_one(&catalog, table, data_file("b", 1, 100, 1)).await;
+        let retention =
+            SnapshotRetention::branch(Some(9), Some(3_456_000_000), Some(2_592_000_000));
+        let table = set_main_retention(&catalog, &table, retention.clone()).await;
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .rewrite_manifests()
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Replace
+        );
+        assert_eq!(table.metadata().refs()[MAIN_BRANCH].retention, retention);
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
@@ -62,8 +62,9 @@ pub(crate) struct DeleteFilter {
 
 /// Action to take when trying to start loading a positional delete file
 pub(crate) enum PosDelLoadAction {
-    /// The file is not loaded, the caller should load it.
-    Load,
+    /// The file is not loaded, the caller should load it and call
+    /// [`PosDelLoadGuard::finish`] once its delete vectors are merged.
+    Load(PosDelLoadGuard),
     /// The file is already loaded, nothing to do.
     AlreadyLoaded,
     /// The file is currently being loaded by another task.
@@ -71,7 +72,39 @@ pub(crate) enum PosDelLoadAction {
     /// returning, as subsequent access (get_delete_vector) is synchronous. The
     /// future is created under the state lock so it cannot miss the loader's
     /// `notify_waiters()` (which stores no permit).
+    ///
+    /// The future also resolves when that load fails or is dropped, so the caller must
+    /// call [`DeleteFilter::try_start_pos_del_load`] again rather than assume the file
+    /// is loaded.
     WaitFor(OwnedNotified),
+}
+
+/// Ownership of an in-progress positional delete load, returned by
+/// [`DeleteFilter::try_start_pos_del_load`].
+///
+/// [`finish`](Self::finish) marks the file loaded. Dropping the guard without finishing,
+/// because the load failed or was cancelled, removes the `Loading` marker and wakes any
+/// waiters, so a later attempt can load the file instead of waiting forever.
+pub(crate) struct PosDelLoadGuard {
+    filter: DeleteFilter,
+    file_path: String,
+    finished: bool,
+}
+
+impl PosDelLoadGuard {
+    /// Marks the file as loaded and wakes any waiters.
+    pub(crate) fn finish(mut self) {
+        self.finished = true;
+        self.filter.finish_pos_del_load(&self.file_path);
+    }
+}
+
+impl Drop for PosDelLoadGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.filter.abandon_pos_del_load(&self.file_path);
+        }
+    }
 }
 
 impl DeleteFilter {
@@ -140,11 +173,15 @@ impl DeleteFilter {
             .positional_deletes
             .insert(file_path.to_string(), PosDelState::Loading(notifier));
 
-        PosDelLoadAction::Load
+        PosDelLoadAction::Load(PosDelLoadGuard {
+            filter: self.clone(),
+            file_path: file_path.to_string(),
+            finished: false,
+        })
     }
 
     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
-    pub(crate) fn finish_pos_del_load(&self, file_path: &str) {
+    fn finish_pos_del_load(&self, file_path: &str) {
         let notify = {
             let mut state = self.state.write().unwrap();
             if let Some(PosDelState::Loading(notify)) = state
@@ -158,6 +195,22 @@ impl DeleteFilter {
         };
 
         if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Removes the `Loading` marker of a positional delete file whose load failed or was
+    /// dropped, and wakes any waiting tasks so they can try the load again.
+    fn abandon_pos_del_load(&self, file_path: &str) {
+        // Runs in `Drop`, also while unwinding, where a second panic aborts the process.
+        let removed = self
+            .state
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .positional_deletes
+            .remove(file_path);
+        debug_assert!(matches!(removed, Some(PosDelState::Loading(_))));
+        if let Some(PosDelState::Loading(notify)) = removed {
             notify.notify_waiters();
         }
     }
@@ -184,9 +237,10 @@ impl DeleteFilter {
 
         notified.await;
 
+        // A failed load leaves no set.
         match self.state.read().unwrap().equality_deletes.get(file_path) {
             Some(EqDelState::Loaded(set)) => Some(set.clone()),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            _ => None,
         }
     }
 
@@ -267,29 +321,32 @@ impl DeleteFilter {
         *entry.lock().unwrap() |= delete_vector;
     }
 
+    /// Stores the equality delete set that `eq_del` delivers, and wakes the tasks
+    /// waiting on `notify`, the notifier from [`Self::try_start_eq_del_load`].
     pub(crate) fn insert_equality_delete(
         &self,
         delete_file_path: &str,
+        notify: Arc<Notify>,
         eq_del: Receiver<Arc<EqDeleteSet>>,
     ) {
-        let notify = Arc::new(Notify::new());
-        {
-            let mut state = self.state.write().unwrap();
-            state.equality_deletes.insert(
-                delete_file_path.to_string(),
-                EqDelState::Loading(notify.clone()),
-            );
-        }
-
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         self.runtime.cpu().spawn(async move {
-            let eq_del = eq_del.await.unwrap();
+            let eq_del = eq_del.await;
             {
-                let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                // A panic here would leave the waiters waiting forever.
+                let mut state = state.write().unwrap_or_else(PoisonError::into_inner);
+                match eq_del {
+                    Ok(eq_del) => {
+                        state
+                            .equality_deletes
+                            .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                    }
+                    // The load failed: a later task loads the file again.
+                    Err(_) => {
+                        state.equality_deletes.remove(&delete_file_path);
+                    }
+                }
             }
             notify.notify_waiters();
         });
@@ -339,23 +396,50 @@ pub(crate) mod tests {
         let filter = DeleteFilter::new(Runtime::current());
         let path = "s3://bucket/pos-delete.parquet";
 
-        assert!(matches!(
-            filter.try_start_pos_del_load(path),
-            PosDelLoadAction::Load
-        ));
+        let PosDelLoadAction::Load(guard) = filter.try_start_pos_del_load(path) else {
+            panic!("expected Load for a new file");
+        };
 
         let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path) else {
             panic!("expected WaitFor for an in-progress load");
         };
 
         // Loader completes and signals before the waiter awaits.
-        filter.finish_pos_del_load(path);
+        guard.finish();
 
         let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
         assert!(
             waited.is_ok(),
             "WaitFor future must resolve after finish_pos_del_load"
         );
+    }
+
+    #[tokio::test]
+    async fn test_abandoned_pos_del_load_wakes_waiters_and_can_be_retried() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/pos-delete.parquet";
+
+        let PosDelLoadAction::Load(guard) = filter.try_start_pos_del_load(path) else {
+            panic!("expected Load for a new file");
+        };
+        let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path) else {
+            panic!("expected WaitFor for an in-progress load");
+        };
+
+        // The load fails: its guard is dropped without `finish`.
+        drop(guard);
+
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+        assert!(
+            waited.is_ok(),
+            "WaitFor future must resolve when the load is dropped"
+        );
+
+        // The file is not loaded, so the next caller is told to load it.
+        assert!(matches!(
+            filter.try_start_pos_del_load(path),
+            PosDelLoadAction::Load(_)
+        ));
     }
 
     #[tokio::test]
@@ -593,9 +677,109 @@ pub(crate) mod tests {
     }
 
     fn insert_set(filter: &DeleteFilter, path: &str, set: EqDeleteSet) {
+        let notify = filter.try_start_eq_del_load(path).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete(path, rx);
+        filter.insert_equality_delete(path, notify, rx);
         tx.send(Arc::new(set)).unwrap();
+    }
+
+    // A task that finds the load started before the loader stores its receiver
+    // must be woken when the set arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_equality_delete_waiter_wakes_when_it_starts_waiting_before_insert() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "eq-a.parquet";
+        let notify = filter.try_start_eq_del_load(path).unwrap();
+        let waiter = filter.get_equality_delete_set_for_delete_file_path(path);
+        tokio::pin!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        filter.insert_equality_delete(path, notify, rx);
+        let set = Arc::new(EqDeleteSet {
+            keys: HashSet::from([EqDeleteKey(vec![Some(Datum::long(1))])]),
+            fields: vec![("id".to_string(), 1, Type::Primitive(PrimitiveType::Long))],
+        });
+        tx.send(set.clone()).unwrap();
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must be woken")
+            .unwrap();
+        assert!(Arc::ptr_eq(&loaded, &set));
+    }
+
+    // A task waiting for a failed equality delete load fails, and a later task loads
+    // the file again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_equality_delete_waiter_fails_when_the_load_fails() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "eq-a.parquet";
+        let task = task_with_eq_deletes(&[path]);
+        let notify = filter.try_start_eq_del_load(path).unwrap();
+        let waiter = filter.build_equality_delete_sets(&task);
+        tokio::pin!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Arc<EqDeleteSet>>();
+        filter.insert_equality_delete(path, notify, rx);
+        drop(tx);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must be woken")
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "Missing equality delete set for delete file 'eq-a.parquet'"
+        );
+        assert!(filter.try_start_eq_del_load(path).is_some());
+    }
+
+    // A poisoned state lock still wakes the waiters of a failed load; they then
+    // panic on the lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_failed_loads_wake_their_waiters_when_the_state_lock_is_poisoned() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let eq_path = "eq-a.parquet";
+        let pos_path = "pos-a.parquet";
+        let eq_notify = filter.try_start_eq_del_load(eq_path).unwrap();
+        let eq_filter = filter.clone();
+        let mut eq_waiter = Box::pin(async move {
+            eq_filter
+                .get_equality_delete_set_for_delete_file_path(eq_path)
+                .await
+        });
+        assert!(futures::poll!(&mut eq_waiter).is_pending());
+        let PosDelLoadAction::Load(pos_load) = filter.try_start_pos_del_load(pos_path) else {
+            panic!("expected Load for a new file");
+        };
+        let PosDelLoadAction::WaitFor(pos_waiter) = filter.try_start_pos_del_load(pos_path) else {
+            panic!("expected WaitFor for an in-progress load");
+        };
+
+        let state = filter.state.clone();
+        std::thread::spawn(move || {
+            let _state = state.write().unwrap();
+            panic!("poison the state lock");
+        })
+        .join()
+        .unwrap_err();
+        assert!(filter.state.is_poisoned());
+
+        let timeout = std::time::Duration::from_secs(5);
+        let (tx, rx) = tokio::sync::oneshot::channel::<Arc<EqDeleteSet>>();
+        filter.insert_equality_delete(eq_path, eq_notify, rx);
+        drop(tx);
+        let eq_result = tokio::time::timeout(timeout, tokio::spawn(eq_waiter))
+            .await
+            .expect("the equality delete waiter must be woken");
+        assert!(eq_result.unwrap_err().is_panic());
+
+        drop(pos_load);
+        tokio::time::timeout(timeout, pos_waiter)
+            .await
+            .expect("the positional delete waiter must be woken");
     }
 
     // Delete files that key on different equality columns must not be merged.

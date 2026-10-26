@@ -17,6 +17,7 @@
 
 //! Conversion between iceberg and avro schema.
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write;
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{
@@ -34,12 +35,72 @@ use crate::spec::{
 use crate::{Error, ErrorKind, Result, ensure_data_valid};
 
 const ELEMENT_ID: &str = "element-id";
-const FIELD_ID_PROP: &str = "field-id";
+pub(crate) const FIELD_ID_PROP: &str = "field-id";
+/// Holds the Iceberg name of a field whose Avro name was sanitized, as Java writes it.
+pub(crate) const ICEBERG_FIELD_NAME_PROP: &str = "iceberg-field-name";
 const KEY_ID: &str = "key-id";
 const VALUE_ID: &str = "value-id";
 const MAP_LOGICAL_TYPE: &str = "map";
 // This const may better to maintain in avro-rs.
 const LOGICAL_TYPE: &str = "logicalType";
+
+/// Whether `name` is a valid Avro name: `[A-Za-z_][A-Za-z0-9_]*`.
+pub(crate) fn is_valid_avro_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Makes `name` a valid Avro name with the escapes of Java's
+/// `AvroSchemaUtil.sanitize`: a leading digit gets a `_` prefix, and any other
+/// character not allowed becomes `_x` and its UTF-16 code unit in hex. Java
+/// keeps non-ASCII letters and digits, which Avro does not allow, so they are
+/// escaped here.
+pub(crate) fn sanitize_avro_name(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    for (i, unit) in name.encode_utf16().enumerate() {
+        match char::from_u32(u32::from(unit)) {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => sanitized.push(c),
+            Some(c) if c.is_ascii_digit() => {
+                if i == 0 {
+                    sanitized.push('_');
+                }
+                sanitized.push(c);
+            }
+            _ => {
+                let _ = write!(sanitized, "_x{unit:X}");
+            }
+        }
+    }
+    sanitized
+}
+
+/// The Avro name of a field: `name` if Avro allows it, else sanitized.
+fn avro_field_name(name: &str) -> String {
+    if is_valid_avro_name(name) {
+        name.to_string()
+    } else {
+        sanitize_avro_name(name)
+    }
+}
+
+/// `struct_type` with its field names as [`schema_to_avro_schema`] writes them,
+/// for values serialized against that schema.
+pub(crate) fn with_avro_field_names(struct_type: &StructType) -> StructType {
+    StructType::new(
+        struct_type
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut field = field.as_ref().clone();
+                field.name = avro_field_name(&field.name);
+                field.into()
+            })
+            .collect(),
+    )
+}
 
 struct SchemaToAvroSchema {
     schema: String,
@@ -117,7 +178,7 @@ impl SchemaVisitor for SchemaToAvroSchema {
         };
 
         let mut avro_record_field = AvroRecordField {
-            name: field.name.clone(),
+            name: avro_field_name(&field.name),
             schema: field_schema,
             doc: field.doc.clone(),
             aliases: Vec::new(),
@@ -125,6 +186,12 @@ impl SchemaVisitor for SchemaToAvroSchema {
             custom_attributes: Default::default(),
         };
 
+        if avro_record_field.name != field.name {
+            avro_record_field.custom_attributes.insert(
+                ICEBERG_FIELD_NAME_PROP.to_string(),
+                Value::String(field.name.clone()),
+            );
+        }
         avro_record_field.custom_attributes.insert(
             FIELD_ID_PROP.to_string(),
             Value::Number(Number::from(field.id)),
@@ -1403,5 +1470,47 @@ mod tests {
             .unwrap();
         let err = schema_to_avro_schema("t", &schema).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::FeatureUnsupported, "{err}");
+    }
+
+    #[test]
+    fn test_sanitize_avro_name() {
+        // Java's `AvroSchemaUtil.sanitize` gives the same names for ASCII input.
+        for (name, valid, sanitized) in [
+            ("event_ts", true, "event_ts"),
+            ("_1st", true, "_1st"),
+            ("event.ts_day", false, "event_x2Ets_day"),
+            ("my-col", false, "my_x2Dcol"),
+            ("1st", false, "_1st"),
+            ("a b", false, "a_x20b"),
+            ("größe", false, "gr_xF6_xDFe"),
+            ("a😀", false, "a_xD83D_xDE00"),
+        ] {
+            assert_eq!(is_valid_avro_name(name), valid, "{name}");
+            assert_eq!(sanitize_avro_name(name), sanitized, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_schema_to_avro_schema_sanitizes_invalid_field_names() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "valid", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "my-col", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let avro_schema = schema_to_avro_schema("r", &schema).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&avro_schema).unwrap(),
+            serde_json::json!({"type": "record", "name": "r", "fields": [
+                {"name": "valid", "type": "int", "field-id": 1},
+                {"name": "my_x2Dcol", "type": ["null", "int"], "default": null,
+                 "iceberg-field-name": "my-col", "field-id": 2},
+            ]})
+        );
+        // A strict Avro reader accepts the names.
+        AvroSchema::parse_str(&serde_json::to_string(&avro_schema).unwrap()).unwrap();
     }
 }

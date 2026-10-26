@@ -18,10 +18,11 @@
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
 
 use crate::arrow::ArrowReader;
-use crate::arrow::reader::ParquetReadOptions;
+use crate::arrow::reader::{ParquetReadOptions, add_fallback_field_ids_to_arrow_schema};
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::io::FileIO;
@@ -84,6 +85,22 @@ impl BasicDeleteFileLoader {
             key_metadata,
         )
         .await?;
+
+        // Like Java's `ReadConf`, a file without field IDs gets IDs from column positions.
+        let missing_field_ids = arrow_metadata
+            .schema()
+            .fields()
+            .iter()
+            .next()
+            .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
+        let arrow_metadata = if missing_field_ids {
+            let options = ArrowReaderOptions::new().with_schema(
+                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema()),
+            );
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options)?
+        } else {
+            arrow_metadata
+        };
 
         let record_batch_stream =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata)
@@ -327,5 +344,70 @@ mod tests {
         let batches: Vec<_> = result.try_collect().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
+    }
+
+    // A delete file without field IDs is matched to the table by column position.
+    #[tokio::test]
+    async fn test_read_equality_delete_file_without_field_ids() {
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use parquet::arrow::ArrowWriter;
+
+        use crate::scan::FileScanTaskDeleteFile;
+        use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Type};
+
+        let tmp_dir = TempDir::new().unwrap();
+        let del_path = format!("{}/eq-del.parquet", tmp_dir.path().to_str().unwrap());
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+            (
+                "data",
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&del_path).unwrap(),
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let task = FileScanTaskDeleteFile::builder()
+            .with_file_path(del_path.clone())
+            .with_file_size_in_bytes(std::fs::metadata(&del_path).unwrap().len())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![2]))
+            .build()
+            .unwrap();
+        let delete_file_loader =
+            BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
+
+        let batches: Vec<RecordBatch> = delete_file_loader
+            .read_delete_file(&task, schema)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let columns: Vec<ArrayRef> = batches
+            .iter()
+            .flat_map(|batch| batch.columns().to_vec())
+            .collect();
+        assert_eq!(columns, vec![
+            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef
+        ]);
     }
 }

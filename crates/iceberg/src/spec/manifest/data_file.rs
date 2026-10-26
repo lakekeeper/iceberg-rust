@@ -28,6 +28,7 @@ use super::{
     Datum, FormatVersion, Schema, data_file_schema_v1, data_file_schema_v2, data_file_schema_v3,
 };
 use crate::Error;
+use crate::avro::with_avro_field_names;
 use crate::error::{Result, invalid_data};
 use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
 use crate::spec::{
@@ -406,8 +407,9 @@ pub fn write_data_files_to_avro<W: Write>(
     let mut writer = AvroWriter::new(&avro_schema, writer)?;
 
     // Wrap once and reuse across files so the field-name lookup is not rebuilt
-    // for each data file.
-    let partition_struct_type = Type::Struct(partition_type.clone());
+    // for each data file. The partition values carry the field names of the Avro
+    // schema.
+    let partition_struct_type = Type::Struct(with_avro_field_names(partition_type));
     for data_file in data_files {
         let value = to_value(DataFileSerde::try_from(
             data_file,
@@ -439,8 +441,9 @@ pub fn read_data_files_from_avro<R: Read>(
         .reader_schema(&avro_schema)
         .build()?;
     // Wrap once and reuse across files so the field-name lookup is not rebuilt
-    // for each data file.
-    let partition_struct_type = Type::Struct(partition_type.clone());
+    // for each data file. The partition values carry the field names of the Avro
+    // schema.
+    let partition_struct_type = Type::Struct(with_avro_field_names(partition_type));
     reader
         .into_iter()
         .map(|value| {
