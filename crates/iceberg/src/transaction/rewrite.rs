@@ -32,8 +32,8 @@ use chrono::Datelike;
 
 use crate::error::{Result, invalid_data};
 use crate::spec::{
-    DataContentType, DataFile, Literal, ManifestContentType, Operation, PartitionSpec,
-    PrimitiveLiteral, Struct, Transform,
+    DataContentType, DataFile, FormatVersion, Literal, ManifestContentType, Operation,
+    PartitionSpec, PrimitiveLiteral, Struct, Transform,
 };
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
@@ -61,41 +61,49 @@ use crate::util::snapshot::ancestors_of;
 ///
 /// # Concurrent deletes
 ///
-/// The action records the table's current snapshot when it is created; a
-/// delete committed after that snapshot is new. The commit is refused with
+/// The starting snapshot is the snapshot the rewrite was planned against: the
+/// table's current snapshot when the action is created, or the one set with
+/// [`validate_from_snapshot`](RewriteFilesAction::validate_from_snapshot). A
+/// delete committed after it is new. By default the added files get the
+/// starting snapshot's sequence number, as data read at that snapshot, so new
+/// equality deletes keep applying to their rows. The commit is refused with
 /// [`ErrorKind::DataInvalid`](crate::ErrorKind::DataInvalid) in these cases:
 ///
 /// 1. a new position delete or deletion vector names a replaced file;
 /// 2. a new partition-scoped position delete is in a replaced file's partition;
 /// 3. a new equality delete would apply to other rows after the rewrite than
 ///    before it. It applies to the replaced files if it is in an unpartitioned
-///    spec or in their partition, and to the added files in the same way only
-///    when [`data_sequence_number`](RewriteFilesAction::data_sequence_number)
-///    is set below the delete's sequence number. The rewrite is refused if the
+///    spec or in their partition, and to the added files in the same way when
+///    their data sequence number is below the delete's. The rewrite is refused if the
 ///    delete applies to a replaced file and either not to the added files or
 ///    some added file is in another spec, or if an added file in its partition
 ///    can hold rows of a replaced file of another spec. A delete whose spec is
 ///    not in the table metadata is always refused;
 /// 4. always, with or without new deletes, when the rewrite was planned
 ///    against a table that had no snapshot yet, or its starting snapshot has
-///    since been expired or is no longer an ancestor of the current one.
+///    since been expired or is no longer an ancestor of the current one;
+/// 5. when [`data_sequence_number`](RewriteFilesAction::data_sequence_number)
+///    sets a sequence number below the starting snapshot's.
 ///
 /// This follows Java's `validateNoNewDeletesForDataFiles`, but does not prune
 /// by column bounds. Java skips equality deletes when the sequence number is
 /// kept and checks no delete against the added files, so a Java rewrite into
-/// another spec can change which rows its new deletes apply to. A rewrite that
-/// only removes delete files is checked only for its starting snapshot. Replan a refused rewrite against the
-/// current table and run it again.
+/// another spec can change which rows its new deletes apply to. Java's action
+/// lets added files inherit the new snapshot's sequence number unless told
+/// otherwise, and checks from the table's first snapshot unless given a
+/// starting snapshot. A rewrite that only removes delete files is checked only
+/// for its starting snapshot. Replan a refused rewrite against the current
+/// table and run it again.
 ///
-/// Deletes that were already committed when the rewrite was planned are not
-/// covered by this check. Either apply them while rewriting, or keep them
-/// applicable to the new file with
-/// [`data_sequence_number`](RewriteFilesAction::data_sequence_number).
+/// Deletes that were already committed at the starting snapshot are not
+/// covered by this check: apply them while rewriting.
 pub struct RewriteFilesAction {
     producer: MergingSnapshotProducer,
     /// The snapshot the rewrite was planned against, if the table had one.
     /// Deletes newer than it that can apply to a replaced file fail the commit.
     starting_snapshot_id: Option<i64>,
+    /// The data sequence number of the added files, if set explicitly.
+    data_sequence_number: Option<i64>,
 }
 
 impl RewriteFilesAction {
@@ -103,7 +111,20 @@ impl RewriteFilesAction {
         Self {
             producer: MergingSnapshotProducer::new(Operation::Replace),
             starting_snapshot_id,
+            data_sequence_number: None,
         }
+    }
+
+    /// Set the snapshot the rewrite was planned against.
+    ///
+    /// Deletes committed after it are checked against the replaced files, and
+    /// the added files get its sequence number. Set it when the files to
+    /// replace were chosen from an older snapshot than the table the
+    /// transaction was created from, for example when a later group of a
+    /// compaction is committed after the table was refreshed.
+    pub fn validate_from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.starting_snapshot_id = Some(snapshot_id);
+        self
     }
 
     /// Register a data file to be removed from the table.
@@ -142,16 +163,18 @@ impl RewriteFilesAction {
         self
     }
 
-    /// Set the data sequence number recorded for every added file.
+    /// Set the data sequence number recorded for every added file, in place
+    /// of the starting snapshot's.
     ///
-    /// Without this the added files inherit the sequence number of the new
-    /// snapshot. A compaction that must not shadow concurrently written
-    /// deletes sets the sequence number of the snapshot it was planned
-    /// against.
+    /// A value below the starting snapshot's sequence number is refused at
+    /// commit: older equality deletes would then apply to rows of replaced
+    /// files they did not apply to. A higher value makes new equality deletes
+    /// stop applying to the rewritten rows, so the commit is refused when one
+    /// would have applied to them.
     /// V1 manifest entries carry no sequence number, so this has no effect on
     /// a V1 table.
     pub fn data_sequence_number(mut self, sequence_number: i64) -> Self {
-        self.producer.set_data_sequence_number(sequence_number);
+        self.data_sequence_number = Some(sequence_number);
         self
     }
 
@@ -193,12 +216,13 @@ impl RewriteFilesAction {
     }
 
     /// Reject the rewrite when a delete committed after the snapshot it was
-    /// planned against can apply to a replaced data file.
-    async fn validate_no_new_deletes(&self, table: &Table) -> Result<()> {
+    /// planned against can apply to a replaced data file, and return the data
+    /// sequence number of the added files.
+    async fn validate_no_new_deletes(&self, table: &Table) -> Result<Option<i64>> {
         // Nothing has been committed, so there is nothing to conflict with.
         // The filter rejects the rewrite for its missing sources instead.
         let Some(current_snapshot) = table.metadata().current_snapshot() else {
-            return Ok(());
+            return Ok(self.data_sequence_number);
         };
         // The rewrite was planned against a table without a snapshot, so every
         // snapshot it has now, deletes included, landed after that.
@@ -226,9 +250,21 @@ impl RewriteFilesAction {
         }
         // A rewrite that replaces no data file cannot lose a delete.
         if self.producer.deleted_data_files().is_empty() {
-            return Ok(());
+            return Ok(self.data_sequence_number);
         }
         let starting_sequence_number = starting_snapshot.sequence_number();
+        // A replaced file's data sequence number can be as high as the start's.
+        // Below that, an older equality delete in an added file's partition
+        // would apply to rows it did not apply to before.
+        let data_sequence_number = match self.data_sequence_number {
+            Some(sequence_number) if sequence_number < starting_sequence_number => {
+                return Err(invalid_data!(
+                    "Cannot rewrite files: the data sequence number {sequence_number} is below the sequence number {starting_sequence_number} of the starting snapshot {starting_snapshot_id}."
+                ));
+            }
+            Some(sequence_number) => sequence_number,
+            None => starting_sequence_number,
+        };
 
         // A delete committed after the start has a data sequence number above
         // the start's, in a manifest written after the start. It stays so when
@@ -251,9 +287,12 @@ impl RewriteFilesAction {
                 let delete_sequence_number = entry
                     .sequence_number()
                     .unwrap_or(manifest_file.sequence_number);
-                if let Some(replaced) =
-                    self.replaced_file_affected_by(table, delete, delete_sequence_number)
-                {
+                if let Some(replaced) = self.replaced_file_affected_by(
+                    table,
+                    delete,
+                    delete_sequence_number,
+                    data_sequence_number,
+                ) {
                     return Err(invalid_data!(
                         "Cannot rewrite files: the {:?} file {} was added after the starting snapshot {starting_snapshot_id} and can apply to the replaced data file {}.",
                         delete.content_type(),
@@ -263,15 +302,21 @@ impl RewriteFilesAction {
                 }
             }
         }
-        Ok(())
+        // V1 manifest entries carry no sequence number.
+        Ok(
+            (table.metadata().format_version() != FormatVersion::V1)
+                .then_some(data_sequence_number),
+        )
     }
 
-    /// The first replaced data file that `delete` can apply to.
+    /// The first replaced data file that `delete` can apply to, when the added
+    /// files get `data_sequence_number`.
     fn replaced_file_affected_by(
         &self,
         table: &Table,
         delete: &DataFile,
         delete_sequence_number: i64,
+        data_sequence_number: i64,
     ) -> Option<&DataFile> {
         let mut replaced = self.producer.deleted_data_files().iter();
         let same_partition = |file: &&DataFile| {
@@ -288,10 +333,7 @@ impl RewriteFilesAction {
                     return replaced.next();
                 };
                 let global = spec.is_unpartitioned();
-                let applies_to_added = self
-                    .producer
-                    .data_sequence_number()
-                    .is_some_and(|sequence_number| delete_sequence_number > sequence_number);
+                let applies_to_added = delete_sequence_number > data_sequence_number;
                 if !applies_to_added {
                     return replaced.find(|file| global || same_partition(file));
                 }
@@ -484,8 +526,10 @@ fn coarsen_temporal(value: i32, from: u8, to: u8) -> Option<i64> {
 impl TransactionAction for RewriteFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         self.validate()?;
-        self.validate_no_new_deletes(table).await?;
-        self.producer.commit_snapshot(table).await
+        let data_sequence_number = self.validate_no_new_deletes(table).await?;
+        self.producer
+            .commit_snapshot(table, data_sequence_number)
+            .await
     }
 }
 
@@ -770,6 +814,44 @@ mod tests {
             .await
             .expect("added file should be in a manifest");
         assert_eq!(merged_entry.sequence_number(), Some(append_sequence_number));
+    }
+
+    /// Without an explicit data sequence number, the added files get the
+    /// starting snapshot's: the transaction's current one, or the one set with
+    /// `validate_from_snapshot`.
+    #[tokio::test]
+    async fn test_rewrite_files_defaults_to_the_starting_sequence_number() {
+        for validate_from_first in [false, true] {
+            let catalog = new_memory_catalog().await;
+            let table = make_v2_minimal_table_in_catalog(&catalog).await;
+            let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+            let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+            let first = table.metadata().current_snapshot().unwrap().clone();
+            let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+            let table = append_files(&catalog, &table, vec![f2]).await;
+            let second = table.metadata().current_snapshot().unwrap().clone();
+
+            let tx = Transaction::new(&table);
+            let mut action = tx
+                .rewrite_files()
+                .delete_file(f1.clone())
+                .add_file(make_data_file(&table, "test/merged.parquet", 10, 100));
+            if validate_from_first {
+                action = action.validate_from_snapshot(first.snapshot_id());
+            }
+            let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+            let snapshot = table.metadata().current_snapshot().unwrap();
+            let merged = find_entry(&table, snapshot, "test/merged.parquet")
+                .await
+                .expect("added file should be in a manifest");
+            let expected = if validate_from_first { &first } else { &second };
+            assert_eq!(
+                merged.sequence_number(),
+                Some(expected.sequence_number()),
+                "validate_from_first={validate_from_first}"
+            );
+        }
     }
 
     /// A data sequence number above the one the new snapshot will carry is
@@ -2323,7 +2405,8 @@ mod tests {
 
     /// The data sequence number the rewrite gives its added files.
     enum SequenceNumber {
-        New,
+        /// None set, so the added files get the starting snapshot's.
+        Default,
         Start,
         AboveStart,
     }
@@ -2373,12 +2456,12 @@ mod tests {
                 refused: None,
             },
             Case {
-                name: "equality delete in the partition, new sequence number",
+                name: "equality delete in the partition, default sequence number",
                 spec_change: SpecChange::None,
-                sequence_number: SequenceNumber::New,
+                sequence_number: SequenceNumber::Default,
                 output: output(),
                 delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
-                refused: Some("EqualityDeletes"),
+                refused: None,
             },
             Case {
                 name: "equality delete in the partition, sequence number above the start",
@@ -2397,9 +2480,9 @@ mod tests {
                 refused: Some("EqualityDeletes"),
             },
             Case {
-                name: "equality delete in another partition, new sequence number",
+                name: "equality delete in another partition, default sequence number",
                 spec_change: SpecChange::None,
-                sequence_number: SequenceNumber::New,
+                sequence_number: SequenceNumber::Default,
                 output: output(),
                 delete: file_in_spec(deletes, EqualityDeletes, 0, x(2), None),
                 refused: None,
@@ -2413,12 +2496,12 @@ mod tests {
                 refused: None,
             },
             Case {
-                name: "equality delete in an unpartitioned spec, output in another spec, new sequence number",
+                name: "equality delete in an unpartitioned spec, output in another spec, default sequence number",
                 spec_change: SpecChange::AroundDelete,
-                sequence_number: SequenceNumber::New,
+                sequence_number: SequenceNumber::Default,
                 output: output(),
                 delete: file_in_spec(deletes, EqualityDeletes, 1, Struct::empty(), None),
-                refused: Some("EqualityDeletes"),
+                refused: None,
             },
             Case {
                 name: "equality delete in the partition, no output, start sequence number",
@@ -2429,12 +2512,12 @@ mod tests {
                 refused: None,
             },
             Case {
-                name: "equality delete in the partition, no output, new sequence number",
+                name: "equality delete in the partition, no output, default sequence number",
                 spec_change: SpecChange::None,
-                sequence_number: SequenceNumber::New,
+                sequence_number: SequenceNumber::Default,
                 output: None,
                 delete: file_in_spec(deletes, EqualityDeletes, 0, x(1), None),
-                refused: Some("EqualityDeletes"),
+                refused: None,
             },
             Case {
                 name: "position delete for the replaced file",
@@ -2492,7 +2575,7 @@ mod tests {
                 action = action.add_file(output);
             }
             let action = match case.sequence_number {
-                SequenceNumber::New => action,
+                SequenceNumber::Default => action,
                 SequenceNumber::Start => {
                     action.data_sequence_number(starting_snapshot.sequence_number())
                 }
@@ -2528,6 +2611,102 @@ mod tests {
                 ))
             });
             assert_eq!(outcome, expected, "{}", case.name);
+        }
+    }
+
+    /// A rewrite planned against an older snapshot than the table its
+    /// transaction is created from is checked from the planned snapshot.
+    #[tokio::test]
+    async fn test_rewrite_files_validates_from_the_planned_snapshot() {
+        let deletes = "test/new-deletes.parquet";
+        for validate_from_planned in [false, true] {
+            let catalog = new_memory_catalog().await;
+            let table = make_v2_minimal_table_in_catalog(&catalog).await;
+            let replaced = make_data_file(&table, "test/1.parquet", 10, 100);
+            let table = append_files(&catalog, &table, vec![replaced.clone()]).await;
+            let planned = table.metadata().current_snapshot().unwrap().clone();
+            let delete = file_in_spec(
+                deletes,
+                DataContentType::PositionDeletes,
+                0,
+                x(1),
+                Some("test/1.parquet"),
+            );
+            let table = stage_delete_files(&catalog, &table, vec![delete]).await;
+
+            let mut action = Transaction::new(&table)
+                .rewrite_files()
+                .delete_file(replaced)
+                .add_file(file_in_spec(
+                    "test/out.parquet",
+                    DataContentType::Data,
+                    0,
+                    x(1),
+                    None,
+                ));
+            if validate_from_planned {
+                action = action.validate_from_snapshot(planned.snapshot_id());
+            }
+            let outcome = Arc::new(action)
+                .commit(&table)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.message().to_string());
+
+            let expected = if validate_from_planned {
+                Err(format!(
+                    "Cannot rewrite files: the PositionDeletes file {deletes} was added after the starting snapshot {} and can apply to the replaced data file test/1.parquet.",
+                    planned.snapshot_id()
+                ))
+            } else {
+                // The delete is older than the transaction's own start.
+                Ok(())
+            };
+            assert_eq!(
+                outcome, expected,
+                "validate_from_planned={validate_from_planned}"
+            );
+        }
+    }
+
+    /// Added files may not carry a data sequence number below the starting
+    /// snapshot's: an older equality delete would start to apply to them.
+    #[tokio::test]
+    async fn test_rewrite_files_rejects_data_sequence_number_below_the_start() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let first = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![first]).await;
+        let replaced = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![replaced.clone()]).await;
+        let start = table.metadata().current_snapshot().unwrap().clone();
+
+        for (sequence_number, expected) in [
+            (
+                start.sequence_number() - 1,
+                Err(format!(
+                    "Cannot rewrite files: the data sequence number {} is below the sequence number {} of the starting snapshot {}.",
+                    start.sequence_number() - 1,
+                    start.sequence_number(),
+                    start.snapshot_id()
+                )),
+            ),
+            (start.sequence_number(), Ok(())),
+        ] {
+            let action = Transaction::new(&table)
+                .rewrite_files()
+                .delete_file(replaced.clone())
+                .add_file(make_data_file(&table, "test/out.parquet", 10, 100))
+                .data_sequence_number(sequence_number);
+            let outcome = Arc::new(action)
+                .commit(&table)
+                .await
+                .map(|_| ())
+                .map_err(|err| {
+                    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+                    err.message().to_string()
+                });
+            assert_eq!(outcome, expected, "sequence number {sequence_number}");
         }
     }
 
@@ -2917,13 +3096,13 @@ mod tests {
                 refused: None,
             },
             XspecCase {
-                name: "global delete, output in its unpartitioned spec, new sequence number",
+                name: "global delete, output in its unpartitioned spec, default sequence number",
                 third_spec: ThirdSpec::Unpartitioned,
-                sequence_number: SequenceNumber::New,
+                sequence_number: SequenceNumber::Default,
                 replaced: &["test/old-b3.parquet", "test/new-b3.parquet"],
                 outputs: vec![out(2, Struct::empty())],
                 delete: file_in_spec(deletes, EqualityDeletes, 2, Struct::empty(), None),
-                refused: Some("test/old-b3.parquet"),
+                refused: None,
             },
             XspecCase {
                 name: "partition-scoped position delete in the moved row's bucket",
@@ -3000,7 +3179,7 @@ mod tests {
                 action = action.add_file(output);
             }
             let action = match case.sequence_number {
-                SequenceNumber::New => action,
+                SequenceNumber::Default => action,
                 SequenceNumber::Start => {
                     action.data_sequence_number(starting_snapshot.sequence_number())
                 }

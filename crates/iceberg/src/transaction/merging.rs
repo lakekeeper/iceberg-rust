@@ -318,7 +318,6 @@ pub(crate) struct MergingSnapshotProducer {
     deleted_delete_files: Vec<DataFile>,
     filter_manager: ManifestFilterManager,
     commit_uuid: Uuid,
-    data_sequence_number: Option<i64>,
     /// Names the manifests this producer writes. It is never reset, so a
     /// commit retry cannot overwrite a manifest an earlier attempt wrote
     /// under the same commit uuid.
@@ -334,21 +333,12 @@ impl MergingSnapshotProducer {
             deleted_delete_files: Vec::new(),
             filter_manager: ManifestFilterManager::new(true),
             commit_uuid: Uuid::now_v7(),
-            data_sequence_number: None,
             manifest_counter: AtomicU64::new(0),
         }
     }
 
     pub(crate) fn add_data_file(&mut self, file: DataFile) {
         self.added_data_files.push(file);
-    }
-
-    pub(crate) fn set_data_sequence_number(&mut self, sequence_number: i64) {
-        self.data_sequence_number = Some(sequence_number);
-    }
-
-    pub(crate) fn data_sequence_number(&self) -> Option<i64> {
-        self.data_sequence_number
     }
 
     pub(crate) fn delete_data_file(&mut self, file: DataFile) {
@@ -374,8 +364,11 @@ impl MergingSnapshotProducer {
     }
 
     /// Reject a data sequence number above the one the new snapshot will carry.
-    fn validate_data_sequence_number(&self, table: &Table) -> Result<()> {
-        let Some(sequence_number) = self.data_sequence_number else {
+    fn validate_data_sequence_number(
+        table: &Table,
+        data_sequence_number: Option<i64>,
+    ) -> Result<()> {
+        let Some(sequence_number) = data_sequence_number else {
             return Ok(());
         };
         let snapshot_sequence_number = table.metadata().next_sequence_number();
@@ -388,8 +381,15 @@ impl MergingSnapshotProducer {
     }
 
     /// Produce manifests, compute summary, and commit a new snapshot.
-    pub(crate) async fn commit_snapshot(&self, table: &Table) -> Result<ActionCommit> {
-        self.validate_data_sequence_number(table)?;
+    ///
+    /// Added files get `data_sequence_number` if set, and otherwise inherit
+    /// the new snapshot's.
+    pub(crate) async fn commit_snapshot(
+        &self,
+        table: &Table,
+        data_sequence_number: Option<i64>,
+    ) -> Result<ActionCommit> {
+        Self::validate_data_sequence_number(table, data_sequence_number)?;
         // Create the SnapshotProducer first so we can use its snapshot_id
         // for new manifests. This ensures the manifest list writer can
         // assign sequence numbers to manifests from this snapshot.
@@ -433,7 +433,12 @@ impl MergingSnapshotProducer {
         // 3. Write a new manifest for added files.
         if !self.added_data_files.is_empty() {
             let added_manifest = self
-                .write_added_manifest(table, snapshot_id, &self.manifest_counter)
+                .write_added_manifest(
+                    table,
+                    snapshot_id,
+                    data_sequence_number,
+                    &self.manifest_counter,
+                )
                 .await?;
             filtered_manifests.push(added_manifest);
         }
@@ -451,6 +456,7 @@ impl MergingSnapshotProducer {
         &self,
         table: &Table,
         snapshot_id: i64,
+        data_sequence_number: Option<i64>,
         manifest_counter: &AtomicU64,
     ) -> Result<ManifestFile> {
         let new_manifest_path = format!(
@@ -475,7 +481,7 @@ impl MergingSnapshotProducer {
 
         let format_version = table.metadata().format_version();
         for data_file in &self.added_data_files {
-            if let Some(sequence_number) = self.data_sequence_number {
+            if let Some(sequence_number) = data_sequence_number {
                 writer.add_file(data_file.clone(), sequence_number)?;
                 continue;
             }
