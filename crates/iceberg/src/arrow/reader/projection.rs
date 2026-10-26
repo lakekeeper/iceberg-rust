@@ -548,7 +548,7 @@ fn try_map_fields(
 /// Why at schema level (not per-batch): Efficiency - avoids repeated schema modification.
 /// Why only top-level: Nested projection uses leaf column indices, not parent struct IDs.
 /// Why 1-indexed: Compatibility with iceberg-java's ParquetSchemaUtil.addFallbackIds().
-pub(super) fn add_fallback_field_ids_to_arrow_schema(
+pub(crate) fn add_fallback_field_ids_to_arrow_schema(
     arrow_schema: &ArrowSchemaRef,
 ) -> Arc<ArrowSchema> {
     debug_assert!(
