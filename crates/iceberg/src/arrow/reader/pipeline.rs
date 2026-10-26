@@ -42,11 +42,11 @@ use super::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
-use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
+use crate::arrow::{build_partition_constant, stores_nanos_for_micros};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
 use crate::expr::BoundPredicate;
@@ -62,7 +62,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, Struct};
+use crate::spec::{Datum, PartitionSpec, Schema, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -602,6 +602,7 @@ impl FileScanTaskReader {
                     &mut record_batch_stream_builder,
                     candidates.as_ref(),
                     &field_id_map,
+                    task.schema(),
                 )
                 .await?;
 
@@ -702,6 +703,7 @@ impl FileScanTaskReader {
         // otherwise, use applyNameMapping() followed by pruneColumns() when configured, or
         // addFallbackIds() followed by pruneColumnsFallback() for position-based fallback.
         // The fast path returns early without materializing an owned schema.
+        let parquet_schema = arrow_metadata.metadata().file_metadata().schema_descr();
         let arrow_schema = if missing_field_ids {
             let schema = if let Some(name_mapping) = task.name_mapping() {
                 apply_name_mapping_to_arrow_schema(
@@ -714,9 +716,9 @@ impl FileScanTaskReader {
             // Coerce INT96 timestamp columns before building the stream reader to avoid
             // i64 overflow in arrow-rs. Apply this after assigning any missing field IDs
             // so the final schema contains both changes.
-            coerce_int96_timestamps(&schema, task.schema()).unwrap_or(schema)
+            coerce_int96_timestamps(&schema, parquet_schema, task.schema())?.unwrap_or(schema)
         } else if let Some(coerced) =
-            coerce_int96_timestamps(arrow_metadata.schema(), task.schema())
+            coerce_int96_timestamps(arrow_metadata.schema(), parquet_schema, task.schema())?
         {
             coerced
         } else if install_row_number {
@@ -758,12 +760,24 @@ impl FileScanTaskReader {
         builder: &mut ParquetRecordBatchStreamBuilder<ArrowFileReader>,
         candidate_row_groups: &[usize],
         field_id_map: &HashMap<i32, usize>,
+        snapshot_schema: &Schema,
     ) -> Result<Vec<usize>> {
         // Only collect field IDs from eq/in predicates — the only types
-        // bloom filters can help with. Skip columns not in the parquet schema.
+        // bloom filters can help with. Skip columns not in the parquet schema,
+        // and columns whose stored values are in another unit than the table's.
+        let parquet_schema = builder.parquet_schema();
         let bloom_filter_field_ids: Vec<i32> = collect_bloom_filter_field_ids(predicate)?
             .into_iter()
-            .filter(|id| field_id_map.contains_key(id))
+            .filter(|id| {
+                field_id_map.get(id).is_some_and(|&col_idx| {
+                    !snapshot_schema
+                        .field_by_id(*id)
+                        .and_then(|field| field.field_type.as_primitive_type())
+                        .is_some_and(|ty| {
+                            stores_nanos_for_micros(parquet_schema.column(col_idx).as_ref(), ty)
+                        })
+                })
+            })
             .collect();
 
         if bloom_filter_field_ids.is_empty() {
@@ -3297,6 +3311,231 @@ mod tests {
             expected_micros,
             "INT96 in map: got {}, expected {expected_micros}",
             ts_array.value(0)
+        );
+    }
+
+    async fn read_parquet(
+        file_path: &str,
+        schema: SchemaRef,
+        project_field_ids: Vec<i32>,
+    ) -> crate::Result<Vec<RecordBatch>> {
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let file_size = std::fs::metadata(file_path).unwrap().len();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(file_size)
+            .with_start(0)
+            .with_length(file_size)
+            .with_data_file_path(file_path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(project_field_ids)
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        reader.read(tasks)?.stream().try_collect().await
+    }
+
+    /// Writes one row group with `a` (INT64 nanosecond timestamp without time zone, field
+    /// ID 1), `b` (INT96, field ID 2), `c` (INT64 nanosecond timestamp in UTC, field ID 3)
+    /// and `id` (field ID 4). The timestamps are optional; `None` writes a null.
+    fn write_nanosecond_timestamp_file(path: &str, nanos: &[Option<i64>]) {
+        use parquet::data_type::{Int32Type, Int64Type, Int96Type};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let message = parse_message_type(
+            "message schema {
+                optional int64 a (TIMESTAMP(NANOS, false)) = 1;
+                optional int96 b = 2;
+                optional int64 c (TIMESTAMP(NANOS, true)) = 3;
+                required int32 id = 4;
+            }",
+        )
+        .unwrap();
+        let values: Vec<i64> = nanos.iter().flatten().copied().collect();
+        let def_levels: Vec<i16> = nanos.iter().map(|v| i16::from(v.is_some())).collect();
+        let (int96_value, _) = make_int96_test_value();
+        let int96_values = vec![int96_value; values.len()];
+        let ids: Vec<i32> = (0..nanos.len() as i32).collect();
+
+        let file = File::create(path).unwrap();
+        let mut writer =
+            SerializedFileWriter::new(file, Arc::new(message), Default::default()).unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        for leaf in 0..4 {
+            let mut column = row_group.next_column().unwrap().unwrap();
+            match leaf {
+                0 | 2 => column
+                    .typed::<Int64Type>()
+                    .write_batch(&values, Some(&def_levels), None),
+                1 => {
+                    column
+                        .typed::<Int96Type>()
+                        .write_batch(&int96_values, Some(&def_levels), None)
+                }
+                _ => column.typed::<Int32Type>().write_batch(&ids, None, None),
+            }
+            .unwrap();
+            column.close().unwrap();
+        }
+        row_group.close().unwrap();
+        writer.close().unwrap();
+    }
+
+    fn nanosecond_timestamp_table_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                    NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                    NestedField::optional(3, "c", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::required(4, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// pandas and pyarrow write nanosecond timestamps, which PyIceberg's `add_files` accepts
+    /// into microsecond columns. They read exactly, next to an INT96 column.
+    #[tokio::test]
+    async fn test_read_int64_nanosecond_timestamps_into_microsecond_columns() {
+        use arrow_array::TimestampMicrosecondArray;
+
+        // 2024-01-01T12:34:56.123456 and 1960-06-15T01:02:03.000001
+        let micros = [
+            Some(1_704_112_496_123_456_i64),
+            None,
+            Some(-301_273_076_999_999),
+        ];
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!("{}/nanos.parquet", tmp_dir.path().to_str().unwrap());
+        write_nanosecond_timestamp_file(&path, &micros.map(|v| v.map(|us| us * 1000)));
+        let schema = nanosecond_timestamp_table_schema();
+
+        let batches = read_parquet(&path, schema.clone(), vec![1, 2, 3, 4])
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let (_, expected_int96_micros) = make_int96_test_value();
+        let expected_int96 = micros.map(|v| v.map(|_| expected_int96_micros));
+        for (column, expected, tz) in [
+            (0, micros, None),
+            (1, expected_int96, None),
+            (2, micros, Some("+00:00")),
+        ] {
+            let array = batches[0]
+                .column(column)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(
+                array.iter().collect::<Vec<_>>(),
+                expected,
+                "column {column}"
+            );
+            assert_eq!(array.timezone(), tz, "column {column}");
+        }
+
+        // An unprojected nanosecond column does not affect the read.
+        let batches = read_parquet(&path, schema, vec![4]).await.unwrap();
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[0, 1, 2]
+        );
+    }
+
+    /// The INT96 hint runs only for files with INT96 leaves: a file with an Arrow type it cannot
+    /// walk (a list view, which pyarrow writes) reads its other columns.
+    #[tokio::test]
+    async fn test_read_file_with_list_view_column() {
+        use arrow_array::ListViewArray;
+        use arrow_buffer::ScalarBuffer;
+
+        let element = Arc::new(Field::new("element", DataType::Int64, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+        ));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("l", DataType::ListView(element.clone()), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            ),
+            Field::new("n", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let list = ListViewArray::new(
+            element,
+            ScalarBuffer::from(vec![0, 1]),
+            ScalarBuffer::from(vec![1, 1]),
+            Arc::new(Int64Array::from(vec![1, 2])),
+            None,
+        );
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(list) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ])
+        .unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!("{}/list_view.parquet", tmp_dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(
+                        1,
+                        "l",
+                        Type::List(crate::spec::ListType::new(
+                            NestedField::list_element(
+                                3,
+                                Type::Primitive(PrimitiveType::Long),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(2, "n", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let batches = read_parquet(&path, schema, vec![2]).await.unwrap();
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+            &[10, 20]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_sub_microsecond_timestamp_into_microsecond_column_fails() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!("{}/nanos.parquet", tmp_dir.path().to_str().unwrap());
+        write_nanosecond_timestamp_file(&path, &[
+            Some(1_704_067_200_000_000_000),
+            Some(1_704_067_200_000_000_001),
+        ]);
+
+        let err = read_parquet(&path, nanosecond_timestamp_table_schema(), vec![1, 4])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "Cannot read the nanosecond timestamp 1704067200000000001 as microseconds without \
+             losing precision"
         );
     }
 

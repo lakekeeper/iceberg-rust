@@ -24,7 +24,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
-use arrow_cast::{CastOptions, cast_with_options};
 use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowSelection};
@@ -33,6 +32,7 @@ use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
 use crate::arrow::caching_delete_file_loader::{EqDeleteKey, EqDeleteSet};
+use crate::arrow::record_batch_transformer::cast_to_table_type;
 use crate::arrow::{arrow_primitive_to_literal, arrow_type_to_type, type_to_arrow_type};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
@@ -166,10 +166,8 @@ impl ArrowReader {
                         if source_type != *target_type {
                             let target_arrow_type = type_to_arrow_type(target_type)
                                 .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
-                            array = cast_with_options(&array, &target_arrow_type, &CastOptions {
-                                safe: false,
-                                ..CastOptions::default()
-                            })?;
+                            array = cast_to_table_type(&array, &target_arrow_type)
+                                .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
                         }
                         let primitive = target_type
                             .as_primitive_type()
@@ -2225,6 +2223,26 @@ mod tests {
         predicate: Option<BoundPredicate>,
         row_selection_enabled: bool,
     ) -> Vec<RecordBatch> {
+        eqd_try_read(
+            data_path,
+            table_schema,
+            project_field_ids,
+            deletes,
+            predicate,
+            row_selection_enabled,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn eqd_try_read(
+        data_path: &str,
+        table_schema: SchemaRef,
+        project_field_ids: Vec<i32>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+        predicate: Option<BoundPredicate>,
+        row_selection_enabled: bool,
+    ) -> crate::Result<Vec<RecordBatch>> {
         let file_io = FileIO::new_with_fs();
         let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
             .with_row_selection_enabled(row_selection_enabled)
@@ -2243,13 +2261,7 @@ mod tests {
             .build()
             .unwrap();
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        reader
-            .read(tasks)
-            .unwrap()
-            .stream()
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .unwrap()
+        reader.read(tasks)?.stream().try_collect().await
     }
 
     fn eqd_collect_i64(batches: &[RecordBatch], col: usize) -> Vec<i64> {
@@ -3753,6 +3765,250 @@ mod tests {
                         "{predicate} on {path}, row_selection_enabled = {row_selection_enabled}"
                     );
                 }
+            }
+        }
+    }
+
+    /// pandas and pyarrow write nanosecond timestamps, which `add_files` accepts into
+    /// microsecond columns: `ts` (`timestamp`) and `tz` (`timestamptz`) store nanoseconds.
+    fn nanosecond_file(path: &str, micros: &[i64], with_bloom_filters: bool) -> SchemaRef {
+        use arrow_array::TimestampNanosecondArray;
+        use arrow_schema::TimeUnit;
+
+        let nanos: Vec<i64> = micros.iter().map(|us| us * 1000).collect();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            eqd_field("id", DataType::Int64, 1, false),
+            eqd_field(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                2,
+                true,
+            ),
+            eqd_field(
+                "tz",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                3,
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int64Array::from_iter_values(1..=micros.len() as i64)) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(nanos.clone())),
+            Arc::new(TimestampNanosecondArray::from(nanos).with_timezone("+00:00")),
+        ])
+        .unwrap();
+        write_row_groups(path, arrow_schema, vec![batch], with_bloom_filters);
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                    NestedField::optional(3, "tz", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    // 2024-01-01T00:00:00.123456, 2024-06-01, 2024-12-31
+    const NANOSECOND_FILE_MICROS: [i64; 3] = [
+        1_704_067_200_123_456,
+        1_717_200_000_000_000,
+        1_735_603_200_000_000,
+    ];
+
+    /// Equality deletes keyed on a column the file stores in nanoseconds match by value, with the
+    /// key columns projected or not, and whether or not the file's UTC flag matches the column.
+    #[tokio::test]
+    async fn test_eq_delete_on_nanosecond_column_in_microsecond_field() {
+        use arrow_array::TimestampMicrosecondArray;
+        use arrow_schema::TimeUnit;
+
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let data_path = format!("{loc}/data.parquet");
+        nanosecond_file(&data_path, &NANOSECOND_FILE_MICROS, false);
+        let delete_file = |name: &str, id: i32, ty: &PrimitiveType, micros: i64| {
+            let path = format!("{loc}/{name}.parquet");
+            let tz = (*ty == PrimitiveType::Timestamptz).then(|| "+00:00".into());
+            eqd_write(
+                &path,
+                Arc::new(ArrowSchema::new(vec![eqd_field(
+                    name,
+                    DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                    id,
+                    true,
+                )])),
+                vec![Arc::new(
+                    TimestampMicrosecondArray::from(vec![micros]).with_timezone_opt(tz),
+                )],
+            );
+            eqd_delete_file(&path, vec![id])
+        };
+
+        // `ts` stores nanoseconds without UTC, `tz` with UTC.
+        for (ts_type, tz_type) in [
+            (PrimitiveType::Timestamp, PrimitiveType::Timestamptz),
+            (PrimitiveType::Timestamptz, PrimitiveType::Timestamp),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                        NestedField::optional(2, "ts", Type::Primitive(ts_type.clone())).into(),
+                        NestedField::optional(3, "tz", Type::Primitive(tz_type.clone())).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            for projection in [vec![1, 2, 3], vec![1]] {
+                let deletes = vec![
+                    delete_file("ts", 2, &ts_type, NANOSECOND_FILE_MICROS[0]),
+                    delete_file("tz", 3, &tz_type, NANOSECOND_FILE_MICROS[1]),
+                ];
+                let result =
+                    eqd_read(&data_path, schema.clone(), projection.clone(), deletes).await;
+                assert_eq!(
+                    eqd_collect_i64(&result, 0),
+                    vec![3],
+                    "ts as {ts_type}, tz as {tz_type}, projection {projection:?}"
+                );
+            }
+        }
+    }
+
+    /// A nanosecond key with sub-microsecond digits has no value in a microsecond column, so an
+    /// equality delete on it fails the read, also with the key column not projected.
+    #[tokio::test]
+    async fn test_eq_delete_on_sub_microsecond_key_fails() {
+        use arrow_array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+        use arrow_schema::TimeUnit;
+
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let data_path = format!("{loc}/data.parquet");
+        let micros = NANOSECOND_FILE_MICROS[1];
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![
+                eqd_field("id", DataType::Int64, 1, false),
+                eqd_field(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    2,
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    micros * 1000,
+                    micros * 1000 + 1,
+                ])),
+            ],
+        );
+        let del_path = format!("{loc}/eq-del.parquet");
+        eqd_write(
+            &del_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                2,
+                true,
+            )])),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![micros])) as ArrayRef],
+        );
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let err = eqd_try_read(
+            &data_path,
+            schema,
+            vec![1],
+            vec![eqd_delete_file(&del_path, vec![2])],
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Unexpected => Failed to read a Parquet file, source: External: Compute error: \
+                 DataInvalid => Cannot read the nanosecond timestamp {} as microseconds without \
+                 losing precision",
+                micros * 1000 + 1
+            )
+        );
+    }
+
+    /// Statistics, the page index and bloom filters of a column that stores nanoseconds hold
+    /// nanoseconds, so none of them may prune by the microsecond values of the table column.
+    #[tokio::test]
+    async fn test_pruning_on_nanosecond_column_in_microsecond_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/data.parquet", tmp.path().to_str().unwrap());
+        let schema = nanosecond_file(&path, &NANOSECOND_FILE_MICROS[..2], true);
+
+        let cases = [
+            (
+                Reference::new("ts")
+                    .less_than(Datum::timestamp_from_str("2025-01-01T00:00:00").unwrap()),
+                2,
+            ),
+            (
+                Reference::new("ts")
+                    .equal_to(Datum::timestamp_from_str("2024-01-01T00:00:00.123456").unwrap()),
+                1,
+            ),
+            (
+                Reference::new("tz")
+                    .less_than(Datum::timestamptz_from_str("2025-01-01T00:00:00+00:00").unwrap()),
+                2,
+            ),
+            (
+                Reference::new("tz").equal_to(
+                    Datum::timestamptz_from_str("2024-01-01T00:00:00.123456+00:00").unwrap(),
+                ),
+                1,
+            ),
+        ];
+        // Each pruning step on its own: row-group statistics, the page index, bloom filters.
+        for (row_groups, pages, blooms) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            for (predicate, expected) in &cases {
+                let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                    .with_row_group_filtering_enabled(row_groups)
+                    .with_row_selection_enabled(pages)
+                    .with_bloom_filter_enabled(blooms)
+                    .build();
+                let (batches, _) = read_once(
+                    reader,
+                    &path,
+                    schema.clone(),
+                    vec![1],
+                    predicate.clone(),
+                    None,
+                    vec![],
+                )
+                .await;
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(
+                    rows, *expected,
+                    "{predicate} with row groups {row_groups}, pages {pages}, blooms {blooms}"
+                );
             }
         }
     }

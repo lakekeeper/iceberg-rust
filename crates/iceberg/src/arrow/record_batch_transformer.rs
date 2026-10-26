@@ -20,14 +20,15 @@ use std::sync::Arc;
 
 use arrow_arith::boolean::is_not_null;
 use arrow_array::cast::AsArray;
+use arrow_array::types::TimestampNanosecondType;
 use arrow_array::{
     Array as ArrowArray, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
-    RecordBatchOptions, RunArray, StructArray,
+    RecordBatchOptions, RunArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_cast::{CastOptions, cast, cast_with_options};
 use arrow_schema::{
     DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
-    SchemaRef,
+    SchemaRef, TimeUnit,
 };
 use arrow_select::zip::zip;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -234,6 +235,52 @@ pub(crate) enum ChildPlan {
     },
 }
 
+/// Casts a primitive column that a data file stores to the table's Arrow type. A value that the
+/// table type cannot hold exactly fails the read, as the spec requires: one out of range, which the
+/// default cast turns into NULL, or a nanosecond timestamp with sub-microsecond digits in a
+/// microsecond column, which the cast truncates.
+pub(crate) fn cast_to_table_type(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef> {
+    if let (
+        DataType::Timestamp(TimeUnit::Nanosecond, _),
+        DataType::Timestamp(TimeUnit::Microsecond, tz),
+    ) = (array.data_type(), target_type)
+    {
+        let micros: TimestampMicrosecondArray = array
+            .as_primitive::<TimestampNanosecondType>()
+            .try_unary(|ns| {
+                if ns % 1000 == 0 {
+                    Ok(ns / 1000)
+                } else {
+                    Err(ns)
+                }
+            })
+            .map_err(|ns| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot read the nanosecond timestamp {ns} as microseconds without \
+                         losing precision"
+                    ),
+                )
+            })?;
+        return Ok(Arc::new(micros.with_timezone_opt(tz.clone())));
+    }
+    cast_with_options(array.as_ref(), target_type, &CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    })
+    .map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot promote {} to {target_type}: a value does not fit the target type",
+                array.data_type()
+            ),
+        )
+        .with_source(e)
+    })
+}
+
 impl PromotePlan {
     fn build(
         source: &DataType,
@@ -411,25 +458,7 @@ impl PromotePlan {
     fn apply(&self, array: &ArrayRef) -> Result<ArrayRef> {
         match self {
             PromotePlan::PassThrough => Ok(Arc::clone(array)),
-            // A value outside the target type's range fails the read, as the spec requires;
-            // the default cast would turn it into NULL.
-            PromotePlan::Cast(target_type) => {
-                cast_with_options(array.as_ref(), target_type, &CastOptions {
-                    safe: false,
-                    ..CastOptions::default()
-                })
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Cannot promote {} to {target_type}: a value does not fit the target \
-                             type",
-                            array.data_type()
-                        ),
-                    )
-                    .with_source(e)
-                })
-            }
+            PromotePlan::Cast(target_type) => cast_to_table_type(array, target_type),
             PromotePlan::Struct { fields, children } => {
                 let source = array
                     .as_struct_opt()

@@ -23,7 +23,9 @@ use fnv::FnvHashSet;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 
-use crate::arrow::{get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum};
+use crate::arrow::{
+    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum, stores_nanos_for_micros,
+};
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType, Schema};
@@ -131,6 +133,15 @@ impl<'a> RowGroupMetricsEvaluator<'a> {
                 ),
             ));
         };
+
+        if let Some(&index) = self.iceberg_field_id_to_parquet_column_index.get(&field_id)
+            && stores_nanos_for_micros(
+                self.row_group_metadata.column(index).column_descr(),
+                primitive_type,
+            )
+        {
+            return Ok(None);
+        }
 
         Ok(Some((stats, primitive_type.clone())))
     }
