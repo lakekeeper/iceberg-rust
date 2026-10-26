@@ -30,7 +30,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::{Result, invalid_data};
-use crate::spec::{DataContentType, DataFile, Literal, ManifestContentType, Operation, Struct};
+use crate::spec::{
+    DataContentType, DataFile, Literal, ManifestContentType, Operation, PartitionSpec, Struct,
+};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -63,22 +65,25 @@ use crate::util::snapshot::ancestors_of;
 ///
 /// 1. a new position delete or deletion vector names a replaced file;
 /// 2. a new partition-scoped position delete is in a replaced file's partition;
-/// 3. a new equality delete is in a replaced file's partition, or in an
-///    unpartitioned spec. It is skipped when
-///    [`data_sequence_number`](RewriteFilesAction::data_sequence_number) is
-///    set, the delete is newer than that number, and the delete is in an
-///    unpartitioned spec or every added file is in its spec, because the
-///    delete then still applies to the added files. A delete whose spec is
-///    not in the table metadata is never skipped;
+/// 3. a new equality delete would apply to other rows after the rewrite than
+///    before it. It applies to the replaced files if it is in an unpartitioned
+///    spec or in their partition, and to the added files in the same way only
+///    when [`data_sequence_number`](RewriteFilesAction::data_sequence_number)
+///    is set below the delete's sequence number. The rewrite is refused if the
+///    delete applies to a replaced file and either not to the added files or
+///    some added file is in another spec, or if an added file in its partition
+///    can hold rows of a replaced file of another spec. A delete whose spec is
+///    not in the table metadata is always refused;
 /// 4. always, with or without new deletes, when the rewrite was planned
 ///    against a table that had no snapshot yet, or its starting snapshot has
 ///    since been expired or is no longer an ancestor of the current one.
 ///
 /// This follows Java's `validateNoNewDeletesForDataFiles`, but does not prune
-/// by column bounds and refuses equality deletes whose added files left their
-/// spec. A rewrite that only removes delete files is checked only for its
-/// starting snapshot. Replan a refused rewrite against the current table and
-/// run it again.
+/// by column bounds. Java skips equality deletes when the sequence number is
+/// kept and checks no delete against the added files, so a Java rewrite into
+/// another spec can change which rows its new deletes apply to. A rewrite that
+/// only removes delete files is checked only for its starting snapshot. Replan a refused rewrite against the
+/// current table and run it again.
 ///
 /// Deletes that were already committed when the rewrite was planned are not
 /// covered by this check. Either apply them while rewriting, or keep them
@@ -281,22 +286,46 @@ impl RewriteFilesAction {
                     return replaced.next();
                 };
                 let global = spec.is_unpartitioned();
-                // The delete still applies to the added files when they are
-                // older than it and in its spec.
                 let applies_to_added = self
                     .producer
                     .data_sequence_number()
-                    .is_some_and(|sequence_number| delete_sequence_number > sequence_number)
-                    && (global
-                        || self
-                            .producer
-                            .added_data_files()
-                            .iter()
-                            .all(|file| file.partition_spec_id == delete.partition_spec_id));
-                if applies_to_added {
+                    .is_some_and(|sequence_number| delete_sequence_number > sequence_number);
+                if !applies_to_added {
+                    return replaced.find(|file| global || same_partition(file));
+                }
+                if global {
                     return None;
                 }
-                replaced.find(|file| global || same_partition(file))
+                // Within one spec a row's partition follows from the row, so rows
+                // of a replaced file in the partition stay deleted if their added
+                // file is in the spec.
+                let added = self.producer.added_data_files();
+                if !added
+                    .iter()
+                    .all(|file| file.partition_spec_id == delete.partition_spec_id)
+                    && let Some(file) = replaced.clone().find(same_partition)
+                {
+                    return Some(file);
+                }
+                // An added file in the partition makes the delete apply to rows
+                // moved there from a replaced file of another spec.
+                if !added.iter().any(|file| same_partition(&file)) {
+                    return None;
+                }
+                replaced.find(|file| {
+                    file.partition_spec_id != delete.partition_spec_id
+                        && table
+                            .metadata()
+                            .partition_spec_by_id(file.partition_spec_id)
+                            .is_none_or(|file_spec| {
+                                may_hold_rows_of(
+                                    file_spec,
+                                    &file.partition,
+                                    spec,
+                                    &delete.partition,
+                                )
+                            })
+                })
             }
             DataContentType::PositionDeletes => match delete.single_referenced_data_file() {
                 Some(path) => replaced.find(|file| file.file_path == path),
@@ -311,13 +340,48 @@ impl RewriteFilesAction {
 /// types (int to long, float to double promotion) count as equal.
 fn may_be_same_partition(a: &Struct, b: &Struct) -> bool {
     a.fields().len() != b.fields().len()
-        || a.iter().zip(b.iter()).all(|pair| match pair {
-            (None, None) => true,
-            (None, Some(_)) | (Some(_), None) => false,
-            (Some(Literal::Primitive(x)), Some(Literal::Primitive(y))) => {
-                std::mem::discriminant(x) != std::mem::discriminant(y) || x == y
-            }
-            (Some(_), Some(_)) => true,
+        || a.iter().zip(b.iter()).all(|(x, y)| may_be_same_value(x, y))
+}
+
+fn may_be_same_value(a: Option<&Literal>, b: Option<&Literal>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
+        (Some(Literal::Primitive(x)), Some(Literal::Primitive(y))) => {
+            std::mem::discriminant(x) != std::mem::discriminant(y) || x == y
+        }
+        (Some(_), Some(_)) => true,
+    }
+}
+
+/// Whether rows of a file in `file_partition` of `file_spec` can be in
+/// `partition` of `spec`. False only when both specs have a field with the same
+/// source and transform whose values certainly differ.
+fn may_hold_rows_of(
+    file_spec: &PartitionSpec,
+    file_partition: &Struct,
+    spec: &PartitionSpec,
+    partition: &Struct,
+) -> bool {
+    if file_spec.fields().len() != file_partition.fields().len()
+        || spec.fields().len() != partition.fields().len()
+    {
+        return true;
+    }
+    !spec
+        .fields()
+        .iter()
+        .zip(partition.iter())
+        .any(|(field, value)| {
+            file_spec
+                .fields()
+                .iter()
+                .zip(file_partition.iter())
+                .any(|(file_field, file_value)| {
+                    file_field.source_id == field.source_id
+                        && file_field.transform == field.transform
+                        && !may_be_same_value(file_value, value)
+                })
         })
 }
 
@@ -2365,6 +2429,370 @@ mod tests {
             let expected = case.refused.map_or(Ok(()), |content| {
                 Err(format!(
                     "Cannot rewrite files: the {content} file {deletes} was added after the starting snapshot {} and can apply to the replaced data file test/1.parquet.",
+                    starting_snapshot.snapshot_id()
+                ))
+            });
+            assert_eq!(outcome, expected, "{}", case.name);
+        }
+    }
+
+    /// `id` long and an optional `p` int, partitioned by `identity(p)` and
+    /// `bucket(4, id)` (spec 0), then by `bucket(4, id)` alone (spec 1).
+    fn xspec_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "p", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn xspec_field(source_id: i32, name: &str, transform: Transform) -> UnboundPartitionField {
+        UnboundPartitionField::builder()
+            .source_ids(vec![source_id])
+            .name(name.to_string())
+            .transform(transform)
+            .build()
+            .unwrap()
+    }
+
+    fn xspec_spec(fields: Vec<UnboundPartitionField>) -> UnboundPartitionSpec {
+        UnboundPartitionSpec::builder()
+            .add_partition_fields(fields)
+            .unwrap()
+            .build()
+    }
+
+    /// Partition `(p, bucket)` of spec 0.
+    fn p_bucket(p: Option<i32>, bucket: i32) -> Struct {
+        Struct::from_iter([p.map(Literal::int), Some(Literal::int(bucket))])
+    }
+
+    /// Partition `bucket` of spec 1.
+    fn bucket(bucket: i32) -> Struct {
+        Struct::from_iter([Some(Literal::int(bucket))])
+    }
+
+    #[test]
+    fn test_may_hold_rows_of() {
+        let schema = Arc::new(xspec_schema());
+        let bind = |id: i32, fields: Vec<UnboundPartitionField>| {
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(id)
+                .add_unbound_fields(fields)
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let p_and_bucket = bind(0, vec![
+            xspec_field(2, "p", Transform::Identity),
+            xspec_field(1, "id_bucket", Transform::Bucket(4)),
+        ]);
+        let bucket_4 = bind(1, vec![xspec_field(1, "id_bucket", Transform::Bucket(4))]);
+        let bucket_8 = bind(2, vec![xspec_field(1, "id_bucket", Transform::Bucket(8))]);
+        let identity_p = bind(3, vec![xspec_field(2, "p", Transform::Identity)]);
+        let p = |value: Option<i32>| Struct::from_iter([value.map(Literal::int)]);
+        let cases = [
+            (
+                "same bucket",
+                &p_and_bucket,
+                p_bucket(Some(2), 3),
+                &bucket_4,
+                bucket(3),
+                true,
+            ),
+            (
+                "other bucket",
+                &p_and_bucket,
+                p_bucket(Some(2), 1),
+                &bucket_4,
+                bucket(3),
+                false,
+            ),
+            (
+                "bucket of another width",
+                &bucket_8,
+                bucket(1),
+                &bucket_4,
+                bucket(3),
+                true,
+            ),
+            (
+                "no shared field",
+                &bucket_4,
+                bucket(1),
+                &identity_p,
+                p(Some(2)),
+                true,
+            ),
+            (
+                "same p",
+                &p_and_bucket,
+                p_bucket(Some(2), 1),
+                &identity_p,
+                p(Some(2)),
+                true,
+            ),
+            (
+                "other p",
+                &p_and_bucket,
+                p_bucket(Some(2), 1),
+                &identity_p,
+                p(Some(5)),
+                false,
+            ),
+            (
+                "null p, p set",
+                &p_and_bucket,
+                p_bucket(None, 1),
+                &identity_p,
+                p(Some(2)),
+                false,
+            ),
+            (
+                "null p, null p",
+                &p_and_bucket,
+                p_bucket(None, 1),
+                &identity_p,
+                p(None),
+                true,
+            ),
+            (
+                "tuple shorter than its spec",
+                &p_and_bucket,
+                p(Some(5)),
+                &identity_p,
+                p(Some(2)),
+                true,
+            ),
+        ];
+        for (name, file_spec, file_partition, spec, partition, expected) in cases {
+            assert_eq!(
+                may_hold_rows_of(file_spec, &file_partition, spec, &partition),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// The default spec made just before the starting snapshot, if any.
+    enum ThirdSpec {
+        None,
+        Unpartitioned,
+        IdentityP,
+    }
+
+    struct XspecCase {
+        name: &'static str,
+        third_spec: ThirdSpec,
+        sequence_number: SequenceNumber,
+        replaced: &'static [&'static str],
+        outputs: Vec<DataFile>,
+        delete: DataFile,
+        /// The replaced file named by the refusal, if refused.
+        refused: Option<&'static str>,
+    }
+
+    /// Rewrites across a partition spec change, with a new delete committed
+    /// before the rewrite. `test/old-b3.parquet` and `test/old-b1.parquet` are
+    /// in spec 0 (`p=2`, buckets 3 and 1), `test/new-b3.parquet` in spec 1
+    /// (bucket 3).
+    #[tokio::test]
+    async fn test_rewrite_files_checks_equality_deletes_across_specs() {
+        use DataContentType::{Data, EqualityDeletes, PositionDeletes};
+        let deletes = "test/new-deletes.parquet";
+        let out = |spec_id: i32, partition: Struct| {
+            file_in_spec("test/out.parquet", Data, spec_id, partition, None)
+        };
+        let cases = [
+            XspecCase {
+                name: "row moved into the delete's bucket from spec 0",
+                third_spec: ThirdSpec::None,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/old-b3.parquet", "test/new-b3.parquet"],
+                outputs: vec![out(1, bucket(3))],
+                delete: file_in_spec(deletes, EqualityDeletes, 1, bucket(3), None),
+                refused: Some("test/old-b3.parquet"),
+            },
+            XspecCase {
+                name: "row moved into the delete's bucket, outputs in two specs",
+                third_spec: ThirdSpec::None,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/old-b3.parquet"],
+                outputs: vec![
+                    out(1, bucket(3)),
+                    file_in_spec("test/out-0.parquet", Data, 0, p_bucket(Some(2), 3), None),
+                ],
+                delete: file_in_spec(deletes, EqualityDeletes, 1, bucket(3), None),
+                refused: Some("test/old-b3.parquet"),
+            },
+            XspecCase {
+                name: "row moved into another bucket from spec 0",
+                third_spec: ThirdSpec::None,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/old-b1.parquet", "test/new-b3.parquet"],
+                outputs: vec![
+                    out(1, bucket(3)),
+                    file_in_spec("test/out-b1.parquet", Data, 1, bucket(1), None),
+                ],
+                delete: file_in_spec(deletes, EqualityDeletes, 1, bucket(3), None),
+                refused: None,
+            },
+            XspecCase {
+                name: "no output in the delete's bucket",
+                third_spec: ThirdSpec::None,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/old-b3.parquet"],
+                outputs: vec![out(1, bucket(3))],
+                delete: file_in_spec(deletes, EqualityDeletes, 1, bucket(1), None),
+                refused: None,
+            },
+            XspecCase {
+                name: "delete in a new spec on a field spec 1 lacks",
+                third_spec: ThirdSpec::IdentityP,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/new-b3.parquet"],
+                outputs: vec![out(2, Struct::from_iter([Some(Literal::int(2))]))],
+                delete: file_in_spec(
+                    deletes,
+                    EqualityDeletes,
+                    2,
+                    Struct::from_iter([Some(Literal::int(2))]),
+                    None,
+                ),
+                refused: Some("test/new-b3.parquet"),
+            },
+            XspecCase {
+                name: "delete in a new spec on a field spec 1 lacks, no output in its partition",
+                third_spec: ThirdSpec::IdentityP,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/new-b3.parquet"],
+                outputs: vec![out(2, Struct::from_iter([Some(Literal::int(2))]))],
+                delete: file_in_spec(
+                    deletes,
+                    EqualityDeletes,
+                    2,
+                    Struct::from_iter([Some(Literal::int(5))]),
+                    None,
+                ),
+                refused: None,
+            },
+            XspecCase {
+                name: "global delete, output in its unpartitioned spec, start sequence number",
+                third_spec: ThirdSpec::Unpartitioned,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/old-b3.parquet", "test/new-b3.parquet"],
+                outputs: vec![out(2, Struct::empty())],
+                delete: file_in_spec(deletes, EqualityDeletes, 2, Struct::empty(), None),
+                refused: None,
+            },
+            XspecCase {
+                name: "global delete, output in its unpartitioned spec, new sequence number",
+                third_spec: ThirdSpec::Unpartitioned,
+                sequence_number: SequenceNumber::New,
+                replaced: &["test/old-b3.parquet", "test/new-b3.parquet"],
+                outputs: vec![out(2, Struct::empty())],
+                delete: file_in_spec(deletes, EqualityDeletes, 2, Struct::empty(), None),
+                refused: Some("test/old-b3.parquet"),
+            },
+            XspecCase {
+                name: "partition-scoped position delete in the moved row's bucket",
+                third_spec: ThirdSpec::None,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/old-b3.parquet"],
+                outputs: vec![out(1, bucket(3))],
+                delete: file_in_spec(deletes, PositionDeletes, 1, bucket(3), None),
+                refused: None,
+            },
+            XspecCase {
+                name: "position delete for the moved file",
+                third_spec: ThirdSpec::None,
+                sequence_number: SequenceNumber::Start,
+                replaced: &["test/old-b3.parquet"],
+                outputs: vec![out(1, bucket(3))],
+                delete: file_in_spec(
+                    deletes,
+                    PositionDeletes,
+                    1,
+                    bucket(3),
+                    Some("test/old-b3.parquet"),
+                ),
+                refused: Some("test/old-b3.parquet"),
+            },
+        ];
+        for case in cases {
+            let catalog = new_memory_catalog().await;
+            let namespace = NamespaceIdent::new(format!("ns1-{}", Uuid::new_v4()));
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .unwrap();
+            let creation = TableCreation::builder()
+                .name("upserts".to_string())
+                .schema(xspec_schema())
+                .partition_spec(xspec_spec(vec![
+                    xspec_field(2, "p", Transform::Identity),
+                    xspec_field(1, "id_bucket", Transform::Bucket(4)),
+                ]))
+                .format_version(FormatVersion::V2)
+                .build();
+            let table = catalog.create_table(&namespace, creation).await.unwrap();
+            let files = [
+                file_in_spec("test/old-b3.parquet", Data, 0, p_bucket(Some(2), 3), None),
+                file_in_spec("test/old-b1.parquet", Data, 0, p_bucket(Some(2), 1), None),
+                file_in_spec("test/new-b3.parquet", Data, 1, bucket(3), None),
+            ];
+            let table = append_files(&catalog, &table, files[..2].to_vec()).await;
+            let bucket_only = xspec_spec(vec![xspec_field(1, "id_bucket", Transform::Bucket(4))]);
+            let table = set_default_spec(&catalog, &table, bucket_only, 1).await;
+            let mut table = append_files(&catalog, &table, files[2..].to_vec()).await;
+            match case.third_spec {
+                ThirdSpec::None => {}
+                ThirdSpec::Unpartitioned => {
+                    let spec = UnboundPartitionSpec::builder().build();
+                    table = set_default_spec(&catalog, &table, spec, 2).await;
+                }
+                ThirdSpec::IdentityP => {
+                    let spec = xspec_spec(vec![xspec_field(2, "p", Transform::Identity)]);
+                    table = set_default_spec(&catalog, &table, spec, 2).await;
+                }
+            }
+            let starting_snapshot = table.metadata().current_snapshot().unwrap().clone();
+
+            let mut action = Transaction::new(&table).rewrite_files();
+            for file in files
+                .iter()
+                .filter(|f| case.replaced.contains(&f.file_path()))
+            {
+                action = action.delete_file(file.clone());
+            }
+            for output in case.outputs {
+                action = action.add_file(output);
+            }
+            let action = match case.sequence_number {
+                SequenceNumber::New => action,
+                SequenceNumber::Start => {
+                    action.data_sequence_number(starting_snapshot.sequence_number())
+                }
+                SequenceNumber::AboveStart => {
+                    action.data_sequence_number(starting_snapshot.sequence_number() + 1)
+                }
+            };
+            let content = case.delete.content_type();
+            let table = stage_delete_files(&catalog, &table, vec![case.delete]).await;
+
+            let outcome = Arc::new(action)
+                .commit(&table)
+                .await
+                .map(|_| ())
+                .map_err(|err| {
+                    assert_eq!(err.kind(), ErrorKind::DataInvalid, "{}", case.name);
+                    err.message().to_string()
+                });
+            let expected = case.refused.map_or(Ok(()), |replaced| {
+                Err(format!(
+                    "Cannot rewrite files: the {content:?} file {deletes} was added after the starting snapshot {} and can apply to the replaced data file {replaced}.",
                     starting_snapshot.snapshot_id()
                 ))
             });
