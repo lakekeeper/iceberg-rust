@@ -674,7 +674,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt(&left, literal.as_ref())
             }))
@@ -694,7 +694,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt_eq(&left, literal.as_ref())
             }))
@@ -714,7 +714,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt(&left, literal.as_ref())
             }))
@@ -734,7 +734,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt_eq(&left, literal.as_ref())
             }))
@@ -754,7 +754,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 eq(&left, literal.as_ref())
             }))
@@ -774,7 +774,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 neq(&left, literal.as_ref())
             }))
@@ -794,7 +794,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 starts_with(&left, literal.as_ref())
             }))
@@ -814,7 +814,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 // update here if arrow ever adds a native not_starts_with
                 not(&starts_with(&left, literal.as_ref())?)
@@ -839,7 +839,10 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native is_in kernel
-                let left = project_column(&batch, idx)?;
+                let mut left = project_column(&batch, idx)?;
+                if let Some(literal) = literals.first() {
+                    left = promote_column(left, literal)?;
+                }
 
                 let mut acc = constant_bool_array(false, batch.num_rows());
                 for literal in &literals {
@@ -869,7 +872,10 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
+                let mut left = project_column(&batch, idx)?;
+                if let Some(literal) = literals.first() {
+                    left = promote_column(left, literal)?;
+                }
                 let mut acc = constant_bool_array(true, batch.num_rows());
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
@@ -882,6 +888,31 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             // A missing column, treating it as null.
             self.build_always_false()
         }
+    }
+}
+
+/// Casts a column that the file stores in a type the table promoted, such as `date` read as
+/// `timestamp`, to the literal's type, which is the table type. Casting the literal down to the
+/// file type instead would truncate or overflow it.
+fn promote_column(
+    column: ArrayRef,
+    literal: &Arc<dyn ArrowDatum + Send + Sync>,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    let table_type = literal.get().0.data_type();
+    let promoted = match (column.data_type(), table_type) {
+        (DataType::Int32, DataType::Int64)
+        | (DataType::Float32, DataType::Float64)
+        | (DataType::Date32, DataType::Timestamp(_, _)) => true,
+        (
+            DataType::Decimal128(file_precision, file_scale),
+            DataType::Decimal128(table_precision, table_scale),
+        ) => file_scale == table_scale && file_precision < table_precision,
+        _ => false,
+    };
+    if promoted {
+        cast(&column, table_type)
+    } else {
+        Ok(column)
     }
 }
 

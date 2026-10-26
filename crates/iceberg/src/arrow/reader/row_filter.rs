@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_cast::{CastOptions, cast_with_options};
 use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowSelection};
@@ -32,7 +33,7 @@ use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
 use crate::arrow::caching_delete_file_loader::{EqDeleteKey, EqDeleteSet};
-use crate::arrow::{arrow_primitive_to_literal, arrow_type_to_type};
+use crate::arrow::{arrow_primitive_to_literal, arrow_type_to_type, type_to_arrow_type};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -44,10 +45,8 @@ use crate::{Error, ErrorKind};
 /// One equality-delete key column of a decoded batch
 struct KeyColumn {
     literals: Vec<Option<Literal>>,
-    /// Iceberg type of the column as stored in this data file.
-    source_primitive: PrimitiveType,
-    /// Whether the file type differs from the table type, so values need `Datum::to`.
-    needs_promotion: bool,
+    /// Iceberg type of the column in the table schema.
+    primitive: PrimitiveType,
 }
 
 impl ArrowReader {
@@ -159,10 +158,20 @@ impl ArrowReader {
                             columns.push(None);
                             continue;
                         };
-                        let array = batch.column(pos);
+                        let mut array = Arc::clone(batch.column(pos));
                         let source_type = arrow_type_to_type(array.data_type())
                             .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
-                        let source_primitive = source_type
+                        // Promotion to the table type keeps these comparable with the parsed
+                        // delete keys under schema evolution.
+                        if source_type != *target_type {
+                            let target_arrow_type = type_to_arrow_type(target_type)
+                                .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
+                            array = cast_with_options(&array, &target_arrow_type, &CastOptions {
+                                safe: false,
+                                ..CastOptions::default()
+                            })?;
+                        }
+                        let primitive = target_type
                             .as_primitive_type()
                             .ok_or_else(|| {
                                 ArrowError::ComputeError(
@@ -172,12 +181,9 @@ impl ArrowReader {
                             })?
                             .clone();
                         columns.push(Some(KeyColumn {
-                            // Promotion to the table type keeps these comparable with the
-                            // parsed delete keys under schema evolution.
-                            needs_promotion: source_type != *target_type,
-                            literals: arrow_primitive_to_literal(array, &source_type)
+                            literals: arrow_primitive_to_literal(&array, target_type)
                                 .map_err(|e| ArrowError::ComputeError(e.to_string()))?,
-                            source_primitive,
+                            primitive,
                         }));
                     }
 
@@ -194,15 +200,7 @@ impl ArrowReader {
                             // we can `take` because each cell is probed once.
                             probe.0[i] = match column.literals[row].take() {
                                 Some(Literal::Primitive(primitive)) => {
-                                    let datum =
-                                        Datum::new(column.source_primitive.clone(), primitive);
-                                    Some(if column.needs_promotion {
-                                        datum
-                                            .to(&target_types[i])
-                                            .map_err(|e| ArrowError::ComputeError(e.to_string()))?
-                                    } else {
-                                        datum
-                                    })
+                                    Some(Datum::new(column.primitive.clone(), primitive))
                                 }
                                 Some(other) => {
                                     return Err(ArrowError::ComputeError(format!(
@@ -387,12 +385,12 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int64Type;
+    use arrow_array::types::{Int64Type, TimestampMicrosecondType};
     use arrow_array::{
-        ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, RecordBatch, StringArray,
+        ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
     };
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
@@ -2448,6 +2446,181 @@ mod tests {
         .await;
 
         assert_eq!(eqd_collect_i64(&result, 0), vec![1, 2]);
+    }
+
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+    /// Writes a file that stores `d` as `date` for 2020-01-01 and 2020-01-02 and returns its
+    /// path with a table schema that promotes `d` to `timestamp`.
+    fn write_date_file_promoted_to_timestamp(loc: &str) -> (String, SchemaRef) {
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "d",
+                DataType::Date32,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Date32Array::from(vec![18262, 18263])) as ArrayRef],
+        );
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "d", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        (data_path, table_schema)
+    }
+
+    fn collect_timestamp_micros(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    // A filter on a column promoted from `date` to `timestamp` compares the stored dates as
+    // timestamps, not the literal truncated to a date.
+    #[tokio::test]
+    async fn test_filter_on_date_column_promoted_to_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let (data_path, table_schema) =
+            write_date_file_promoted_to_timestamp(tmp.path().to_str().unwrap());
+        let (day1, day2) = (18262 * MICROS_PER_DAY, 18263 * MICROS_PER_DAY);
+        let noon = Datum::timestamp_micros(day1 + MICROS_PER_DAY / 2);
+
+        for (predicate, expected) in [
+            (Reference::new("d").less_than(noon.clone()), vec![day1]),
+            (
+                Reference::new("d").less_than_or_equal_to(noon.clone()),
+                vec![day1],
+            ),
+            (Reference::new("d").greater_than(noon.clone()), vec![day2]),
+            (
+                Reference::new("d").greater_than_or_equal_to(noon.clone()),
+                vec![day2],
+            ),
+            (Reference::new("d").equal_to(noon.clone()), vec![]),
+            (Reference::new("d").not_equal_to(noon.clone()), vec![
+                day1, day2,
+            ]),
+            (Reference::new("d").is_in([noon.clone()]), vec![]),
+            (Reference::new("d").is_not_in([noon.clone()]), vec![
+                day1, day2,
+            ]),
+        ] {
+            let result = eqd_read_with(
+                &data_path,
+                table_schema.clone(),
+                vec![1],
+                vec![],
+                Some(predicate.bind(table_schema.clone(), true).unwrap()),
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                collect_timestamp_micros(&result),
+                expected,
+                "predicate={predicate}"
+            );
+        }
+    }
+
+    // A filter on a column promoted from `int` to `long` compares with a literal outside the
+    // `int` range.
+    #[tokio::test]
+    async fn test_filter_on_int_column_promoted_to_long_with_literal_beyond_int_range() {
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "id",
+                DataType::Int32,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        );
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let large = Datum::long(1_i64 << 40);
+
+        for (predicate, expected) in [
+            (Reference::new("id").less_than(large.clone()), vec![1, 2]),
+            (Reference::new("id").greater_than(large.clone()), vec![]),
+            (
+                Reference::new("id").is_not_in([large.clone(), Datum::long(1)]),
+                vec![2],
+            ),
+        ] {
+            let result = eqd_read_with(
+                &data_path,
+                table_schema.clone(),
+                vec![1],
+                vec![],
+                Some(predicate.bind(table_schema.clone(), true).unwrap()),
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                eqd_collect_i64(&result, 0),
+                expected,
+                "predicate={predicate}"
+            );
+        }
+    }
+
+    // An equality delete keyed on a column promoted from `date` to `timestamp` matches the
+    // stored dates read as timestamps.
+    #[tokio::test]
+    async fn test_eq_delete_on_date_column_promoted_to_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let (data_path, table_schema) = write_date_file_promoted_to_timestamp(loc);
+
+        let del_path = format!("{loc}/eq-del.parquet");
+        eqd_write(
+            &del_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "d",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                1,
+                false,
+            )])),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                18263 * MICROS_PER_DAY,
+            ])) as ArrayRef],
+        );
+
+        let result = eqd_read(&data_path, table_schema, vec![1], vec![eqd_delete_file(
+            &del_path,
+            vec![1],
+        )])
+        .await;
+
+        assert_eq!(collect_timestamp_micros(&result), vec![
+            18262 * MICROS_PER_DAY
+        ]);
     }
 
     // Two delete files that key on different columns each apply independently: a row is deleted
