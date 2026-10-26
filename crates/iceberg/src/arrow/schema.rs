@@ -352,6 +352,9 @@ pub(super) fn type_promotion_is_valid(
         ) if requested_precision >= file_precision && file_scale == requested_scale => true,
         // Uuid will be store as Fixed(16) in parquet file, so the read back type will be Fixed(16).
         (Some(PrimitiveType::Fixed(16)), Some(PrimitiveType::Uuid)) => true,
+        // `unknown` may be promoted to any type. Its values are all null; the spec says to
+        // omit the column, but iceberg-rust's own writers store it as a null column.
+        (Some(PrimitiveType::Unknown), Some(_)) => true,
         // Writers such as Spark (INT96) and Hive store timestamps without the UTC adjustment that
         // tells `timestamp` from `timestamptz`; Java reads them as the table type.
         (Some(PrimitiveType::Timestamp), Some(PrimitiveType::Timestamptz))

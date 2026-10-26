@@ -2911,4 +2911,74 @@ message schema {
              source: Arithmetic overflow: Overflow happened on: 200000 * 86400000000000"
         );
     }
+
+    /// A column stored as `unknown` and later promoted to another type reads as NULL.
+    #[tokio::test]
+    async fn test_read_unknown_column_promoted_to_another_type() {
+        use arrow_array::{Int32Array, NullArray, new_null_array};
+
+        use crate::arrow::schema_to_arrow_schema;
+
+        fn schema(u: PrimitiveType) -> Schema {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "u", Type::Primitive(u)).into(),
+                    NestedField::optional(2, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap()
+        }
+
+        let ints = Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&schema(PrimitiveType::Unknown)).unwrap()),
+            vec![Arc::new(NullArray::new(2)), ints.clone()],
+        )
+        .unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/unknown.parquet", tmp_dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        for table_type in [
+            PrimitiveType::String,
+            PrimitiveType::Long,
+            PrimitiveType::Timestamptz,
+        ] {
+            let table_schema = Arc::new(schema(table_type.clone()));
+            let arrow_schema = Arc::new(schema_to_arrow_schema(&table_schema).unwrap());
+            let expected = RecordBatch::try_new(arrow_schema.clone(), vec![
+                new_null_array(arrow_schema.field(0).data_type(), 2),
+                ints.clone(),
+            ])
+            .unwrap();
+
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+            let tasks = Box::pin(futures::stream::iter(
+                vec![Ok(FileScanTask::builder()
+                    .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                    .with_start(0)
+                    .with_length(0)
+                    .with_data_file_path(file_path.clone())
+                    .with_data_file_format(DataFileFormat::Parquet)
+                    .with_schema(table_schema)
+                    .with_project_field_ids(vec![1, 2])
+                    .with_case_sensitive(false)
+                    .build()
+                    .unwrap())]
+                .into_iter(),
+            )) as FileScanTaskStream;
+
+            let result = reader
+                .read(tasks)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap();
+            assert_eq!(result, vec![expected], "{table_type}");
+        }
+    }
 }
