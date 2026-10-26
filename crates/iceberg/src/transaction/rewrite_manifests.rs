@@ -26,8 +26,8 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
-    ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, Struct, Summary, TableProperties,
+    ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, SchemaId, SchemaRef,
+    Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary, TableProperties,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::generate_unique_snapshot_id;
@@ -39,7 +39,8 @@ const FALLBACK_BYTES_PER_ENTRY: u64 = 256;
 /// A transaction action that compacts the data manifests of the current snapshot.
 ///
 /// Live `DataFile` entries from manifests bound to the default partition spec are
-/// grouped by partition and rewritten into new manifests rolled at
+/// grouped by the schema their manifest was written with and by partition, and
+/// rewritten into new manifests rolled at
 /// [`RewriteManifestsAction::set_target_size_bytes`], preserving each entry's
 /// sequence numbers. The result is committed as a
 /// [`Operation::Replace`](crate::spec::Operation::Replace) snapshot, mirroring
@@ -137,11 +138,15 @@ impl TransactionAction for RewriteManifestsAction {
             .try_collect()
             .await?;
 
-        let mut grouped: Vec<Vec<(DataFile, i64, i64, Option<i64>)>> = Vec::new();
-        let mut group_index: HashMap<Struct, usize> = HashMap::new();
+        // Each new manifest keeps the schema its entries were written with, so
+        // their partition values keep fitting their types after a promotion or
+        // a dropped source column.
+        let mut grouped: Vec<(SchemaRef, Vec<(DataFile, i64, i64, Option<i64>)>)> = Vec::new();
+        let mut group_index: HashMap<(SchemaId, Struct), usize> = HashMap::new();
         let mut entries_processed: u64 = 0;
 
         for manifest in loaded {
+            let schema = manifest.metadata().schema().clone();
             for entry in manifest.entries() {
                 if !entry.is_alive() {
                     continue;
@@ -159,16 +164,19 @@ impl TransactionAction for RewriteManifestsAction {
                     )
                 })?;
                 let data_file = entry.data_file().clone();
-                let idx = match group_index.get(&data_file.partition) {
+                let key = (schema.schema_id(), data_file.partition.clone());
+                let idx = match group_index.get(&key) {
                     Some(&i) => i,
                     None => {
                         let i = grouped.len();
-                        group_index.insert(data_file.partition.clone(), i);
-                        grouped.push(Vec::new());
+                        group_index.insert(key, i);
+                        grouped.push((schema.clone(), Vec::new()));
                         i
                     }
                 };
-                grouped[idx].push((data_file, snap_id, seq, entry.file_sequence_number));
+                grouped[idx]
+                    .1
+                    .push((data_file, snap_id, seq, entry.file_sequence_number));
                 entries_processed += 1;
             }
         }
@@ -176,8 +184,9 @@ impl TransactionAction for RewriteManifestsAction {
         let mut counter: u64 = 0;
         let mut new_manifests: Vec<ManifestFile> = Vec::with_capacity(grouped.len());
 
-        for group in grouped {
-            let mut writer = new_manifest_writer(table, &commit_uuid, counter, snapshot_id)?;
+        for (schema, group) in grouped {
+            let mut writer =
+                new_manifest_writer(table, &schema, &commit_uuid, counter, snapshot_id)?;
             counter += 1;
             let mut accumulated: u64 = 0;
             let mut min_first_row_id: Option<u64> = None;
@@ -191,7 +200,8 @@ impl TransactionAction for RewriteManifestsAction {
                         written.first_row_id = min_first_row_id;
                     }
                     new_manifests.push(written);
-                    writer = new_manifest_writer(table, &commit_uuid, counter, snapshot_id)?;
+                    writer =
+                        new_manifest_writer(table, &schema, &commit_uuid, counter, snapshot_id)?;
                     counter += 1;
                     accumulated = 0;
                     min_first_row_id = None;
@@ -318,6 +328,7 @@ impl TransactionAction for RewriteManifestsAction {
 
 fn new_manifest_writer(
     table: &Table,
+    schema: &SchemaRef,
     commit_uuid: &Uuid,
     n: u64,
     snapshot_id: i64,
@@ -334,7 +345,7 @@ fn new_manifest_writer(
     let builder = ManifestWriterBuilder::new(
         output,
         Some(snapshot_id),
-        metadata.current_schema().clone(),
+        schema.clone(),
         metadata.default_partition_spec().as_ref().clone(),
     );
     Ok(match metadata.format_version() {
@@ -380,6 +391,118 @@ mod tests {
             .commit(catalog)
             .await
             .unwrap()
+    }
+
+    /// Manifests written before `p` was promoted from int to long are merged
+    /// with the schema they were written with, apart from the newer ones.
+    #[tokio::test]
+    async fn test_rewrite_manifests_after_a_partition_source_promotion() {
+        use uuid::Uuid;
+
+        use crate::spec::{
+            NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionField,
+            UnboundPartitionSpec,
+        };
+        use crate::{NamespaceIdent, TableCommit, TableCreation};
+
+        let catalog = new_memory_catalog().await;
+        let namespace = NamespaceIdent::new(format!("ns1-{}", Uuid::new_v4()));
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = |p_type: PrimitiveType| {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "p", Type::Primitive(p_type)).into(),
+                ])
+                .build()
+                .unwrap()
+        };
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![2])
+                    .name("p")
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .build();
+        let creation = TableCreation::builder()
+            .name("events".to_string())
+            .schema(schema(PrimitiveType::Int))
+            .partition_spec(spec)
+            .format_version(crate::spec::FormatVersion::V2)
+            .build();
+        let table = catalog.create_table(&namespace, creation).await.unwrap();
+        let file = |name: &str, value: Literal| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("test/{name}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(0)
+                .partition(Struct::from_iter([Some(value)]))
+                .build()
+                .unwrap()
+        };
+        let table = append_one(&catalog, table, file("a", Literal::int(5))).await;
+        let table = append_one(&catalog, table, file("b", Literal::int(5))).await;
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![
+                TableUpdate::AddSchema {
+                    schema: schema(PrimitiveType::Long),
+                },
+                TableUpdate::SetCurrentSchema { schema_id: -1 },
+            ])
+            .build();
+        let table = catalog.update_table(commit).await.unwrap();
+        let table = append_one(&catalog, table, file("c", Literal::long(5))).await;
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .rewrite_manifests()
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Replace);
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let mut manifests = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+            let mut entries: Vec<(String, Struct)> = manifest
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.file_path().to_string(),
+                        entry.data_file().partition.clone(),
+                    )
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            manifests.push((manifest.metadata().schema().schema_id(), entries));
+        }
+        manifests.sort_by_key(|(schema_id, _)| *schema_id);
+        let int_5 = Struct::from_iter([Some(Literal::int(5))]);
+        let long_5 = Struct::from_iter([Some(Literal::long(5))]);
+        assert_eq!(manifests, vec![
+            (0, vec![
+                ("test/a.parquet".to_string(), int_5.clone()),
+                ("test/b.parquet".to_string(), int_5),
+            ]),
+            (1, vec![("test/c.parquet".to_string(), long_5)]),
+        ]);
     }
 
     #[tokio::test]
