@@ -91,7 +91,7 @@ impl ArrowReader {
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
         use_position_fallback: bool,
-        partition_constants: &HashMap<i32, Datum>,
+        absent_key_values: &HashMap<i32, Datum>,
     ) -> Result<Vec<Box<dyn ArrowPredicate>>> {
         let field_id_map =
             Self::resolve_field_id_map(parquet_schema, arrow_schema, use_position_fallback)?;
@@ -125,13 +125,13 @@ impl ArrowReader {
                 .map(|leaf| leaf.and_then(|idx| column_indices.binary_search(&idx).ok()))
                 .collect();
 
-            // A key column absent from this file probes as its identity partition value, as
-            // Java's reader fills it, and as null when there is none.
+            // A key column absent from this file probes as the value projection fills in for
+            // it (`absent_key_values`), as Java's reader does, and as null when there is none.
             let absent_values: Vec<Option<Datum>> = set
                 .fields
                 .iter()
                 .map(|(_, id, ty)| {
-                    partition_constants
+                    absent_key_values
                         .get(id)
                         .map(|value| match (value.literal(), ty) {
                             // Delete keys are read back through Arrow, which types a uuid as
@@ -2665,10 +2665,7 @@ mod tests {
     }
 
     // An equality-delete key column absent from the data file (added by later schema
-    // evolution). The probe reads it as null for every row, so nothing matches and the
-    // delete file removes no rows -- it does NOT resolve `initial_default`, which the spec
-    // asks for via normal projection rules. Pinned here so the divergence is visible and a
-    // later fix has something to change.
+    // evolution) probes as its `initial_default`, as projection reads it, and as null without one.
     #[tokio::test]
     async fn test_eq_delete_on_column_absent_from_data_file() {
         let tmp = TempDir::new().unwrap();
@@ -2710,35 +2707,47 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
         );
 
-        // Keyed on `added` with the value that IS the initial default: if the probe ever
-        // resolves defaults, every row matches and this expectation flips to empty.
-        let del_path = format!("{loc}/eq-del.parquet");
-        eqd_write(
-            &del_path,
-            Arc::new(ArrowSchema::new(vec![eqd_field(
-                "added",
-                DataType::Int64,
-                2,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![7])) as ArrayRef],
-        );
+        // Keyed on `added`, once with the initial default and once with another value.
+        let del_path = |value: i64| {
+            let path = format!("{loc}/eq-del-{value}.parquet");
+            eqd_write(
+                &path,
+                Arc::new(ArrowSchema::new(vec![eqd_field(
+                    "added",
+                    DataType::Int64,
+                    2,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+            );
+            path
+        };
+        let (del_default, del_other) = (del_path(7), del_path(8));
 
-        for (label, schema) in [
-            ("required with initial_default", required_with_default),
-            ("optional without default", optional_no_default),
+        for (label, schema, del_path, expected) in [
+            (
+                "initial_default deleted",
+                required_with_default.clone(),
+                &del_default,
+                vec![],
+            ),
+            (
+                "other value deleted",
+                required_with_default,
+                &del_other,
+                vec![1, 2, 3],
+            ),
+            ("no default", optional_no_default, &del_default, vec![
+                1, 2, 3,
+            ]),
         ] {
             let result = eqd_read(&data_path, schema, vec![1], vec![eqd_delete_file(
-                &del_path,
+                del_path,
                 vec![2],
             )])
             .await;
 
-            assert_eq!(
-                eqd_collect_i64(&result, 0),
-                vec![1, 2, 3],
-                "{label}: absent key column probes as null, so nothing is deleted"
-            );
+            assert_eq!(eqd_collect_i64(&result, 0), expected, "{label}");
         }
     }
 
