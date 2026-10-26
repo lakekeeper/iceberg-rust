@@ -3403,4 +3403,93 @@ mod tests {
         ])
         .await;
     }
+
+    /// Reads a file that stores only `id` (1, 2, 3) with each filter, with row selection off and
+    /// on, and asserts the ids it keeps.
+    async fn assert_filters_on_file_with_only_id(
+        schema: SchemaRef,
+        partition: Option<(Arc<PartitionSpec>, Struct)>,
+        cases: Vec<(Predicate, Vec<i64>)>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let data_path = format!("{}/data.parquet", tmp.path().to_str().unwrap());
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "id",
+                DataType::Int64,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        );
+        for row_selection_enabled in [false, true] {
+            for (predicate, expected) in &cases {
+                let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                    .with_row_selection_enabled(row_selection_enabled)
+                    .build();
+                let (batches, _) = read_once(
+                    reader,
+                    &data_path,
+                    schema.clone(),
+                    vec![1],
+                    predicate.clone(),
+                    partition.clone(),
+                    vec![],
+                )
+                .await;
+                assert_eq!(
+                    eqd_collect_i64(&batches, 0),
+                    *expected,
+                    "{predicate}, row_selection_enabled = {row_selection_enabled}"
+                );
+            }
+        }
+    }
+
+    /// A migrated file that does not store its identity partition column `p` (partition value 5)
+    /// keeps the rows a filter on `p` selects when `p` is read as 5.
+    #[tokio::test]
+    async fn test_filter_on_absent_identity_partition_column_keeps_matching_rows() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "p", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("p", "p", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition = Struct::from_iter([Some(Literal::long(5))]);
+        let id = || Reference::new("id");
+        let p = || Reference::new("p");
+        assert_filters_on_file_with_only_id(schema, Some((Arc::new(spec), partition)), vec![
+            (p().equal_to(Datum::long(5)), vec![1, 2, 3]),
+            (p().is_in([Datum::long(5), Datum::long(6)]), vec![1, 2, 3]),
+            (p().greater_than_or_equal_to(Datum::long(3)), vec![1, 2, 3]),
+            (p().is_not_null(), vec![1, 2, 3]),
+            (p().equal_to(Datum::long(6)).negate(), vec![1, 2, 3]),
+            (
+                id().equal_to(Datum::long(2))
+                    .and(p().equal_to(Datum::long(5))),
+                vec![2],
+            ),
+            (
+                id().equal_to(Datum::long(2))
+                    .or(p().equal_to(Datum::long(5))),
+                vec![1, 2, 3],
+            ),
+            (p().less_than(Datum::long(6)), vec![1, 2, 3]),
+            (p().less_than_or_equal_to(Datum::long(5)), vec![1, 2, 3]),
+            (p().less_than(Datum::long(5)), vec![]),
+            (p().less_than_or_equal_to(Datum::long(4)), vec![]),
+        ])
+        .await;
+    }
 }
