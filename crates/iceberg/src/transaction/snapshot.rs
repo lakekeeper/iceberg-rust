@@ -194,6 +194,10 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub(crate) async fn validate_duplicate_files(&self) -> Result<()> {
+        // Nothing to look up, so no manifest is read.
+        if self.added_data_files.is_empty() {
+            return Ok(());
+        }
         let Some(current_snapshot) = self.table.metadata().current_snapshot() else {
             return Ok(());
         };
@@ -758,7 +762,7 @@ mod tests {
         ManifestEntry, ManifestStatus, NestedField, PartitionSpec, PrimitiveType, Schema, Struct,
         Transform, Type,
     };
-    use crate::transaction::tests::make_v2_minimal_table;
+    use crate::transaction::tests::{make_v2_minimal_table, make_v2_table};
 
     fn make_entry(
         path: &str,
@@ -927,6 +931,19 @@ mod tests {
 
         // Producer should have drained its added_delete_files.
         assert!(producer.added_delete_files.is_empty());
+    }
+
+    /// Without added files the check reads nothing: this table's manifest
+    /// list does not exist, so any read would fail.
+    #[tokio::test]
+    async fn test_validate_duplicate_files_without_added_files_reads_no_manifest() {
+        let table = make_v2_table();
+        let producer = SnapshotProducer::builder()
+            .with_table(&table)
+            .with_commit_uuid(Uuid::now_v7())
+            .build();
+
+        producer.validate_duplicate_files().await.unwrap();
     }
 
     struct DeleteOperation;

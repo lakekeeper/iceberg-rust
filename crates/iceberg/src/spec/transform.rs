@@ -221,6 +221,10 @@ impl Transform {
             (Self::Hour, PrimitiveLiteral::Int(ordinal)) => Self::human_hour(ordinal),
             (_, value) => {
                 let field_type = field_type.as_primitive_type().unwrap();
+                // A value written before an `int` -> `long` or `float` -> `double`
+                // promotion keeps its narrower literal; the datum renders only the
+                // literal that matches its type.
+                let value = value.promote_to(field_type).unwrap_or(value);
                 Datum::new(field_type.clone(), value).to_human_string()
             }
         }
@@ -1303,6 +1307,33 @@ mod tests {
                 Some(&Literal::string("unformatted"))
             ),
             "unformatted"
+        );
+    }
+
+    /// A partition value written before its source was promoted keeps its
+    /// narrower literal; it renders under the promoted type.
+    #[test]
+    fn test_to_human_string_widens_a_value_written_before_a_promotion() {
+        assert_eq!(
+            Transform::Identity.to_human_string(
+                &Type::Primitive(PrimitiveType::Long),
+                Some(&Literal::int(5))
+            ),
+            "5"
+        );
+        assert_eq!(
+            Transform::Truncate(10).to_human_string(
+                &Type::Primitive(PrimitiveType::Long),
+                Some(&Literal::int(-20))
+            ),
+            "-20"
+        );
+        assert_eq!(
+            Transform::Identity.to_human_string(
+                &Type::Primitive(PrimitiveType::Double),
+                Some(&Literal::float(1.5_f32))
+            ),
+            "1.5"
         );
     }
 

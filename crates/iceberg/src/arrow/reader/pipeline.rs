@@ -43,7 +43,7 @@ use super::{
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
-use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::record_batch_transformer::{RecordBatchTransformerBuilder, constants_map};
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
@@ -581,11 +581,17 @@ impl FileScanTaskReader {
         }
 
         if !eq_delete_sets.is_empty() {
+            // Identity partition values stand in for key columns the file does not store.
+            let partition_constants = match (task.partition_spec(), task.partition()) {
+                (Some(spec), Some(data)) => constants_map(spec, data, task.schema())?,
+                _ => HashMap::new(),
+            };
             row_filter_predicates.extend(ArrowReader::build_equality_delete_predicates(
                 &eq_delete_sets,
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 use_position_fallback,
+                &partition_constants,
             )?);
         }
 

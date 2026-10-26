@@ -217,7 +217,12 @@ impl PopulatedDeleteFileIndex {
                 }
                 DataContentType::EqualityDeletes => {
                     // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
-                    if partition.fields().is_empty() {
+                    // As in Java, a spec whose fields are all void transforms is unpartitioned.
+                    let unpartitioned = match &arc_ctx.partition_spec {
+                        Some(spec) => spec.is_unpartitioned(),
+                        None => partition.fields().is_empty(),
+                    };
+                    if unpartitioned {
                         global_equality_deletes.push(arc_ctx);
                     } else {
                         eq_deletes_by_partition
@@ -356,7 +361,7 @@ mod tests {
     use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
-        ManifestStatus, Struct,
+        ManifestStatus, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, Transform, Type,
     };
 
     #[test]
@@ -378,6 +383,7 @@ mod tests {
             .map(|entry| DeleteFileContext {
                 manifest_entry: entry.into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             })
             .collect();
 
@@ -476,6 +482,7 @@ mod tests {
             .map(|entry| DeleteFileContext {
                 manifest_entry: entry.into(),
                 partition_spec_id: spec_id,
+                partition_spec: None,
             })
             .collect();
 
@@ -563,6 +570,91 @@ mod tests {
     }
 
     #[test]
+    fn test_void_spec_equality_delete_is_global() {
+        // Dropping a v1 table's only partition field leaves it as a void transform. Like Java,
+        // such a spec is unpartitioned, so its equality deletes also apply to data files written
+        // under the earlier, partitioned spec.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let void_spec = PartitionSpec::builder(schema)
+            .with_spec_id(1)
+            .add_partition_field("x", "x_void", Transform::Void)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let eq_delete = build_partitioned_eq_delete(&Struct::from_iter([None::<Literal>]), 1);
+        let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(5, &eq_delete).into(),
+            partition_spec_id: 1,
+            partition_spec: Some(Arc::new(void_spec)),
+        }])
+        .unwrap();
+
+        let old_spec_file =
+            build_partitioned_data_file(&Struct::from_iter([Some(Literal::long(100))]), 0);
+        let deletes = index
+            .get_deletes_for_data_file(&old_spec_file, Some(1))
+            .unwrap();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].file_path(), eq_delete.file_path());
+
+        // The sequence number rule still applies.
+        assert!(
+            index
+                .get_deletes_for_data_file(&old_spec_file, Some(5))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_identity_spec_null_partition_equality_delete_stays_scoped() {
+        // An identity spec with a null partition value is partitioned, so its equality
+        // deletes apply only to files of the same spec and partition.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let identity_spec = PartitionSpec::builder(schema)
+            .with_spec_id(1)
+            .add_partition_field("x", "x", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let null_partition = Struct::from_iter([None::<Literal>]);
+        let eq_delete = build_partitioned_eq_delete(&null_partition, 1);
+        let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(5, &eq_delete).into(),
+            partition_spec_id: 1,
+            partition_spec: Some(Arc::new(identity_spec)),
+        }])
+        .unwrap();
+
+        let other_spec_file =
+            build_partitioned_data_file(&Struct::from_iter([Some(Literal::long(100))]), 0);
+        assert!(
+            index
+                .get_deletes_for_data_file(&other_spec_file, Some(1))
+                .unwrap()
+                .is_empty()
+        );
+        let same_partition_file = build_partitioned_data_file(&null_partition, 1);
+        let deletes = index
+            .get_deletes_for_data_file(&same_partition_file, Some(1))
+            .unwrap();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].file_path(), eq_delete.file_path());
+    }
+
+    #[test]
     fn test_partition_scoped_deletes_distinguish_signed_zero() {
         let neg_zero = Struct::from_iter([Some(Literal::double(-0.0))]);
         let pos_zero = Struct::from_iter([Some(Literal::double(0.0))]);
@@ -576,6 +668,7 @@ mod tests {
         .map(|delete| DeleteFileContext {
             manifest_entry: build_added_manifest_entry(4, delete).into(),
             partition_spec_id: spec_id,
+            partition_spec: None,
         })
         .collect();
 
@@ -603,6 +696,7 @@ mod tests {
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }])
         .unwrap();
 
@@ -632,6 +726,7 @@ mod tests {
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }])
         .unwrap();
 
@@ -662,6 +757,7 @@ mod tests {
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }])
         .unwrap();
 
@@ -692,6 +788,7 @@ mod tests {
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }])
         .unwrap();
 
@@ -712,6 +809,7 @@ mod tests {
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }])
         .unwrap();
 
@@ -762,14 +860,17 @@ mod tests {
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &path_delete).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             },
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &partition_delete).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             },
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &eq_delete).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             },
         ])
         .unwrap();
@@ -803,10 +904,12 @@ mod tests {
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &first_delete).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             },
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(6, &second_delete).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             },
         ])
         .unwrap();
@@ -847,6 +950,7 @@ mod tests {
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 1,
+            partition_spec: None,
         }])
         .unwrap();
 
@@ -881,6 +985,7 @@ mod tests {
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }])
         .unwrap();
 
@@ -958,6 +1063,7 @@ mod tests {
         let ctx = DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &dv).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         };
 
         let task = FileScanTaskDeleteFile::try_from(&ctx).unwrap();
@@ -981,6 +1087,7 @@ mod tests {
         let ctx = DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         };
         let task = FileScanTaskDeleteFile::try_from(&ctx).unwrap();
         assert_eq!(task.referenced_data_file(), Some("s3://bucket/a.parquet"));
@@ -992,6 +1099,7 @@ mod tests {
         let ctx = DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         };
         let task = FileScanTaskDeleteFile::try_from(&ctx).unwrap();
         assert_eq!(task.referenced_data_file(), Some("s3://bucket/a.parquet"));
@@ -1006,6 +1114,7 @@ mod tests {
             let ctx = DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &pos_delete).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             };
             let task = FileScanTaskDeleteFile::try_from(&ctx).unwrap();
             assert_eq!(task.referenced_data_file(), None);
@@ -1026,10 +1135,12 @@ mod tests {
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &dv).into(),
                 partition_spec_id: spec_id,
+                partition_spec: None,
             },
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &pos_del).into(),
                 partition_spec_id: spec_id,
+                partition_spec: None,
             },
         ];
 
@@ -1057,6 +1168,7 @@ mod tests {
         let contexts = vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(3, &dv).into(),
             partition_spec_id: spec_id,
+            partition_spec: None,
         }];
 
         let index = PopulatedDeleteFileIndex::new(contexts).unwrap();
@@ -1088,6 +1200,7 @@ mod tests {
         let contexts = vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &dv).into(),
             partition_spec_id: spec_id,
+            partition_spec: None,
         }];
 
         let index = PopulatedDeleteFileIndex::new(contexts).unwrap();
@@ -1114,6 +1227,7 @@ mod tests {
         let contexts = vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &dv).into(),
             partition_spec_id: 2,
+            partition_spec: None,
         }];
 
         let index = PopulatedDeleteFileIndex::new(contexts).unwrap();
@@ -1141,10 +1255,12 @@ mod tests {
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &dv).into(),
                 partition_spec_id: spec_id,
+                partition_spec: None,
             },
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &pos_del).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             },
         ];
 
@@ -1176,10 +1292,12 @@ mod tests {
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &dv).into(),
                 partition_spec_id: spec_id,
+                partition_spec: None,
             },
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &eq_del).into(),
                 partition_spec_id: 0,
+                partition_spec: None,
             },
         ];
 
@@ -1215,6 +1333,7 @@ mod tests {
         let contexts = vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &malformed_dv).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }];
 
         let err = PopulatedDeleteFileIndex::new(contexts).unwrap_err();
@@ -1256,6 +1375,7 @@ mod tests {
         let contexts = vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &malformed_dv).into(),
             partition_spec_id: 0,
+            partition_spec: None,
         }];
 
         let delete_file_index = PopulatedDeleteFileIndex::new(contexts).unwrap();
@@ -1280,10 +1400,12 @@ mod tests {
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(5, &dv_1).into(),
                 partition_spec_id: spec_id,
+                partition_spec: None,
             },
             DeleteFileContext {
                 manifest_entry: build_added_manifest_entry(6, &dv_2).into(),
                 partition_spec_id: spec_id,
+                partition_spec: None,
             },
         ];
 
@@ -1305,11 +1427,13 @@ mod tests {
         tx.try_send(DeleteFileContext {
             manifest_entry: build_added_manifest_entry(5, &dv_1).into(),
             partition_spec_id: spec_id,
+            partition_spec: None,
         })
         .unwrap();
         tx.try_send(DeleteFileContext {
             manifest_entry: build_added_manifest_entry(6, &dv_2).into(),
             partition_spec_id: spec_id,
+            partition_spec: None,
         })
         .unwrap();
         drop(tx);
