@@ -21,7 +21,7 @@
 //! of transformed Arrow `RecordBatch`es.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -35,16 +35,17 @@ use parquet::arrow::{
 };
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
-use super::predicate_visitor::residual_for_missing_fields;
+use super::predicate_visitor::{absent_field_values, residual_for_missing_fields};
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    ArrowFileReader, ArrowReader, CollectFieldIdVisitor, ParquetReadOptions,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
-use crate::arrow::record_batch_transformer::{RecordBatchTransformerBuilder, constants_map};
+use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
@@ -52,6 +53,7 @@ use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
+use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -60,7 +62,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, Literal, PartitionSpec, Struct, Type};
+use crate::spec::{Datum, PartitionSpec, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -516,6 +518,18 @@ impl FileScanTaskReader {
 
         let mut row_filter_predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
 
+        // Values that projection fills in for fields the file does not store; filters and
+        // equality deletes on those fields are decided against them.
+        let absent_values = if final_predicate.is_some() || !eq_delete_sets.is_empty() {
+            absent_field_values(
+                task.schema(),
+                task.partition_spec().map(Arc::as_ref),
+                task.partition(),
+            )?
+        } else {
+            HashMap::new()
+        };
+
         if let Some(predicate) = final_predicate {
             // Normalize NOT out of the predicate once for every consumer below. The
             // conservative row-group and page-index evaluators cannot soundly negate
@@ -525,7 +539,7 @@ impl FileScanTaskReader {
             // rewrite it here. Matches TableScan::with_filter.
             let predicate = predicate.rewrite_not();
 
-            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            let (mut iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 &predicate,
@@ -538,16 +552,29 @@ impl FileScanTaskReader {
                 &iceberg_field_ids,
                 &field_id_map,
                 task.schema(),
-                task.partition_spec().map(Arc::as_ref),
-                task.partition(),
+                &absent_values,
             )?;
+            if !iceberg_field_ids
+                .iter()
+                .all(|id| field_id_map.contains_key(id))
+            {
+                let mut collector = CollectFieldIdVisitor {
+                    field_ids: HashSet::default(),
+                };
+                visit(&mut collector, &predicate)?;
+                iceberg_field_ids = collector.field_ids();
+            }
 
-            row_filter_predicates.push(ArrowReader::build_scan_predicate(
-                &predicate,
-                record_batch_stream_builder.parquet_schema(),
-                &iceberg_field_ids,
-                &field_id_map,
-            )?);
+            match predicate {
+                BoundPredicate::AlwaysTrue => {}
+                BoundPredicate::AlwaysFalse => selected_row_group_indices = Some(Vec::new()),
+                _ => row_filter_predicates.push(ArrowReader::build_scan_predicate(
+                    &predicate,
+                    record_batch_stream_builder.parquet_schema(),
+                    &iceberg_field_ids,
+                    &field_id_map,
+                )?),
+            }
 
             if self.row_group_filtering_enabled {
                 let candidates = candidate_row_groups(
@@ -595,28 +622,12 @@ impl FileScanTaskReader {
         }
 
         if !eq_delete_sets.is_empty() {
-            // Identity partition values, then initial defaults of top-level fields, stand in for
-            // key columns the file does not store, as projection fills them.
-            let mut absent_key_values = match (task.partition_spec(), task.partition()) {
-                (Some(spec), Some(data)) => constants_map(spec, data, task.schema())?,
-                _ => HashMap::new(),
-            };
-            for (_, id, _) in eq_delete_sets.iter().flat_map(|set| &set.fields) {
-                if let Some(field) = task.schema().as_struct().field_by_id(*id)
-                    && let (Type::Primitive(ty), Some(Literal::Primitive(value))) =
-                        (&*field.field_type, &field.initial_default)
-                {
-                    absent_key_values
-                        .entry(*id)
-                        .or_insert_with(|| Datum::new(ty.clone(), value.clone()));
-                }
-            }
             row_filter_predicates.extend(ArrowReader::build_equality_delete_predicates(
                 &eq_delete_sets,
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 use_position_fallback,
-                &absent_key_values,
+                &absent_values,
             )?);
         }
 

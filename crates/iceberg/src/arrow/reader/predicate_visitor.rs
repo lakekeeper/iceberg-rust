@@ -40,7 +40,7 @@ use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::visitors::expression_evaluator::ExpressionEvaluatorVisitor;
 use crate::expr::{BoundPredicate, BoundReference};
-use crate::spec::{Datum, Literal, PartitionSpec, Schema, Struct};
+use crate::spec::{Datum, Literal, PartitionSpec, Schema, Struct, Type};
 
 /// A visitor to collect field ids from bound predicates.
 pub(super) struct CollectFieldIdVisitor {
@@ -197,12 +197,35 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
     }
 }
 
+/// Returns the value that projection reads for each top-level primitive field when a data file
+/// does not store it: the identity partition value, otherwise the field's `initial-default`.
+/// Fields with neither have no entry.
+pub(super) fn absent_field_values(
+    schema: &Schema,
+    partition_spec: Option<&PartitionSpec>,
+    partition: Option<&Struct>,
+) -> Result<HashMap<i32, Datum>> {
+    let mut values = match (partition_spec, partition) {
+        (Some(spec), Some(data)) => constants_map(spec, data, schema)?,
+        _ => HashMap::new(),
+    };
+    for field in schema.as_struct().fields() {
+        if let (Type::Primitive(ty), Some(Literal::Primitive(value))) =
+            (&*field.field_type, &field.initial_default)
+        {
+            values
+                .entry(field.id)
+                .or_insert_with(|| Datum::new(ty.clone(), value.clone()));
+        }
+    }
+    Ok(values)
+}
+
 /// Returns the residual of `predicate` for one data file: each leaf on a top-level field that is
-/// missing from the file becomes `AlwaysTrue` or `AlwaysFalse`, based on the value projection
-/// returns for that field. That value is the identity partition value, otherwise the field's
-/// `initial-default`, and every row of the file holds it. Leaves on missing fields with neither
-/// keep the null handling of the row filter and the page index evaluator. The resulting constants
-/// are folded out of `AND` and `OR`.
+/// missing from the file becomes `AlwaysTrue` or `AlwaysFalse`, based on its value in
+/// `absent_values` (see [`absent_field_values`]), which every row of the file holds. Leaves on
+/// missing fields without a value keep the null handling of the row filter and the page index
+/// evaluator. The resulting constants are folded out of `AND` and `OR`.
 ///
 /// Leaves on nested fields are kept, because a nested field also reads as null in any row where
 /// an ancestor struct is null.
@@ -211,8 +234,7 @@ pub(super) fn residual_for_missing_fields(
     predicate_field_ids: &HashSet<i32>,
     field_id_map: &HashMap<i32, usize>,
     schema: &Schema,
-    partition_spec: Option<&PartitionSpec>,
-    partition: Option<&Struct>,
+    absent_values: &HashMap<i32, Datum>,
 ) -> Result<BoundPredicate> {
     if predicate_field_ids
         .iter()
@@ -220,11 +242,6 @@ pub(super) fn residual_for_missing_fields(
     {
         return Ok(predicate);
     }
-
-    let partition_constants = match (partition_spec, partition) {
-        (Some(spec), Some(data)) => constants_map(spec, data, schema)?,
-        _ => HashMap::new(),
-    };
 
     let mut constant_field_ids = HashSet::new();
     let row: Struct = schema
@@ -235,10 +252,9 @@ pub(super) fn residual_for_missing_fields(
             if !predicate_field_ids.contains(&field.id) || field_id_map.contains_key(&field.id) {
                 return None;
             }
-            let value = match partition_constants.get(&field.id) {
-                Some(datum) => Some(Literal::Primitive(datum.literal().clone())),
-                None => field.initial_default.clone(),
-            };
+            let value = absent_values
+                .get(&field.id)
+                .map(|datum| Literal::Primitive(datum.literal().clone()));
             if value.is_some() {
                 constant_field_ids.insert(field.id);
             }
@@ -293,8 +309,7 @@ impl BoundPredicateVisitor for MissingFieldResidualVisitor<'_> {
         Ok(BoundPredicate::AlwaysFalse)
     }
 
-    // Fold constants so the row filter doesn't evaluate them per batch. The keep predicate of an
-    // equality delete file has one `OR` per deleted row, and each can fold to a constant.
+    // Fold constants so the row filter doesn't evaluate them per batch.
     fn and(&mut self, lhs: BoundPredicate, rhs: BoundPredicate) -> Result<BoundPredicate> {
         Ok(match (lhs, rhs) {
             (BoundPredicate::AlwaysFalse, _) | (_, BoundPredicate::AlwaysFalse) => {
@@ -948,7 +963,8 @@ mod tests {
     use parquet::schema::types::SchemaDescriptor;
 
     use super::{
-        CollectFieldIdVisitor, PredicateConverter, constant_bool_array, residual_for_missing_fields,
+        CollectFieldIdVisitor, PredicateConverter, absent_field_values, constant_bool_array,
+        residual_for_missing_fields,
     };
     use crate::expr::visitors::bound_predicate_visitor::visit;
     use crate::expr::{Bind, BoundPredicate, Predicate, Reference};
@@ -1136,8 +1152,12 @@ mod tests {
             &collector.field_ids(),
             &HashMap::from([(1, 0)]),
             schema,
-            partition.map(|(spec, _)| spec),
-            partition.map(|(_, data)| data),
+            &absent_field_values(
+                schema,
+                partition.map(|(spec, _)| spec),
+                partition.map(|(_, data)| data),
+            )
+            .unwrap(),
         )
         .unwrap()
     }
@@ -1344,14 +1364,14 @@ mod tests {
                 ),
             ),
             (
-                "the keep predicate of an equality delete on b = 7 drops every row",
+                "b IS NULL OR b != 7 drops every row",
                 Reference::new("b")
                     .is_null()
                     .or(Reference::new("b").not_equal_to(Datum::long(7))),
                 BoundPredicate::AlwaysFalse,
             ),
             (
-                "the keep predicate of an equality delete on b = 5 keeps every row",
+                "b IS NULL OR b != 5 keeps every row",
                 Reference::new("b")
                     .is_null()
                     .or(Reference::new("b").not_equal_to(Datum::long(5))),
