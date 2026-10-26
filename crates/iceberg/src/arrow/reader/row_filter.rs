@@ -3492,4 +3492,95 @@ mod tests {
         ])
         .await;
     }
+
+    /// A column the file does not store, with no partition value or `initial-default`, reads as
+    /// null, so every filter on it keeps the same rows as on a file that stores it as all null.
+    #[tokio::test]
+    async fn test_filter_on_absent_column_without_value_matches_all_null_column() {
+        use arrow_array::{Float64Array, StringArray};
+
+        let tmp = TempDir::new().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "c", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(4, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let id_field = eqd_field("id", DataType::Int64, 1, false);
+        let ids = || Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
+        let absent = format!("{}/absent.parquet", tmp.path().to_str().unwrap());
+        eqd_write(
+            &absent,
+            Arc::new(ArrowSchema::new(vec![id_field.clone()])),
+            vec![ids()],
+        );
+        let all_null = format!("{}/all-null.parquet", tmp.path().to_str().unwrap());
+        eqd_write(
+            &all_null,
+            Arc::new(ArrowSchema::new(vec![
+                id_field,
+                eqd_field("c", DataType::Int64, 2, true),
+                eqd_field("s", DataType::Utf8, 3, true),
+                eqd_field("d", DataType::Float64, 4, true),
+            ])),
+            vec![
+                ids(),
+                Arc::new(Int64Array::from(vec![None::<i64>; 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>; 3])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![None::<f64>; 3])) as ArrayRef,
+            ],
+        );
+
+        let c = || Reference::new("c");
+        let cases = vec![
+            (c().less_than(Datum::long(5)), vec![]),
+            (c().less_than_or_equal_to(Datum::long(5)), vec![]),
+            (c().greater_than(Datum::long(5)), vec![]),
+            (c().greater_than_or_equal_to(Datum::long(5)), vec![]),
+            (c().equal_to(Datum::long(5)), vec![]),
+            (c().not_equal_to(Datum::long(5)), vec![]),
+            (c().is_in([Datum::long(5), Datum::long(6)]), vec![]),
+            (c().is_not_in([Datum::long(5), Datum::long(6)]), vec![]),
+            (c().less_than(Datum::long(5)).negate(), vec![]),
+            (c().is_null(), vec![1, 2, 3]),
+            (c().is_not_null(), vec![]),
+            (Reference::new("s").starts_with(Datum::string("a")), vec![]),
+            (
+                Reference::new("s").not_starts_with(Datum::string("a")),
+                vec![],
+            ),
+            (Reference::new("d").is_nan(), vec![]),
+            (Reference::new("d").is_not_nan(), vec![1, 2, 3]),
+        ];
+        for row_selection_enabled in [false, true] {
+            for path in [&absent, &all_null] {
+                for (predicate, expected) in &cases {
+                    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                        .with_row_selection_enabled(row_selection_enabled)
+                        .build();
+                    let (batches, _) = read_once(
+                        reader,
+                        path,
+                        schema.clone(),
+                        vec![1],
+                        predicate.clone(),
+                        None,
+                        vec![],
+                    )
+                    .await;
+                    assert_eq!(
+                        eqd_collect_i64(&batches, 0),
+                        *expected,
+                        "{predicate} on {path}, row_selection_enabled = {row_selection_enabled}"
+                    );
+                }
+            }
+        }
+    }
 }
