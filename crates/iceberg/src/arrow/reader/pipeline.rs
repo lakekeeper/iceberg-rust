@@ -2868,6 +2868,75 @@ mod tests {
         assert_int96_read_matches(&file_path, schema, vec![1, 2], &expected_micros).await;
     }
 
+    /// Spark writes `timestamptz` (Spark `TimestampType`) as INT96 by default, so tables that
+    /// `migrate`, `snapshot` or `add_files` built from Spark files read INT96 as `timestamptz`.
+    #[tokio::test]
+    async fn test_read_int96_timestamps_as_timestamptz() {
+        use arrow_array::TimestampMicrosecondArray;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let (file_path, expected_micros) =
+            write_int96_parquet_file(&table_location, "spark.parquet", true);
+
+        for project_field_ids in [vec![1, 2], vec![1]] {
+            let batches = read_int96_batches(&file_path, schema.clone(), project_field_ids).await;
+            assert_eq!(batches.len(), 1);
+            let ts = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(ts.values().to_vec(), expected_micros);
+            assert_eq!(ts.timezone(), Some("+00:00"));
+        }
+    }
+
+    /// parquet-rs wraps INT96 values outside 1677-2262 at nanosecond resolution, and
+    /// microseconds drop the nanoseconds INT96 can hold, so INT96 in a nanosecond column fails
+    /// the read instead of returning a wrong instant.
+    #[tokio::test]
+    async fn test_read_int96_timestamps_as_nanoseconds_fails() {
+        for (table_type, file_type) in [
+            (PrimitiveType::TimestampNs, "timestamp"),
+            (PrimitiveType::TimestamptzNs, "timestamptz"),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(1, "ts", Type::Primitive(table_type.clone())).into(),
+                        NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let tmp_dir = TempDir::new().unwrap();
+            let table_location = tmp_dir.path().to_str().unwrap().to_string();
+            let (file_path, _) = write_int96_parquet_file(&table_location, "spark.parquet", true);
+
+            let err = read_parquet(&file_path, schema, vec![1, 2])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "DataInvalid => Cannot read column ts (field ID 1): the data file stores it \
+                     as {file_type}, which cannot be read as {table_type}"
+                )
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_read_int96_timestamps_without_field_ids() {
         let schema = Arc::new(
