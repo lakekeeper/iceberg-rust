@@ -20,14 +20,15 @@ use std::sync::Arc;
 
 use arrow_arith::boolean::is_not_null;
 use arrow_array::cast::AsArray;
+use arrow_array::types::TimestampNanosecondType;
 use arrow_array::{
     Array as ArrowArray, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
-    RecordBatchOptions, RunArray, StructArray,
+    RecordBatchOptions, RunArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_cast::{CastOptions, cast, cast_with_options};
 use arrow_schema::{
     DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
-    SchemaRef,
+    SchemaRef, TimeUnit,
 };
 use arrow_select::zip::zip;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -206,6 +207,9 @@ pub(crate) enum ColumnSource {
 pub(crate) enum PromotePlan {
     PassThrough,
     Cast(DataType),
+    /// A nanosecond timestamp read into a microsecond column, with the target time zone.
+    /// The cast would truncate sub-microsecond digits, so such a value fails the read.
+    TimestampNanosToMicros(Option<Arc<str>>),
     Struct {
         fields: Fields,
         children: Vec<ChildPlan>,
@@ -296,6 +300,10 @@ impl PromotePlan {
             | (DataType::Map(_, _), _) => {
                 Err(invalid_data!("cannot promote {source:?} to {target:?}"))
             }
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, _),
+                DataType::Timestamp(TimeUnit::Microsecond, tz),
+            ) => Ok(PromotePlan::TimestampNanosToMicros(tz.clone())),
             _ => {
                 if let (
                     Ok(crate::spec::Type::Primitive(file_type)),
@@ -429,6 +437,29 @@ impl PromotePlan {
                     )
                     .with_source(e)
                 })
+            }
+            PromotePlan::TimestampNanosToMicros(tz) => {
+                let nanos = array
+                    .as_primitive_opt::<TimestampNanosecondType>()
+                    .ok_or_else(|| promote_err(array, "nanosecond timestamp"))?;
+                let micros: TimestampMicrosecondArray = nanos
+                    .try_unary(|ns| {
+                        if ns % 1000 == 0 {
+                            Ok(ns / 1000)
+                        } else {
+                            Err(ns)
+                        }
+                    })
+                    .map_err(|ns| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot read the nanosecond timestamp {ns} as microseconds \
+                                 without losing precision"
+                            ),
+                        )
+                    })?;
+                Ok(Arc::new(micros.with_timezone_opt(tz.clone())))
             }
             PromotePlan::Struct { fields, children } => {
                 let source = array

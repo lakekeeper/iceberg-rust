@@ -23,8 +23,12 @@ use arrow_schema::{
     DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::basic::Type as PhysicalType;
+use parquet::schema::types::SchemaDescriptor;
 
-use crate::arrow::schema::{ArrowSchemaVisitor, DEFAULT_MAP_FIELD_NAME, visit_schema};
+use crate::arrow::schema::{
+    ArrowSchemaVisitor, DEFAULT_MAP_FIELD_NAME, UTC_TIME_ZONE, visit_schema,
+};
 use crate::error::Result;
 use crate::spec::{PrimitiveType, Schema, Type};
 use crate::{Error, ErrorKind};
@@ -32,78 +36,96 @@ use crate::{Error, ErrorKind};
 /// Coerce Arrow schema types for INT96 columns to match the Iceberg table schema.
 ///
 /// arrow-rs defaults INT96 to `Timestamp(Nanosecond)`, which overflows i64 for dates outside
-/// ~1677-2262. We use arrow-rs's schema hint mechanism to read INT96 at the resolution
-/// specified by the Iceberg schema (`timestamp` → microsecond, `timestamp_ns` → nanosecond).
+/// ~1677-2262. We use arrow-rs's schema hint mechanism to read INT96 as microseconds, in UTC
+/// for `timestamptz` columns. Reads into `timestamp_ns` and `timestamptz_ns` columns fail.
 ///
 /// Iceberg Java handles this differently: it bypasses parquet-mr with a custom column reader
 /// (`GenericParquetReaders.TimestampInt96Reader`). We achieve the same result via schema hints.
+///
+/// Only INT96 leaves get a hint. parquet-rs also accepts it for an INT64 `TIMESTAMP(NANOS)`
+/// leaf, but then reinterprets the nanosecond values as microseconds.
 ///
 /// References:
 /// - Iceberg spec primitive types: <https://iceberg.apache.org/spec/#primitive-types>
 /// - arrow-rs schema hint support: <https://github.com/apache/arrow-rs/pull/7285>
 pub(crate) fn coerce_int96_timestamps(
     arrow_schema: &ArrowSchemaRef,
+    parquet_schema: &SchemaDescriptor,
     iceberg_schema: &Schema,
-) -> Option<Arc<ArrowSchema>> {
-    let mut visitor = Int96CoercionVisitor::new(iceberg_schema);
-    let coerced = visit_schema(arrow_schema, &mut visitor).ok()?;
-    if visitor.changed {
-        Some(Arc::new(coerced))
-    } else {
-        None
+) -> Result<Option<Arc<ArrowSchema>>> {
+    // The visitor cannot walk every Arrow type, so it runs only for files with INT96 leaves.
+    if !parquet_schema
+        .columns()
+        .iter()
+        .any(|column| column.physical_type() == PhysicalType::INT96)
+    {
+        return Ok(None);
     }
+    let mut visitor = Int96CoercionVisitor::new(parquet_schema, iceberg_schema);
+    let coerced = visit_schema(arrow_schema, &mut visitor)?;
+    Ok(visitor.changed.then(|| Arc::new(coerced)))
 }
 
-/// Visitor that coerces `Timestamp(Nanosecond)` Arrow fields to the resolution
+/// Visitor that coerces the Arrow fields of INT96 leaves to the resolution and time zone
 /// indicated by the Iceberg schema.
 struct Int96CoercionVisitor<'a> {
+    parquet_schema: &'a SchemaDescriptor,
     iceberg_schema: &'a Schema,
     field_stack: Vec<FieldRef>,
+    /// Index of the next Parquet leaf column; Arrow leaves are visited in Parquet leaf order.
+    next_leaf: usize,
     changed: bool,
 }
 
 impl<'a> Int96CoercionVisitor<'a> {
-    fn new(iceberg_schema: &'a Schema) -> Self {
+    fn new(parquet_schema: &'a SchemaDescriptor, iceberg_schema: &'a Schema) -> Self {
         Self {
+            parquet_schema,
             iceberg_schema,
             field_stack: Vec::new(),
+            next_leaf: 0,
             changed: false,
         }
     }
 
-    /// Determine the target TimeUnit for a Timestamp(Nanosecond) field based on the
-    /// Iceberg schema. Falls back to microsecond when field IDs are unavailable,
-    /// matching Iceberg Java behavior.
-    fn target_unit(&self, field: &FieldRef) -> Option<TimeUnit> {
-        if !matches!(
-            field.data_type(),
-            DataType::Timestamp(TimeUnit::Nanosecond, _)
-        ) {
+    /// The Arrow type to read an INT96 leaf as: the resolution and time zone of its Iceberg
+    /// column. INT96 holds UTC instants, so `timestamptz` columns read them as UTC, as Java does.
+    /// Without a timestamp column (no field ID, or another type), falls back to microseconds
+    /// like Iceberg Java.
+    fn target_type(&self, field: &FieldRef, leaf: usize) -> Option<DataType> {
+        let is_int96 = self
+            .parquet_schema
+            .columns()
+            .get(leaf)
+            .is_some_and(|column| column.physical_type() == PhysicalType::INT96);
+        if !is_int96 {
             return None;
         }
+        let DataType::Timestamp(_, file_tz) = field.data_type() else {
+            return None;
+        };
 
-        let target = field
+        let (unit, tz) = match field
             .metadata()
             .get(PARQUET_FIELD_ID_META_KEY)
             .and_then(|id_str| id_str.parse::<i32>().ok())
             .and_then(|field_id| self.iceberg_schema.field_by_id(field_id))
-            .and_then(|f| match &*f.field_type {
-                Type::Primitive(PrimitiveType::Timestamp | PrimitiveType::Timestamptz) => {
-                    Some(TimeUnit::Microsecond)
-                }
-                Type::Primitive(PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs) => {
-                    Some(TimeUnit::Nanosecond)
-                }
-                _ => None,
-            })
+            .map(|f| &*f.field_type)
+        {
+            // Nanosecond columns read INT96 as microseconds too, and the type check then refuses
+            // them: parquet-rs wraps INT96 values outside 1677-2262 at nanosecond resolution,
+            // and microseconds drop the nanoseconds INT96 can hold.
+            Some(Type::Primitive(PrimitiveType::Timestamp | PrimitiveType::TimestampNs)) => {
+                (TimeUnit::Microsecond, None)
+            }
+            Some(Type::Primitive(PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs)) => {
+                (TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into()))
+            }
             // Iceberg Java reads INT96 as microseconds by default
-            .unwrap_or(TimeUnit::Microsecond);
-
-        if target == TimeUnit::Nanosecond {
-            None
-        } else {
-            Some(target)
-        }
+            _ => (TimeUnit::Microsecond, file_tz.clone()),
+        };
+        let target = DataType::Timestamp(unit, tz);
+        (&target != field.data_type()).then_some(target)
     }
 }
 
@@ -224,19 +246,15 @@ impl ArrowSchemaVisitor for Int96CoercionVisitor<'_> {
         let field_info = self.field_stack.last().ok_or_else(|| {
             Error::new(ErrorKind::Unexpected, "Field stack underflow in primitive")
         })?;
+        let leaf = self.next_leaf;
+        self.next_leaf += 1;
 
-        if let Some(target_unit) = self.target_unit(field_info) {
-            let tz = match field_info.data_type() {
-                DataType::Timestamp(_, tz) => tz.clone(),
-                _ => None,
-            };
+        if let Some(target_type) = self.target_type(field_info, leaf) {
             self.changed = true;
-            Ok(Field::new(
-                field_info.name(),
-                DataType::Timestamp(target_unit, tz),
-                field_info.is_nullable(),
+            Ok(
+                Field::new(field_info.name(), target_type, field_info.is_nullable())
+                    .with_metadata(field_info.metadata().clone()),
             )
-            .with_metadata(field_info.metadata().clone()))
         } else {
             Ok(
                 Field::new(field_info.name(), p.clone(), field_info.is_nullable())
@@ -251,11 +269,53 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
-    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
+    use parquet::arrow::{ArrowSchemaConverter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::basic::{LogicalType, Type as PhysicalType};
+    use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
     use super::coerce_int96_timestamps;
     use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
+
+    /// The Parquet schema of `arrow_schema`, with every timestamp leaf stored as INT96.
+    fn int96_parquet_schema(arrow_schema: &ArrowSchema) -> SchemaDescriptor {
+        fn rewrite(t: &ParquetType) -> Arc<ParquetType> {
+            let info = t.get_basic_info();
+            let id = info.has_id().then(|| info.id());
+            match t {
+                ParquetType::PrimitiveType { .. }
+                    if matches!(info.logical_type_ref(), Some(LogicalType::Timestamp(_))) =>
+                {
+                    Arc::new(
+                        ParquetType::primitive_type_builder(info.name(), PhysicalType::INT96)
+                            .with_repetition(info.repetition())
+                            .with_id(id)
+                            .build()
+                            .unwrap(),
+                    )
+                }
+                ParquetType::GroupType { fields, .. } => {
+                    let mut builder = ParquetType::group_type_builder(info.name())
+                        .with_fields(fields.iter().map(|f| rewrite(f)).collect())
+                        .with_logical_type(info.logical_type_ref().cloned())
+                        .with_converted_type(info.converted_type())
+                        .with_id(id);
+                    if info.has_repetition() {
+                        builder = builder.with_repetition(info.repetition());
+                    }
+                    Arc::new(builder.build().unwrap())
+                }
+                _ => Arc::new(t.clone()),
+            }
+        }
+        let descriptor = ArrowSchemaConverter::new().convert(arrow_schema).unwrap();
+        SchemaDescriptor::new(rewrite(descriptor.root_schema()))
+    }
+
+    /// Coerces `arrow_schema` as read from a file that stores its nanosecond timestamps as INT96.
+    fn coerce(arrow_schema: &SchemaRef, iceberg: &Schema) -> Option<Arc<ArrowSchema>> {
+        coerce_int96_timestamps(arrow_schema, &int96_parquet_schema(arrow_schema), iceberg).unwrap()
+    }
 
     fn iceberg_schema_with_timestamp() -> Schema {
         Schema::builder()
@@ -281,7 +341,7 @@ mod tests {
         ]));
         let iceberg = iceberg_schema_with_timestamp();
 
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        let coerced = coerce(&arrow_schema, &iceberg).unwrap();
         assert_eq!(
             coerced.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -290,71 +350,75 @@ mod tests {
         assert_eq!(coerced.field(1).data_type(), &DataType::Int32);
     }
 
+    /// INT96 holds UTC instants: the time zone follows the Iceberg column, whatever time zone
+    /// the file's Arrow schema names.
     #[test]
-    fn test_coerce_timestamptz_ns_to_us() {
-        let iceberg = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![
-                NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::Timestamptz)).into(),
-            ])
-            .build()
-            .unwrap();
+    fn test_coerce_time_zone_to_iceberg_type() {
+        let utc = || Some("+00:00".into());
+        for (iceberg_type, file_type, expected) in [
+            // Spark writes INT96 without an Arrow schema.
+            (
+                PrimitiveType::Timestamptz,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, utc()),
+            ),
+            // pyarrow stores the Arrow type it wrote from.
+            (
+                PrimitiveType::Timestamptz,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, utc()),
+            ),
+            (
+                PrimitiveType::Timestamp,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            // Microseconds, so that the type check refuses nanosecond columns.
+            (
+                PrimitiveType::TimestampNs,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                PrimitiveType::TimestamptzNs,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, utc()),
+            ),
+        ] {
+            let iceberg = Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "ts", Type::Primitive(iceberg_type.clone())).into(),
+                ])
+                .build()
+                .unwrap();
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("ts", file_type.clone(), true).with_metadata(field_id_meta(1)),
+            ]));
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
-            )
-            .with_metadata(field_id_meta(1)),
-        ]));
-
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
-        assert_eq!(
-            coerced.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        );
+            let coerced = coerce(&arrow_schema, &iceberg).unwrap();
+            assert_eq!(
+                coerced.field(0).data_type(),
+                &expected,
+                "{file_type} as {iceberg_type}"
+            );
+        }
     }
 
     #[test]
-    fn test_no_coercion_when_iceberg_is_timestamp_ns() {
-        let iceberg = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![
-                NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::TimestampNs)).into(),
-            ])
-            .build()
-            .unwrap();
-
+    fn test_no_coercion_of_int64_nanosecond_leaf() {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true)
                 .with_metadata(field_id_meta(1)),
+            Field::new("id", DataType::Int32, false).with_metadata(field_id_meta(2)),
         ]));
+        let parquet_schema = ArrowSchemaConverter::new().convert(&arrow_schema).unwrap();
+        let iceberg = iceberg_schema_with_timestamp();
 
-        assert!(coerce_int96_timestamps(&arrow_schema, &iceberg).is_none());
-    }
-
-    #[test]
-    fn test_no_coercion_when_iceberg_is_timestamptz_ns() {
-        let iceberg = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![
-                NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::TimestamptzNs))
-                    .into(),
-            ])
-            .build()
-            .unwrap();
-
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
-            )
-            .with_metadata(field_id_meta(1)),
-        ]));
-
-        assert!(coerce_int96_timestamps(&arrow_schema, &iceberg).is_none());
+        assert!(
+            coerce_int96_timestamps(&arrow_schema, &parquet_schema, &iceberg)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -366,7 +430,7 @@ mod tests {
         ]));
         let iceberg = iceberg_schema_with_timestamp();
 
-        assert!(coerce_int96_timestamps(&arrow_schema, &iceberg).is_none());
+        assert!(coerce(&arrow_schema, &iceberg).is_none());
     }
 
     // Without field IDs, the visitor can't look up the Iceberg type and falls back
@@ -380,7 +444,7 @@ mod tests {
         )]));
         let iceberg = iceberg_schema_with_timestamp();
 
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        let coerced = coerce(&arrow_schema, &iceberg).unwrap();
         assert_eq!(
             coerced.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -405,7 +469,7 @@ mod tests {
                 .with_metadata(field_id_meta(1)),
         ]));
 
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        let coerced = coerce(&arrow_schema, &iceberg).unwrap();
         assert_eq!(
             coerced.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -423,7 +487,7 @@ mod tests {
         ]));
         let iceberg = iceberg_schema_with_timestamp();
 
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        let coerced = coerce(&arrow_schema, &iceberg).unwrap();
         assert_eq!(coerced.field(0).metadata(), &meta);
     }
 
@@ -460,7 +524,7 @@ mod tests {
             .with_metadata(field_id_meta(1)),
         ]));
 
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        let coerced = coerce(&arrow_schema, &iceberg).unwrap();
         let inner = match coerced.field(0).data_type() {
             DataType::Struct(fields) => fields,
             other => panic!("Expected Struct, got {other}"),
@@ -504,7 +568,7 @@ mod tests {
                 .with_metadata(field_id_meta(1)),
         ]));
 
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        let coerced = coerce(&arrow_schema, &iceberg).unwrap();
         let element_dt = match coerced.field(0).data_type() {
             DataType::List(f) => f.data_type(),
             other => panic!("Expected List, got {other}"),
@@ -564,7 +628,7 @@ mod tests {
             .with_metadata(field_id_meta(1)),
         ]));
 
-        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        let coerced = coerce(&arrow_schema, &iceberg).unwrap();
         let value_dt = match coerced.field(0).data_type() {
             DataType::Map(entries, _) => match entries.data_type() {
                 DataType::Struct(fields) => fields[1].data_type().clone(),
