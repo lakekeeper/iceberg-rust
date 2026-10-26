@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_cast::{CastOptions, cast_with_options};
 use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowSelection};
@@ -32,7 +33,7 @@ use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
 use crate::arrow::caching_delete_file_loader::{EqDeleteKey, EqDeleteSet};
-use crate::arrow::{arrow_primitive_to_literal, arrow_type_to_type};
+use crate::arrow::{arrow_primitive_to_literal, arrow_type_to_type, type_to_arrow_type};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -44,10 +45,8 @@ use crate::{Error, ErrorKind};
 /// One equality-delete key column of a decoded batch
 struct KeyColumn {
     literals: Vec<Option<Literal>>,
-    /// Iceberg type of the column as stored in this data file.
-    source_primitive: PrimitiveType,
-    /// Whether the file type differs from the table type, so values need `Datum::to`.
-    needs_promotion: bool,
+    /// Iceberg type of the column in the table schema.
+    primitive: PrimitiveType,
 }
 
 impl ArrowReader {
@@ -91,7 +90,7 @@ impl ArrowReader {
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
         use_position_fallback: bool,
-        partition_constants: &HashMap<i32, Datum>,
+        absent_key_values: &HashMap<i32, Datum>,
     ) -> Result<Vec<Box<dyn ArrowPredicate>>> {
         let field_id_map =
             Self::resolve_field_id_map(parquet_schema, arrow_schema, use_position_fallback)?;
@@ -125,13 +124,13 @@ impl ArrowReader {
                 .map(|leaf| leaf.and_then(|idx| column_indices.binary_search(&idx).ok()))
                 .collect();
 
-            // A key column absent from this file probes as its identity partition value, as
-            // Java's reader fills it, and as null when there is none.
+            // A key column absent from this file probes as the value projection fills in for
+            // it (`absent_key_values`), as Java's reader does, and as null when there is none.
             let absent_values: Vec<Option<Datum>> = set
                 .fields
                 .iter()
                 .map(|(_, id, ty)| {
-                    partition_constants
+                    absent_key_values
                         .get(id)
                         .map(|value| match (value.literal(), ty) {
                             // Delete keys are read back through Arrow, which types a uuid as
@@ -159,10 +158,20 @@ impl ArrowReader {
                             columns.push(None);
                             continue;
                         };
-                        let array = batch.column(pos);
+                        let mut array = Arc::clone(batch.column(pos));
                         let source_type = arrow_type_to_type(array.data_type())
                             .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
-                        let source_primitive = source_type
+                        // Promotion to the table type keeps these comparable with the parsed
+                        // delete keys under schema evolution.
+                        if source_type != *target_type {
+                            let target_arrow_type = type_to_arrow_type(target_type)
+                                .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
+                            array = cast_with_options(&array, &target_arrow_type, &CastOptions {
+                                safe: false,
+                                ..CastOptions::default()
+                            })?;
+                        }
+                        let primitive = target_type
                             .as_primitive_type()
                             .ok_or_else(|| {
                                 ArrowError::ComputeError(
@@ -172,12 +181,9 @@ impl ArrowReader {
                             })?
                             .clone();
                         columns.push(Some(KeyColumn {
-                            // Promotion to the table type keeps these comparable with the
-                            // parsed delete keys under schema evolution.
-                            needs_promotion: source_type != *target_type,
-                            literals: arrow_primitive_to_literal(array, &source_type)
+                            literals: arrow_primitive_to_literal(&array, target_type)
                                 .map_err(|e| ArrowError::ComputeError(e.to_string()))?,
-                            source_primitive,
+                            primitive,
                         }));
                     }
 
@@ -194,15 +200,7 @@ impl ArrowReader {
                             // we can `take` because each cell is probed once.
                             probe.0[i] = match column.literals[row].take() {
                                 Some(Literal::Primitive(primitive)) => {
-                                    let datum =
-                                        Datum::new(column.source_primitive.clone(), primitive);
-                                    Some(if column.needs_promotion {
-                                        datum
-                                            .to(&target_types[i])
-                                            .map_err(|e| ArrowError::ComputeError(e.to_string()))?
-                                    } else {
-                                        datum
-                                    })
+                                    Some(Datum::new(column.primitive.clone(), primitive))
                                 }
                                 Some(other) => {
                                     return Err(ArrowError::ComputeError(format!(
@@ -387,11 +385,12 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int64Type, TimestampMicrosecondType};
     use arrow_array::{
-        ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, RecordBatch, StringArray,
+        ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
     };
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
@@ -407,8 +406,8 @@ mod tests {
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
-        DataContentType, DataFileFormat, Datum, Literal, NestedField, PrimitiveType, Schema,
-        SchemaRef, Type,
+        DataContentType, DataFileFormat, Datum, Literal, NestedField, PartitionSpec, PrimitiveType,
+        Schema, SchemaRef, Struct, Transform, Type,
     };
 
     async fn test_perform_read(
@@ -1742,20 +1741,15 @@ mod tests {
     }
 
     async fn read_once(
+        reader: ArrowReader,
         file_path: &str,
         schema: Arc<Schema>,
         project_field_ids: Vec<i32>,
         predicate: Predicate,
-        bloom_enabled: bool,
+        partition: Option<(Arc<PartitionSpec>, Struct)>,
+        deletes: Vec<FileScanTaskDeleteFile>,
     ) -> (Vec<RecordBatch>, u64) {
-        let file_io = FileIO::new_with_fs();
-        let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
-            .with_bloom_filter_enabled(bloom_enabled)
-            // Keep the fixed footer prefetch small so the byte measurement reflects
-            // row group I/O rather than a constant metadata read.
-            .with_metadata_size_hint(8 * 1024)
-            .build();
-
+        let (partition_spec, partition) = partition.unzip();
         let task = FileScanTask::builder()
             .with_file_size_in_bytes(std::fs::metadata(file_path).unwrap().len())
             .with_start(0)
@@ -1765,6 +1759,9 @@ mod tests {
             .with_schema(schema.clone())
             .with_project_field_ids(project_field_ids)
             .with_predicate(Some(predicate.bind(schema, true).unwrap()))
+            .with_deletes(deletes)
+            .with_partition(partition)
+            .with_partition_spec(partition_spec)
             .with_case_sensitive(false)
             .build()
             .unwrap();
@@ -1793,15 +1790,25 @@ mod tests {
         project_field_ids: Vec<i32>,
         predicate: Predicate,
     ) -> (Option<RecordBatch>, u64, u64) {
-        let (off, bytes_off) = read_once(
-            file_path,
-            schema.clone(),
-            project_field_ids.clone(),
-            predicate.clone(),
-            false,
-        )
-        .await;
-        let (on, bytes_on) = read_once(file_path, schema, project_field_ids, predicate, true).await;
+        let read = |bloom_enabled| {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_bloom_filter_enabled(bloom_enabled)
+                // Keep the fixed footer prefetch small so the byte measurement reflects
+                // row group I/O rather than a constant metadata read.
+                .with_metadata_size_hint(8 * 1024)
+                .build();
+            read_once(
+                reader,
+                file_path,
+                schema.clone(),
+                project_field_ids.clone(),
+                predicate.clone(),
+                None,
+                vec![],
+            )
+        };
+        let (off, bytes_off) = read(false).await;
+        let (on, bytes_on) = read(true).await;
 
         let off = collapse(&off);
         let on = collapse(&on);
@@ -2250,7 +2257,7 @@ mod tests {
             .iter()
             .flat_map(|b| {
                 b.column(col)
-                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .as_primitive::<Int64Type>()
                     .iter()
                     .flatten()
                     .collect::<Vec<_>>()
@@ -2369,7 +2376,7 @@ mod tests {
         for b in &result {
             let ids: Vec<i64> = b
                 .column(0)
-                .as_primitive::<arrow_array::types::Int64Type>()
+                .as_primitive::<Int64Type>()
                 .iter()
                 .flatten()
                 .collect();
@@ -2439,6 +2446,181 @@ mod tests {
         .await;
 
         assert_eq!(eqd_collect_i64(&result, 0), vec![1, 2]);
+    }
+
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+    /// Writes a file that stores `d` as `date` for 2020-01-01 and 2020-01-02 and returns its
+    /// path with a table schema that promotes `d` to `timestamp`.
+    fn write_date_file_promoted_to_timestamp(loc: &str) -> (String, SchemaRef) {
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "d",
+                DataType::Date32,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Date32Array::from(vec![18262, 18263])) as ArrayRef],
+        );
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "d", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        (data_path, table_schema)
+    }
+
+    fn collect_timestamp_micros(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    // A filter on a column promoted from `date` to `timestamp` compares the stored dates as
+    // timestamps, not the literal truncated to a date.
+    #[tokio::test]
+    async fn test_filter_on_date_column_promoted_to_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let (data_path, table_schema) =
+            write_date_file_promoted_to_timestamp(tmp.path().to_str().unwrap());
+        let (day1, day2) = (18262 * MICROS_PER_DAY, 18263 * MICROS_PER_DAY);
+        let noon = Datum::timestamp_micros(day1 + MICROS_PER_DAY / 2);
+
+        for (predicate, expected) in [
+            (Reference::new("d").less_than(noon.clone()), vec![day1]),
+            (
+                Reference::new("d").less_than_or_equal_to(noon.clone()),
+                vec![day1],
+            ),
+            (Reference::new("d").greater_than(noon.clone()), vec![day2]),
+            (
+                Reference::new("d").greater_than_or_equal_to(noon.clone()),
+                vec![day2],
+            ),
+            (Reference::new("d").equal_to(noon.clone()), vec![]),
+            (Reference::new("d").not_equal_to(noon.clone()), vec![
+                day1, day2,
+            ]),
+            (Reference::new("d").is_in([noon.clone()]), vec![]),
+            (Reference::new("d").is_not_in([noon.clone()]), vec![
+                day1, day2,
+            ]),
+        ] {
+            let result = eqd_read_with(
+                &data_path,
+                table_schema.clone(),
+                vec![1],
+                vec![],
+                Some(predicate.bind(table_schema.clone(), true).unwrap()),
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                collect_timestamp_micros(&result),
+                expected,
+                "predicate={predicate}"
+            );
+        }
+    }
+
+    // A filter on a column promoted from `int` to `long` compares with a literal outside the
+    // `int` range.
+    #[tokio::test]
+    async fn test_filter_on_int_column_promoted_to_long_with_literal_beyond_int_range() {
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "id",
+                DataType::Int32,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        );
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let large = Datum::long(1_i64 << 40);
+
+        for (predicate, expected) in [
+            (Reference::new("id").less_than(large.clone()), vec![1, 2]),
+            (Reference::new("id").greater_than(large.clone()), vec![]),
+            (
+                Reference::new("id").is_not_in([large.clone(), Datum::long(1)]),
+                vec![2],
+            ),
+        ] {
+            let result = eqd_read_with(
+                &data_path,
+                table_schema.clone(),
+                vec![1],
+                vec![],
+                Some(predicate.bind(table_schema.clone(), true).unwrap()),
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                eqd_collect_i64(&result, 0),
+                expected,
+                "predicate={predicate}"
+            );
+        }
+    }
+
+    // An equality delete keyed on a column promoted from `date` to `timestamp` matches the
+    // stored dates read as timestamps.
+    #[tokio::test]
+    async fn test_eq_delete_on_date_column_promoted_to_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let (data_path, table_schema) = write_date_file_promoted_to_timestamp(loc);
+
+        let del_path = format!("{loc}/eq-del.parquet");
+        eqd_write(
+            &del_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "d",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                1,
+                false,
+            )])),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                18263 * MICROS_PER_DAY,
+            ])) as ArrayRef],
+        );
+
+        let result = eqd_read(&data_path, table_schema, vec![1], vec![eqd_delete_file(
+            &del_path,
+            vec![1],
+        )])
+        .await;
+
+        assert_eq!(collect_timestamp_micros(&result), vec![
+            18262 * MICROS_PER_DAY
+        ]);
     }
 
     // Two delete files that key on different columns each apply independently: a row is deleted
@@ -2665,10 +2847,7 @@ mod tests {
     }
 
     // An equality-delete key column absent from the data file (added by later schema
-    // evolution). The probe reads it as null for every row, so nothing matches and the
-    // delete file removes no rows -- it does NOT resolve `initial_default`, which the spec
-    // asks for via normal projection rules. Pinned here so the divergence is visible and a
-    // later fix has something to change.
+    // evolution) probes as its `initial_default`, as projection reads it, and as null without one.
     #[tokio::test]
     async fn test_eq_delete_on_column_absent_from_data_file() {
         let tmp = TempDir::new().unwrap();
@@ -2710,35 +2889,47 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
         );
 
-        // Keyed on `added` with the value that IS the initial default: if the probe ever
-        // resolves defaults, every row matches and this expectation flips to empty.
-        let del_path = format!("{loc}/eq-del.parquet");
-        eqd_write(
-            &del_path,
-            Arc::new(ArrowSchema::new(vec![eqd_field(
-                "added",
-                DataType::Int64,
-                2,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![7])) as ArrayRef],
-        );
+        // Keyed on `added`, once with the initial default and once with another value.
+        let del_path = |value: i64| {
+            let path = format!("{loc}/eq-del-{value}.parquet");
+            eqd_write(
+                &path,
+                Arc::new(ArrowSchema::new(vec![eqd_field(
+                    "added",
+                    DataType::Int64,
+                    2,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+            );
+            path
+        };
+        let (del_default, del_other) = (del_path(7), del_path(8));
 
-        for (label, schema) in [
-            ("required with initial_default", required_with_default),
-            ("optional without default", optional_no_default),
+        for (label, schema, del_path, expected) in [
+            (
+                "initial_default deleted",
+                required_with_default.clone(),
+                &del_default,
+                vec![],
+            ),
+            (
+                "other value deleted",
+                required_with_default,
+                &del_other,
+                vec![1, 2, 3],
+            ),
+            ("no default", optional_no_default, &del_default, vec![
+                1, 2, 3,
+            ]),
         ] {
             let result = eqd_read(&data_path, schema, vec![1], vec![eqd_delete_file(
-                &del_path,
+                del_path,
                 vec![2],
             )])
             .await;
 
-            assert_eq!(
-                eqd_collect_i64(&result, 0),
-                vec![1, 2, 3],
-                "{label}: absent key column probes as null, so nothing is deleted"
-            );
+            assert_eq!(eqd_collect_i64(&result, 0), expected, "{label}");
         }
     }
 
@@ -3224,5 +3415,345 @@ mod tests {
         .await;
 
         assert_eq!(eqd_collect_i64(&result, 0), vec![1, 2, 3]);
+    }
+
+    /// Writes a file that stores only field 1 (`a`), with values 1, 2, 3.
+    fn write_file_without_b() -> (String, TempDir) {
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "a",
+            DataType::Int64,
+            1,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int64Array::from(
+            vec![1, 2, 3],
+        ))])
+        .unwrap();
+        write_row_groups(&file_path, arrow_schema, vec![batch], false);
+        (file_path, tmp_dir)
+    }
+
+    fn schema_with_b(b: NestedField) -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "a", Type::Primitive(PrimitiveType::Long)).into(),
+                    b.into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Reads the file from [`write_file_without_b`], in which `b` reads as 7 on every row through
+    /// `schema` or `partition`, and asserts the rows each predicate keeps. Each predicate, and each
+    /// equality delete on `b`, must keep or drop all three rows as if `b` were stored as 7.
+    async fn assert_absent_b_reads_as_7(
+        schema: SchemaRef,
+        partition: Option<(Arc<PartitionSpec>, Struct)>,
+        cases: Vec<(Predicate, usize)>,
+    ) {
+        let (file_path, tmp_dir) = write_file_without_b();
+        let read = async |row_selection_enabled, predicate, deletes| {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_row_selection_enabled(row_selection_enabled)
+                .build();
+            let (batches, _) = read_once(
+                reader,
+                &file_path,
+                schema.clone(),
+                vec![1, 2],
+                predicate,
+                partition.clone(),
+                deletes,
+            )
+            .await;
+            batches
+        };
+
+        let batches = read(false, Predicate::AlwaysTrue, vec![]).await;
+        assert_eq!(
+            batches[0].column(1).as_primitive::<Int64Type>().values(),
+            &[7, 7, 7]
+        );
+
+        // The keep predicate for a deleted value `v` is `b IS NULL OR b != v`, and `b IS NOT NULL`
+        // for a deleted null.
+        let delete_field = Field::new("b", DataType::Int64, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )]));
+        let delete_schema = Arc::new(ArrowSchema::new(vec![delete_field]));
+        let deletes: Vec<_> = [(Some(7), 0), (Some(5), 3), (None, 3)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (deleted_b, rows))| {
+                let delete_path =
+                    format!("{}/eq-del-{i}.parquet", tmp_dir.path().to_str().unwrap());
+                let batch = RecordBatch::try_new(delete_schema.clone(), vec![Arc::new(
+                    Int64Array::from(vec![deleted_b]),
+                )])
+                .unwrap();
+                write_row_groups(&delete_path, delete_schema.clone(), vec![batch], false);
+                let delete = FileScanTaskDeleteFile::builder()
+                    .with_file_size_in_bytes(std::fs::metadata(&delete_path).unwrap().len())
+                    .with_file_path(delete_path)
+                    .with_file_type(DataContentType::EqualityDeletes)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .with_equality_ids(Some(vec![2]))
+                    .build()
+                    .unwrap();
+                (deleted_b, delete, rows)
+            })
+            .collect();
+
+        for row_selection_enabled in [false, true] {
+            for (predicate, expected) in &cases {
+                let batches = read(row_selection_enabled, predicate.clone(), vec![]).await;
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(
+                    rows, *expected,
+                    "{predicate}, row_selection_enabled = {row_selection_enabled}"
+                );
+            }
+            for (deleted_b, delete, expected) in &deletes {
+                let batches = read(row_selection_enabled, Predicate::AlwaysTrue, vec![
+                    delete.clone(),
+                ])
+                .await;
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(
+                    rows, *expected,
+                    "equality delete on b = {deleted_b:?}, row_selection_enabled = {row_selection_enabled}"
+                );
+            }
+        }
+    }
+
+    /// A file written before column `b` was added with `initial-default` 7.
+    #[tokio::test]
+    async fn test_predicate_on_absent_column_uses_initial_default() {
+        let schema = schema_with_b(
+            NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Long))
+                .with_initial_default(Literal::long(7)),
+        );
+        let b = || Reference::new("b");
+        assert_absent_b_reads_as_7(schema, None, vec![
+            (b().equal_to(Datum::long(7)), 3),
+            (b().is_not_null(), 3),
+            (b().is_in([Datum::long(7), Datum::long(8)]), 3),
+            (b().greater_than(Datum::long(5)), 3),
+            (b().equal_to(Datum::long(8)), 0),
+            (b().is_null(), 0),
+        ])
+        .await;
+    }
+
+    /// A file that doesn't store its identity partition column `b`, as after a Hive migration or
+    /// `add_files`, with partition value 7.
+    #[tokio::test]
+    async fn test_predicate_on_absent_identity_partition_column_uses_partition_value() {
+        let schema = schema_with_b(NestedField::optional(
+            2,
+            "b",
+            Type::Primitive(PrimitiveType::Long),
+        ));
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("b", "b", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition = Struct::from_iter([Some(Literal::long(7))]);
+        let b = || Reference::new("b");
+        assert_absent_b_reads_as_7(schema, Some((Arc::new(partition_spec), partition)), vec![
+            (b().equal_to(Datum::long(7)), 3),
+            (b().is_not_null(), 3),
+            (b().equal_to(Datum::long(8)), 0),
+            (b().is_null(), 0),
+        ])
+        .await;
+    }
+
+    /// Reads a file that stores only `id` (1, 2, 3) with each filter, with row selection off and
+    /// on, and asserts the ids it keeps.
+    async fn assert_filters_on_file_with_only_id(
+        schema: SchemaRef,
+        partition: Option<(Arc<PartitionSpec>, Struct)>,
+        cases: Vec<(Predicate, Vec<i64>)>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let data_path = format!("{}/data.parquet", tmp.path().to_str().unwrap());
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "id",
+                DataType::Int64,
+                1,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        );
+        for row_selection_enabled in [false, true] {
+            for (predicate, expected) in &cases {
+                let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                    .with_row_selection_enabled(row_selection_enabled)
+                    .build();
+                let (batches, _) = read_once(
+                    reader,
+                    &data_path,
+                    schema.clone(),
+                    vec![1],
+                    predicate.clone(),
+                    partition.clone(),
+                    vec![],
+                )
+                .await;
+                assert_eq!(
+                    eqd_collect_i64(&batches, 0),
+                    *expected,
+                    "{predicate}, row_selection_enabled = {row_selection_enabled}"
+                );
+            }
+        }
+    }
+
+    /// A migrated file that does not store its identity partition column `p` (partition value 5)
+    /// keeps the rows a filter on `p` selects when `p` is read as 5.
+    #[tokio::test]
+    async fn test_filter_on_absent_identity_partition_column_keeps_matching_rows() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "p", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("p", "p", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition = Struct::from_iter([Some(Literal::long(5))]);
+        let id = || Reference::new("id");
+        let p = || Reference::new("p");
+        assert_filters_on_file_with_only_id(schema, Some((Arc::new(spec), partition)), vec![
+            (p().equal_to(Datum::long(5)), vec![1, 2, 3]),
+            (p().is_in([Datum::long(5), Datum::long(6)]), vec![1, 2, 3]),
+            (p().greater_than_or_equal_to(Datum::long(3)), vec![1, 2, 3]),
+            (p().is_not_null(), vec![1, 2, 3]),
+            (p().equal_to(Datum::long(6)).negate(), vec![1, 2, 3]),
+            (
+                id().equal_to(Datum::long(2))
+                    .and(p().equal_to(Datum::long(5))),
+                vec![2],
+            ),
+            (
+                id().equal_to(Datum::long(2))
+                    .or(p().equal_to(Datum::long(5))),
+                vec![1, 2, 3],
+            ),
+            (p().less_than(Datum::long(6)), vec![1, 2, 3]),
+            (p().less_than_or_equal_to(Datum::long(5)), vec![1, 2, 3]),
+            (p().less_than(Datum::long(5)), vec![]),
+            (p().less_than_or_equal_to(Datum::long(4)), vec![]),
+        ])
+        .await;
+    }
+
+    /// A column the file does not store, with no partition value or `initial-default`, reads as
+    /// null, so every filter on it keeps the same rows as on a file that stores it as all null.
+    #[tokio::test]
+    async fn test_filter_on_absent_column_without_value_matches_all_null_column() {
+        use arrow_array::{Float64Array, StringArray};
+
+        let tmp = TempDir::new().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "c", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(4, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let id_field = eqd_field("id", DataType::Int64, 1, false);
+        let ids = || Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
+        let absent = format!("{}/absent.parquet", tmp.path().to_str().unwrap());
+        eqd_write(
+            &absent,
+            Arc::new(ArrowSchema::new(vec![id_field.clone()])),
+            vec![ids()],
+        );
+        let all_null = format!("{}/all-null.parquet", tmp.path().to_str().unwrap());
+        eqd_write(
+            &all_null,
+            Arc::new(ArrowSchema::new(vec![
+                id_field,
+                eqd_field("c", DataType::Int64, 2, true),
+                eqd_field("s", DataType::Utf8, 3, true),
+                eqd_field("d", DataType::Float64, 4, true),
+            ])),
+            vec![
+                ids(),
+                Arc::new(Int64Array::from(vec![None::<i64>; 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>; 3])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![None::<f64>; 3])) as ArrayRef,
+            ],
+        );
+
+        let c = || Reference::new("c");
+        let cases = vec![
+            (c().less_than(Datum::long(5)), vec![]),
+            (c().less_than_or_equal_to(Datum::long(5)), vec![]),
+            (c().greater_than(Datum::long(5)), vec![]),
+            (c().greater_than_or_equal_to(Datum::long(5)), vec![]),
+            (c().equal_to(Datum::long(5)), vec![]),
+            (c().not_equal_to(Datum::long(5)), vec![]),
+            (c().is_in([Datum::long(5), Datum::long(6)]), vec![]),
+            (c().is_not_in([Datum::long(5), Datum::long(6)]), vec![]),
+            (c().less_than(Datum::long(5)).negate(), vec![]),
+            (c().is_null(), vec![1, 2, 3]),
+            (c().is_not_null(), vec![]),
+            (Reference::new("s").starts_with(Datum::string("a")), vec![]),
+            (
+                Reference::new("s").not_starts_with(Datum::string("a")),
+                vec![],
+            ),
+            (Reference::new("d").is_nan(), vec![]),
+            (Reference::new("d").is_not_nan(), vec![1, 2, 3]),
+        ];
+        for row_selection_enabled in [false, true] {
+            for path in [&absent, &all_null] {
+                for (predicate, expected) in &cases {
+                    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                        .with_row_selection_enabled(row_selection_enabled)
+                        .build();
+                    let (batches, _) = read_once(
+                        reader,
+                        path,
+                        schema.clone(),
+                        vec![1],
+                        predicate.clone(),
+                        None,
+                        vec![],
+                    )
+                    .await;
+                    assert_eq!(
+                        eqd_collect_i64(&batches, 0),
+                        *expected,
+                        "{predicate} on {path}, row_selection_enabled = {row_selection_enabled}"
+                    );
+                }
+            }
+        }
     }
 }

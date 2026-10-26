@@ -24,7 +24,7 @@ use arrow_array::{
     Array as ArrowArray, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
     RecordBatchOptions, RunArray, StructArray,
 };
-use arrow_cast::cast;
+use arrow_cast::{CastOptions, cast, cast_with_options};
 use arrow_schema::{
     DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     SchemaRef,
@@ -32,11 +32,11 @@ use arrow_schema::{
 use arrow_select::zip::zip;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::arrow::schema::try_get_field_id_from_metadata;
+use crate::arrow::schema::{try_get_field_id_from_metadata, type_promotion_is_valid};
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{
-    datum_to_arrow_type_with_ree, primitive_type_to_arrow_type_with_ree, schema_to_arrow_schema,
-    type_to_arrow_type,
+    arrow_type_to_type, datum_to_arrow_type_with_ree, primitive_type_to_arrow_type_with_ree,
+    schema_to_arrow_schema, type_to_arrow_type,
 };
 use crate::error::invalid_data;
 use crate::metadata_columns::{
@@ -296,7 +296,19 @@ impl PromotePlan {
             | (DataType::Map(_, _), _) => {
                 Err(invalid_data!("cannot promote {source:?} to {target:?}"))
             }
-            _ => Ok(PromotePlan::Cast(target.clone())),
+            _ => {
+                if let (
+                    Ok(crate::spec::Type::Primitive(file_type)),
+                    Ok(crate::spec::Type::Primitive(table_type)),
+                ) = (arrow_type_to_type(source), arrow_type_to_type(target))
+                    && !type_promotion_is_valid(Some(&file_type), Some(&table_type))
+                {
+                    return Err(invalid_data!(
+                        "the data file stores {file_type}, which cannot be read as {table_type}"
+                    ));
+                }
+                Ok(PromotePlan::Cast(target.clone()))
+            }
         }
     }
 
@@ -399,7 +411,25 @@ impl PromotePlan {
     fn apply(&self, array: &ArrayRef) -> Result<ArrayRef> {
         match self {
             PromotePlan::PassThrough => Ok(Arc::clone(array)),
-            PromotePlan::Cast(target_type) => Ok(cast(array.as_ref(), target_type)?),
+            // A value outside the target type's range fails the read, as the spec requires;
+            // the default cast would turn it into NULL.
+            PromotePlan::Cast(target_type) => {
+                cast_with_options(array.as_ref(), target_type, &CastOptions {
+                    safe: false,
+                    ..CastOptions::default()
+                })
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot promote {} to {target_type}: a value does not fit the target \
+                             type",
+                            array.data_type()
+                        ),
+                    )
+                    .with_source(e)
+                })
+            }
             PromotePlan::Struct { fields, children } => {
                 let source = array
                     .as_struct_opt()

@@ -106,9 +106,14 @@ impl ObjectCache {
 
     /// Retrieves an Arc [`Manifest`] from the cache
     /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
+    pub(crate) async fn get_manifest(
+        &self,
+        manifest_file: &ManifestFile,
+        table_metadata: &TableMetadataRef,
+    ) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
             return ManifestReader::new(self.file_io.clone())
+                .with_table_metadata(table_metadata.clone())
                 .read(manifest_file)
                 .await
                 .map(Arc::new);
@@ -122,7 +127,7 @@ impl ObjectCache {
         let cache_entry = self
             .cache
             .entry_by_ref(&key)
-            .or_try_insert_with(self.fetch_and_parse_manifest(manifest_file))
+            .or_try_insert_with(self.fetch_and_parse_manifest(manifest_file, table_metadata))
             .await
             .map_err(|err| {
                 Error::new(
@@ -187,8 +192,13 @@ impl ObjectCache {
         }
     }
 
-    async fn fetch_and_parse_manifest(&self, manifest_file: &ManifestFile) -> Result<CachedItem> {
+    async fn fetch_and_parse_manifest(
+        &self,
+        manifest_file: &ManifestFile,
+        table_metadata: &TableMetadataRef,
+    ) -> Result<CachedItem> {
         let manifest = ManifestReader::new(self.file_io.clone())
+            .with_table_metadata(table_metadata.clone())
             .read(manifest_file)
             .await?;
 
@@ -424,7 +434,10 @@ mod tests {
         assert_eq!(result_manifest_list.entries().len(), 1);
 
         let manifest_file = result_manifest_list.entries().first().unwrap();
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, &fixture.table.metadata_ref())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -471,7 +484,10 @@ mod tests {
         let manifest_file = result_manifest_list.entries().first().unwrap();
 
         // not in cache
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, &fixture.table.metadata_ref())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -486,7 +502,10 @@ mod tests {
         );
 
         // retrieve cached version
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, &fixture.table.metadata_ref())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -647,9 +666,19 @@ mod tests {
         manifest_file_b.first_row_id = Some(2000);
 
         let object_cache = ObjectCache::new(io, None);
+        // get_manifest takes the table metadata for schema/spec resolution;
+        // first_row_id inheritance is independent of it.
+        let fixture = TableTestFixture::new();
+        let table_metadata = fixture.table.metadata_ref();
 
-        let manifest_a = object_cache.get_manifest(&manifest_file_a).await.unwrap();
-        let manifest_b = object_cache.get_manifest(&manifest_file_b).await.unwrap();
+        let manifest_a = object_cache
+            .get_manifest(&manifest_file_a, &table_metadata)
+            .await
+            .unwrap();
+        let manifest_b = object_cache
+            .get_manifest(&manifest_file_b, &table_metadata)
+            .await
+            .unwrap();
 
         // A cache keyed on path alone would serve manifest_a's inherited ids for
         // the second read; keying on first_row_id keeps them distinct.

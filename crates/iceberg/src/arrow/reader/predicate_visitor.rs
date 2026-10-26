@@ -35,10 +35,12 @@ use fnv::FnvHashSet;
 use parquet::schema::types::SchemaDescriptor;
 
 use crate::arrow::get_arrow_datum;
+use crate::arrow::record_batch_transformer::constants_map;
 use crate::error::{Result, invalid_data};
-use crate::expr::visitors::bound_predicate_visitor::BoundPredicateVisitor;
+use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
+use crate::expr::visitors::expression_evaluator::ExpressionEvaluatorVisitor;
 use crate::expr::{BoundPredicate, BoundReference};
-use crate::spec::Datum;
+use crate::spec::{Datum, Literal, PartitionSpec, Schema, Struct, Type};
 
 /// A visitor to collect field ids from bound predicates.
 pub(super) struct CollectFieldIdVisitor {
@@ -192,6 +194,266 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
     ) -> Result<()> {
         self.field_ids.insert(reference.field().id);
         Ok(())
+    }
+}
+
+/// Returns the value that projection reads for each top-level primitive field when a data file
+/// does not store it: the identity partition value, otherwise the field's `initial-default`.
+/// Fields with neither have no entry.
+pub(super) fn absent_field_values(
+    schema: &Schema,
+    partition_spec: Option<&PartitionSpec>,
+    partition: Option<&Struct>,
+) -> Result<HashMap<i32, Datum>> {
+    let mut values = match (partition_spec, partition) {
+        (Some(spec), Some(data)) => constants_map(spec, data, schema)?,
+        _ => HashMap::new(),
+    };
+    for field in schema.as_struct().fields() {
+        if let (Type::Primitive(ty), Some(Literal::Primitive(value))) =
+            (&*field.field_type, &field.initial_default)
+        {
+            values
+                .entry(field.id)
+                .or_insert_with(|| Datum::new(ty.clone(), value.clone()));
+        }
+    }
+    Ok(values)
+}
+
+/// Returns the residual of `predicate` for one data file: each leaf on a top-level field that is
+/// missing from the file becomes `AlwaysTrue` or `AlwaysFalse`, based on its value in
+/// `absent_values` (see [`absent_field_values`]), which every row of the file holds. Leaves on
+/// missing fields without a value keep the null handling of the row filter and the page index
+/// evaluator. The resulting constants are folded out of `AND` and `OR`.
+///
+/// Leaves on nested fields are kept, because a nested field also reads as null in any row where
+/// an ancestor struct is null.
+pub(super) fn residual_for_missing_fields(
+    predicate: BoundPredicate,
+    predicate_field_ids: &HashSet<i32>,
+    field_id_map: &HashMap<i32, usize>,
+    schema: &Schema,
+    absent_values: &HashMap<i32, Datum>,
+) -> Result<BoundPredicate> {
+    if predicate_field_ids
+        .iter()
+        .all(|id| field_id_map.contains_key(id))
+    {
+        return Ok(predicate);
+    }
+
+    let mut constant_field_ids = HashSet::new();
+    let row: Struct = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| {
+            if !predicate_field_ids.contains(&field.id) || field_id_map.contains_key(&field.id) {
+                return None;
+            }
+            let value = absent_values
+                .get(&field.id)
+                .map(|datum| Literal::Primitive(datum.literal().clone()));
+            if value.is_some() {
+                constant_field_ids.insert(field.id);
+            }
+            value
+        })
+        .collect();
+
+    if constant_field_ids.is_empty() {
+        return Ok(predicate);
+    }
+    visit(
+        &mut MissingFieldResidualVisitor {
+            row: &row,
+            constant_field_ids: &constant_field_ids,
+        },
+        &predicate,
+    )
+}
+
+/// Replaces leaves on the fields in `constant_field_ids` with their result on `row`, which holds each
+/// top-level field's value at its position in the schema.
+struct MissingFieldResidualVisitor<'a> {
+    row: &'a Struct,
+    constant_field_ids: &'a HashSet<i32>,
+}
+
+impl MissingFieldResidualVisitor<'_> {
+    fn residual(
+        &self,
+        reference: &BoundReference,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        if !self.constant_field_ids.contains(&reference.field().id) {
+            return Ok(predicate.clone());
+        }
+        if visit(&mut ExpressionEvaluatorVisitor::new(self.row), predicate)? {
+            Ok(BoundPredicate::AlwaysTrue)
+        } else {
+            Ok(BoundPredicate::AlwaysFalse)
+        }
+    }
+}
+
+impl BoundPredicateVisitor for MissingFieldResidualVisitor<'_> {
+    type T = BoundPredicate;
+
+    fn always_true(&mut self) -> Result<BoundPredicate> {
+        Ok(BoundPredicate::AlwaysTrue)
+    }
+
+    fn always_false(&mut self) -> Result<BoundPredicate> {
+        Ok(BoundPredicate::AlwaysFalse)
+    }
+
+    // Fold constants so the row filter doesn't evaluate them per batch.
+    fn and(&mut self, lhs: BoundPredicate, rhs: BoundPredicate) -> Result<BoundPredicate> {
+        Ok(match (lhs, rhs) {
+            (BoundPredicate::AlwaysFalse, _) | (_, BoundPredicate::AlwaysFalse) => {
+                BoundPredicate::AlwaysFalse
+            }
+            (BoundPredicate::AlwaysTrue, other) | (other, BoundPredicate::AlwaysTrue) => other,
+            (lhs, rhs) => lhs.and(rhs),
+        })
+    }
+
+    fn or(&mut self, lhs: BoundPredicate, rhs: BoundPredicate) -> Result<BoundPredicate> {
+        Ok(match (lhs, rhs) {
+            (BoundPredicate::AlwaysTrue, _) | (_, BoundPredicate::AlwaysTrue) => {
+                BoundPredicate::AlwaysTrue
+            }
+            (BoundPredicate::AlwaysFalse, other) | (other, BoundPredicate::AlwaysFalse) => other,
+            (lhs, rhs) => lhs.or(rhs),
+        })
+    }
+
+    fn not(&mut self, inner: BoundPredicate) -> Result<BoundPredicate> {
+        Ok(inner.negate())
+    }
+
+    fn is_null(
+        &mut self,
+        reference: &BoundReference,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn not_null(
+        &mut self,
+        reference: &BoundReference,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn is_nan(
+        &mut self,
+        reference: &BoundReference,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn not_nan(
+        &mut self,
+        reference: &BoundReference,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn less_than(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn less_than_or_eq(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn greater_than(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn greater_than_or_eq(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn eq(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn not_eq(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn starts_with(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn not_starts_with(
+        &mut self,
+        reference: &BoundReference,
+        _literal: &Datum,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn r#in(
+        &mut self,
+        reference: &BoundReference,
+        _literals: &FnvHashSet<Datum>,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
+    }
+
+    fn not_in(
+        &mut self,
+        reference: &BoundReference,
+        _literals: &FnvHashSet<Datum>,
+        predicate: &BoundPredicate,
+    ) -> Result<BoundPredicate> {
+        self.residual(reference, predicate)
     }
 }
 
@@ -427,13 +689,13 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt(&left, literal.as_ref())
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
     }
 
@@ -447,13 +709,13 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt_eq(&left, literal.as_ref())
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
     }
 
@@ -467,7 +729,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt(&left, literal.as_ref())
             }))
@@ -487,7 +749,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt_eq(&left, literal.as_ref())
             }))
@@ -507,7 +769,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 eq(&left, literal.as_ref())
             }))
@@ -527,7 +789,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 neq(&left, literal.as_ref())
             }))
@@ -547,7 +809,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 starts_with(&left, literal.as_ref())
             }))
@@ -567,14 +829,14 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = promote_column(project_column(&batch, idx)?, &literal)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 // update here if arrow ever adds a native not_starts_with
                 not(&starts_with(&left, literal.as_ref())?)
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
     }
 
@@ -592,7 +854,10 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native is_in kernel
-                let left = project_column(&batch, idx)?;
+                let mut left = project_column(&batch, idx)?;
+                if let Some(literal) = literals.first() {
+                    left = promote_column(left, literal)?;
+                }
 
                 let mut acc = constant_bool_array(false, batch.num_rows());
                 for literal in &literals {
@@ -622,7 +887,10 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
+                let mut left = project_column(&batch, idx)?;
+                if let Some(literal) = literals.first() {
+                    left = promote_column(left, literal)?;
+                }
                 let mut acc = constant_bool_array(true, batch.num_rows());
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
@@ -633,8 +901,33 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
+    }
+}
+
+/// Casts a column that the file stores in a type the table promoted, such as `date` read as
+/// `timestamp`, to the literal's type, which is the table type. Casting the literal down to the
+/// file type instead would truncate or overflow it.
+fn promote_column(
+    column: ArrayRef,
+    literal: &Arc<dyn ArrowDatum + Send + Sync>,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    let table_type = literal.get().0.data_type();
+    let promoted = match (column.data_type(), table_type) {
+        (DataType::Int32, DataType::Int64)
+        | (DataType::Float32, DataType::Float64)
+        | (DataType::Date32, DataType::Timestamp(_, _)) => true,
+        (
+            DataType::Decimal128(file_precision, file_scale),
+            DataType::Decimal128(table_precision, table_scale),
+        ) => file_scale == table_scale && file_precision < table_precision,
+        _ => false,
+    };
+    if promoted {
+        cast(&column, table_type)
+    } else {
+        Ok(column)
     }
 }
 
@@ -669,10 +962,16 @@ mod tests {
     use parquet::schema::parser::parse_message_type;
     use parquet::schema::types::SchemaDescriptor;
 
-    use super::{CollectFieldIdVisitor, PredicateConverter, constant_bool_array};
+    use super::{
+        CollectFieldIdVisitor, PredicateConverter, absent_field_values, constant_bool_array,
+        residual_for_missing_fields,
+    };
     use crate::expr::visitors::bound_predicate_visitor::visit;
-    use crate::expr::{Bind, Predicate, Reference};
-    use crate::spec::{NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::expr::{Bind, BoundPredicate, Predicate, Reference};
+    use crate::spec::{
+        Datum, Literal, NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Struct,
+        StructType, Transform, Type,
+    };
 
     fn table_schema_simple() -> SchemaRef {
         Arc::new(
@@ -835,5 +1134,258 @@ mod tests {
             [true, false, true, true]
         );
         assert!(!result.is_null(2));
+    }
+
+    /// Returns the residual of `predicate` for a data file that stores only field 1.
+    fn residual_for_file_with_field_1(
+        schema: &SchemaRef,
+        predicate: Predicate,
+        partition: Option<(&PartitionSpec, &Struct)>,
+    ) -> BoundPredicate {
+        let predicate = predicate.bind(schema.clone(), true).unwrap();
+        let mut collector = CollectFieldIdVisitor {
+            field_ids: HashSet::default(),
+        };
+        visit(&mut collector, &predicate).unwrap();
+        residual_for_missing_fields(
+            predicate,
+            &collector.field_ids(),
+            &HashMap::from([(1, 0)]),
+            schema,
+            &absent_field_values(
+                schema,
+                partition.map(|(spec, _)| spec),
+                partition.map(|(_, data)| data),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Asserts that each predicate in `always_true` has the residual `AlwaysTrue` and each in
+    /// `always_false` has `AlwaysFalse`, for a file that doesn't store the field `field`.
+    fn assert_residuals_for_missing_field_with_initial_default(
+        field: NestedField,
+        always_true: Vec<Predicate>,
+        always_false: Vec<Predicate>,
+    ) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    field.into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let cases = always_true
+            .into_iter()
+            .map(|predicate| (predicate, BoundPredicate::AlwaysTrue))
+            .chain(
+                always_false
+                    .into_iter()
+                    .map(|predicate| (predicate, BoundPredicate::AlwaysFalse)),
+            );
+        for (predicate, expected) in cases {
+            let message = predicate.to_string();
+            let residual = residual_for_file_with_field_1(&schema, predicate, None);
+            assert_eq!(residual, expected, "{message}");
+        }
+    }
+
+    /// Mirrors Java's `TestMetricsRowGroupFilter.testColumnNotInFileWithInitialDefault`.
+    #[test]
+    fn test_residual_for_missing_string_field_with_initial_default() {
+        let country = || Reference::new("country");
+        let string = Datum::string;
+        assert_residuals_for_missing_field_with_initial_default(
+            NestedField::optional(99, "country", Type::Primitive(PrimitiveType::String))
+                .with_initial_default(Literal::string("US")),
+            vec![
+                country().equal_to(string("US")),
+                country().is_not_null(),
+                country().not_equal_to(string("CA")),
+                country().is_in([string("US"), string("MX")]),
+                country().is_not_in([string("CA"), string("MX")]),
+                country().greater_than_or_equal_to(string("US")),
+                country().less_than(string("ZW")),
+                country().starts_with(string("U")),
+                country().not_starts_with(string("X")),
+            ],
+            vec![
+                country().equal_to(string("CA")),
+                country().is_null(),
+                country().not_equal_to(string("US")),
+                country().is_in([string("CA"), string("MX")]),
+                country().is_not_in([string("US"), string("MX")]),
+                country().less_than(string("AD")),
+                country().greater_than(string("US")),
+                country().starts_with(string("X")),
+                country().not_starts_with(string("U")),
+            ],
+        );
+    }
+
+    /// Mirrors Java's `TestMetricsRowGroupFilter.testDoubleColumnNotInFileWithInitialDefault`.
+    #[test]
+    fn test_residual_for_missing_double_field_with_initial_default() {
+        assert_residuals_for_missing_field_with_initial_default(
+            NestedField::optional(101, "measurement", Type::Primitive(PrimitiveType::Double))
+                .with_initial_default(Literal::double(12.5)),
+            vec![Reference::new("measurement").is_not_nan()],
+            vec![Reference::new("measurement").is_nan()],
+        );
+    }
+
+    /// Covers which value a leaf is evaluated against, and which leaves are kept.
+    #[test]
+    fn test_residual_for_missing_fields() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "a", Type::Primitive(PrimitiveType::Long))
+                        .with_initial_default(Literal::long(5))
+                        .into(),
+                    NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Long))
+                        .with_initial_default(Literal::long(7))
+                        .into(),
+                    NestedField::optional(4, "d", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(5, "p", Type::Primitive(PrimitiveType::Long))
+                        .with_initial_default(Literal::long(7))
+                        .into(),
+                    NestedField::optional(6, "q", Type::Primitive(PrimitiveType::Long))
+                        .with_initial_default(Literal::long(7))
+                        .into(),
+                    NestedField::optional(
+                        7,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(8, "x", Type::Primitive(PrimitiveType::Long))
+                                .with_initial_default(Literal::long(7))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("a", "a", Transform::Identity)
+            .unwrap()
+            .add_partition_field("p", "p", Transform::Identity)
+            .unwrap()
+            .add_partition_field("q", "q_bucket", Transform::Bucket(4))
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition = Struct::from_iter([
+            Some(Literal::long(100)),
+            Some(Literal::long(9)),
+            Some(Literal::int(2)),
+        ]);
+
+        let bind = |predicate: Predicate| predicate.bind(schema.clone(), true).unwrap();
+        let cases = [
+            (
+                "p = 9 uses the identity partition value over the initial-default",
+                Reference::new("p").equal_to(Datum::long(9)),
+                BoundPredicate::AlwaysTrue,
+            ),
+            (
+                "p = 7",
+                Reference::new("p").equal_to(Datum::long(7)),
+                BoundPredicate::AlwaysFalse,
+            ),
+            (
+                "q = 7 ignores the bucket partition value",
+                Reference::new("q").equal_to(Datum::long(7)),
+                BoundPredicate::AlwaysTrue,
+            ),
+            (
+                "a = 3 reads the file despite a partition value and initial-default",
+                Reference::new("a").equal_to(Datum::long(3)),
+                bind(Reference::new("a").equal_to(Datum::long(3))),
+            ),
+            (
+                "d IS NULL has no value to apply",
+                Reference::new("d").is_null(),
+                bind(Reference::new("d").is_null()),
+            ),
+            (
+                "s.x = 7 is nested",
+                Reference::new("s.x").equal_to(Datum::long(7)),
+                bind(Reference::new("s.x").equal_to(Datum::long(7))),
+            ),
+            (
+                "NOT (b = 7)",
+                !Reference::new("b").equal_to(Datum::long(7)),
+                BoundPredicate::AlwaysFalse,
+            ),
+            (
+                "a > 0 AND b = 8",
+                Reference::new("a")
+                    .greater_than(Datum::long(0))
+                    .and(Reference::new("b").equal_to(Datum::long(8))),
+                BoundPredicate::AlwaysFalse,
+            ),
+            (
+                "b = 7 AND a > 0",
+                Reference::new("b")
+                    .equal_to(Datum::long(7))
+                    .and(Reference::new("a").greater_than(Datum::long(0))),
+                bind(Reference::new("a").greater_than(Datum::long(0))),
+            ),
+            (
+                "b = 7 OR d = 1",
+                Reference::new("b")
+                    .equal_to(Datum::long(7))
+                    .or(Reference::new("d").equal_to(Datum::long(1))),
+                BoundPredicate::AlwaysTrue,
+            ),
+            (
+                "d = 1 OR b = 8",
+                Reference::new("d")
+                    .equal_to(Datum::long(1))
+                    .or(Reference::new("b").equal_to(Datum::long(8))),
+                bind(Reference::new("d").equal_to(Datum::long(1))),
+            ),
+            (
+                "(a > 0 AND d IS NULL) OR b = 8 keeps the AND",
+                Reference::new("a")
+                    .greater_than(Datum::long(0))
+                    .and(Reference::new("d").is_null())
+                    .or(Reference::new("b").equal_to(Datum::long(8))),
+                bind(
+                    Reference::new("a")
+                        .greater_than(Datum::long(0))
+                        .and(Reference::new("d").is_null()),
+                ),
+            ),
+            (
+                "b IS NULL OR b != 7 drops every row",
+                Reference::new("b")
+                    .is_null()
+                    .or(Reference::new("b").not_equal_to(Datum::long(7))),
+                BoundPredicate::AlwaysFalse,
+            ),
+            (
+                "b IS NULL OR b != 5 keeps every row",
+                Reference::new("b")
+                    .is_null()
+                    .or(Reference::new("b").not_equal_to(Datum::long(5))),
+                BoundPredicate::AlwaysTrue,
+            ),
+        ];
+
+        for (name, predicate, expected) in cases {
+            let residual = residual_for_file_with_field_1(
+                &schema,
+                predicate,
+                Some((&partition_spec, &partition)),
+            );
+            assert_eq!(residual, expected, "{name}");
+        }
     }
 }

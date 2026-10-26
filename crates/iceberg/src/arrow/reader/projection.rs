@@ -31,6 +31,7 @@ use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use super::{ArrowReader, CollectFieldIdVisitor};
 use crate::arrow::arrow_schema_to_schema;
+use crate::arrow::schema::type_promotion_is_valid;
 use crate::error::{Result, invalid_data};
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -110,30 +111,6 @@ impl ArrowReader {
         arrow_schema: &ArrowSchemaRef,
         use_fallback: bool, // Position-based fallback: file lacks embedded field IDs and no name mapping assigned any
     ) -> Result<ProjectionMask> {
-        fn type_promotion_is_valid(
-            file_type: Option<&PrimitiveType>,
-            projected_type: Option<&PrimitiveType>,
-        ) -> bool {
-            match (file_type, projected_type) {
-                (Some(lhs), Some(rhs)) if lhs == rhs => true,
-                (Some(PrimitiveType::Int), Some(PrimitiveType::Long)) => true,
-                (Some(PrimitiveType::Float), Some(PrimitiveType::Double)) => true,
-                (
-                    Some(PrimitiveType::Decimal {
-                        precision: file_precision,
-                        scale: file_scale,
-                    }),
-                    Some(PrimitiveType::Decimal {
-                        precision: requested_precision,
-                        scale: requested_scale,
-                    }),
-                ) if requested_precision >= file_precision && file_scale == requested_scale => true,
-                // Uuid will be store as Fixed(16) in parquet file, so the read back type will be Fixed(16).
-                (Some(PrimitiveType::Fixed(16)), Some(PrimitiveType::Uuid)) => true,
-                _ => false,
-            }
-        }
-
         if field_ids.is_empty() {
             return Ok(ProjectionMask::all());
         }
@@ -200,31 +177,45 @@ impl ArrowReader {
         );
         let iceberg_schema = arrow_schema_to_schema(&projected_arrow_schema)?;
 
+        let mut unreadable_field = None;
         fields.filter_leaves(|idx, field| {
             let Some(field_id) = parquet_field_id(field) else {
                 return false;
             };
 
-            let iceberg_field = iceberg_schema_of_task.field_by_id(field_id);
-            let parquet_iceberg_field = iceberg_schema.field_by_id(field_id);
-
-            if iceberg_field.is_none() || parquet_iceberg_field.is_none() {
+            let (Some(iceberg_field), Some(parquet_iceberg_field)) = (
+                iceberg_schema_of_task.field_by_id(field_id),
+                iceberg_schema.field_by_id(field_id),
+            ) else {
                 return false;
-            }
+            };
 
+            // Leaving the column out would read it as NULL although the file has values.
             if !type_promotion_is_valid(
-                parquet_iceberg_field
-                    .unwrap()
-                    .field_type
-                    .as_primitive_type(),
-                iceberg_field.unwrap().field_type.as_primitive_type(),
+                parquet_iceberg_field.field_type.as_primitive_type(),
+                iceberg_field.field_type.as_primitive_type(),
             ) {
+                unreadable_field.get_or_insert_with(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot read column {} (field ID {field_id}): the data file stores \
+                             it as {}, which cannot be read as {}",
+                            iceberg_field.name,
+                            parquet_iceberg_field.field_type,
+                            iceberg_field.field_type
+                        ),
+                    )
+                });
                 return false;
             }
 
             column_map.insert(field_id, idx);
             true
         });
+        if let Some(err) = unreadable_field {
+            return Err(err);
+        }
 
         // Schema evolution: New columns may not exist in old Parquet files.
         // We only project existing columns; RecordBatchTransformer adds default/NULL values.
@@ -2573,5 +2564,351 @@ message schema {
             .await
             .unwrap();
         assert_eq!(result, vec![expected]);
+    }
+
+    /// Reads a file that stores `date` columns through a schema that promotes them to
+    /// `timestamp` and `timestamp_ns`, with an unpromoted column projected alongside them.
+    #[tokio::test]
+    async fn test_read_date_promoted_to_timestamp_with_other_columns() {
+        use arrow_array::{
+            Date32Array, Int32Array, TimestampMicrosecondArray, TimestampNanosecondArray,
+        };
+
+        use crate::arrow::schema_to_arrow_schema;
+
+        fn schema(d: PrimitiveType, e: PrimitiveType) -> Schema {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "d", Type::Primitive(d)).into(),
+                    NestedField::required(2, "e", Type::Primitive(e)).into(),
+                    NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap()
+        }
+
+        let days = [18000, -1, 0];
+        let ints = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let old_schema = schema(PrimitiveType::Date, PrimitiveType::Date);
+        let old_batch = RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&old_schema).unwrap()),
+            vec![
+                Arc::new(Date32Array::from(days.to_vec())),
+                Arc::new(Date32Array::from(days.to_vec())),
+                ints.clone(),
+            ],
+        )
+        .unwrap();
+        let new_schema = Arc::new(schema(PrimitiveType::Timestamp, PrimitiveType::TimestampNs));
+        let micros: Vec<i64> = days
+            .iter()
+            .map(|d| i64::from(*d) * 86_400_000_000)
+            .collect();
+        let expected = RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&new_schema).unwrap()),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(micros.clone())),
+                Arc::new(TimestampNanosecondArray::from(
+                    micros.iter().map(|us| us * 1000).collect::<Vec<_>>(),
+                )),
+                ints,
+            ],
+        )
+        .unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/date.parquet", tmp_dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), old_batch.schema(), None)
+                .unwrap();
+        writer.write(&old_batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(file_path)
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(new_schema)
+                .with_project_field_ids(vec![1, 2, 3])
+                .with_case_sensitive(false)
+                .build()
+                .unwrap())]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert_eq!(result, vec![expected]);
+    }
+
+    /// A column whose file type the reader cannot promote to the table type fails the read:
+    /// leaving it out of the projection would fill it with NULL although the file has values.
+    #[tokio::test]
+    async fn test_read_column_with_unpromotable_type_fails() {
+        use arrow_array::{Date32Array, Int32Array, Int64Array};
+
+        use crate::arrow::schema_to_arrow_schema;
+
+        fn schema(c: PrimitiveType) -> Schema {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "c", Type::Primitive(c)).into(),
+                    NestedField::optional(2, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap()
+        }
+
+        let cases: [(PrimitiveType, ArrayRef, PrimitiveType, &str); 2] = [
+            (
+                PrimitiveType::Date,
+                Arc::new(Date32Array::from(vec![18000])),
+                PrimitiveType::String,
+                "DataInvalid => Cannot read column c (field ID 1): the data file stores it as \
+                 date, which cannot be read as string",
+            ),
+            (
+                PrimitiveType::Long,
+                Arc::new(Int64Array::from(vec![1])),
+                PrimitiveType::Int,
+                "DataInvalid => Cannot read column c (field ID 1): the data file stores it as \
+                 long, which cannot be read as int",
+            ),
+        ];
+        for (file_type, values, table_type, expected) in cases {
+            let file_schema = schema(file_type);
+            let batch = RecordBatch::try_new(
+                Arc::new(schema_to_arrow_schema(&file_schema).unwrap()),
+                vec![values, Arc::new(Int32Array::from(vec![7]))],
+            )
+            .unwrap();
+
+            let tmp_dir = TempDir::new().unwrap();
+            let file_path = format!("{}/data.parquet", tmp_dir.path().to_str().unwrap());
+            let mut writer =
+                ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None)
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            // Projected alone and together with a readable column.
+            for project_field_ids in [vec![1], vec![1, 2]] {
+                let reader =
+                    ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+                let tasks = Box::pin(futures::stream::iter(
+                    vec![Ok(FileScanTask::builder()
+                        .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                        .with_start(0)
+                        .with_length(0)
+                        .with_data_file_path(file_path.clone())
+                        .with_data_file_format(DataFileFormat::Parquet)
+                        .with_schema(Arc::new(schema(table_type.clone())))
+                        .with_project_field_ids(project_field_ids.clone())
+                        .with_case_sensitive(false)
+                        .build()
+                        .unwrap())]
+                    .into_iter(),
+                )) as FileScanTaskStream;
+
+                let err = reader
+                    .read(tasks)
+                    .unwrap()
+                    .stream()
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.to_string(), expected, "{project_field_ids:?}");
+            }
+        }
+    }
+
+    /// Writes `values` as column 1 of a Parquet file, with or without field IDs, and reads it
+    /// back as `table_type`.
+    async fn read_single_column(
+        values: ArrayRef,
+        with_field_ids: bool,
+        table_type: PrimitiveType,
+    ) -> crate::Result<Vec<RecordBatch>> {
+        let metadata = if with_field_ids {
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())])
+        } else {
+            HashMap::new()
+        };
+        let field = Field::new("c", values.data_type().clone(), true).with_metadata(metadata);
+        let batch =
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![values]).unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/data.parquet", tmp_dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let table_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "c", Type::Primitive(table_type)).into(),
+            ])
+            .build()
+            .unwrap();
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(table_schema))
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        reader.read(tasks)?.stream().try_collect().await
+    }
+
+    /// A file without field IDs is read by column position, and an unpromotable type fails
+    /// the read there too.
+    #[tokio::test]
+    async fn test_read_column_with_unpromotable_type_without_field_ids_fails() {
+        use arrow_array::Date32Array;
+
+        let err = read_single_column(
+            Arc::new(Date32Array::from(vec![18000])),
+            false,
+            PrimitiveType::String,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "DataInvalid => the data file stores date, which cannot be read as string"
+        );
+    }
+
+    /// Timestamps stored without the UTC adjustment of the table type, as Spark's INT96 and Hive
+    /// write them, read as the table type, and so do byte arrays without the UTF8 annotation in
+    /// a `string` column.
+    #[tokio::test]
+    async fn test_read_timestamp_without_utc_adjustment_and_unannotated_byte_array() {
+        use arrow_array::{BinaryArray, TimestampMicrosecondArray};
+
+        let micros = vec![Some(1_600_000_000_000_000), None];
+        let cases: [(ArrayRef, PrimitiveType, ArrayRef); 3] = [
+            (
+                Arc::new(TimestampMicrosecondArray::from(micros.clone())),
+                PrimitiveType::Timestamptz,
+                Arc::new(TimestampMicrosecondArray::from(micros.clone()).with_timezone("+00:00")),
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(micros.clone()).with_timezone("UTC")),
+                PrimitiveType::Timestamp,
+                Arc::new(TimestampMicrosecondArray::from(micros)),
+            ),
+            (
+                Arc::new(BinaryArray::from(vec![Some(b"abc".as_ref()), None])),
+                PrimitiveType::String,
+                Arc::new(StringArray::from(vec![Some("abc"), None])),
+            ),
+        ];
+        for (values, table_type, expected) in cases {
+            for with_field_ids in [true, false] {
+                let batches =
+                    read_single_column(values.clone(), with_field_ids, table_type.clone())
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    batches[0].column(0),
+                    &expected,
+                    "{table_type}, with_field_ids={with_field_ids}"
+                );
+            }
+        }
+    }
+
+    /// A byte array that is not valid UTF-8 fails the read of a `string` column.
+    #[tokio::test]
+    async fn test_read_invalid_utf8_byte_array_as_string_fails() {
+        use arrow_array::BinaryArray;
+
+        let err = read_single_column(
+            Arc::new(BinaryArray::from(vec![[0xff_u8].as_ref()])),
+            true,
+            PrimitiveType::String,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "DataInvalid => Cannot promote Binary to Utf8: a value does not fit the target type, \
+             source: Invalid argument error: Encountered non UTF-8 data: invalid utf-8 sequence \
+             of 1 bytes from index 0"
+        );
+    }
+
+    /// A promoted value outside the range of the table type fails the read: `date` 200000 is in
+    /// the year 2517, after the last `timestamp_ns`.
+    #[tokio::test]
+    async fn test_read_promoted_value_out_of_range_fails() {
+        use arrow_array::Date32Array;
+
+        use crate::arrow::schema_to_arrow_schema;
+
+        let schema = |d| {
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "d", Type::Primitive(d)).into(),
+                ])
+                .build()
+                .unwrap()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&schema(PrimitiveType::Date)).unwrap()),
+            vec![Arc::new(Date32Array::from(vec![18000, 200000]))],
+        )
+        .unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/date.parquet", tmp_dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(file_path)
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(Arc::new(schema(PrimitiveType::TimestampNs)))
+                .with_project_field_ids(vec![1])
+                .with_case_sensitive(false)
+                .build()
+                .unwrap())]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let err = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "DataInvalid => Cannot promote Date32 to Timestamp(ns): a value does not fit the target type, \
+             source: Arithmetic overflow: Overflow happened on: 200000 * 86400000000000"
+        );
     }
 }

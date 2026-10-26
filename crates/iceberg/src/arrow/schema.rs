@@ -320,6 +320,44 @@ pub fn arrow_type_to_type(ty: &DataType) -> Result<Type> {
     visit_type(ty, &mut visitor)
 }
 
+/// Whether the reader can read a column that a data file stores as `file_type` as the table's
+/// `projected_type`.
+pub(super) fn type_promotion_is_valid(
+    file_type: Option<&PrimitiveType>,
+    projected_type: Option<&PrimitiveType>,
+) -> bool {
+    match (file_type, projected_type) {
+        (Some(lhs), Some(rhs)) if lhs == rhs => true,
+        (Some(PrimitiveType::Int), Some(PrimitiveType::Long)) => true,
+        (Some(PrimitiveType::Float), Some(PrimitiveType::Double)) => true,
+        (
+            Some(PrimitiveType::Date),
+            Some(PrimitiveType::Timestamp | PrimitiveType::TimestampNs),
+        ) => true,
+        (
+            Some(PrimitiveType::Decimal {
+                precision: file_precision,
+                scale: file_scale,
+            }),
+            Some(PrimitiveType::Decimal {
+                precision: requested_precision,
+                scale: requested_scale,
+            }),
+        ) if requested_precision >= file_precision && file_scale == requested_scale => true,
+        // Uuid will be store as Fixed(16) in parquet file, so the read back type will be Fixed(16).
+        (Some(PrimitiveType::Fixed(16)), Some(PrimitiveType::Uuid)) => true,
+        // Writers such as Spark (INT96) and Hive store timestamps without the UTC adjustment that
+        // tells `timestamp` from `timestamptz`; Java reads them as the table type.
+        (Some(PrimitiveType::Timestamp), Some(PrimitiveType::Timestamptz))
+        | (Some(PrimitiveType::Timestamptz), Some(PrimitiveType::Timestamp))
+        | (Some(PrimitiveType::TimestampNs), Some(PrimitiveType::TimestamptzNs))
+        | (Some(PrimitiveType::TimestamptzNs), Some(PrimitiveType::TimestampNs)) => true,
+        // Byte arrays without the UTF8 annotation, as Java reads them for a `string` column.
+        (Some(PrimitiveType::Binary), Some(PrimitiveType::String)) => true,
+        _ => false,
+    }
+}
+
 const ARROW_FIELD_DOC_KEY: &str = "doc";
 
 pub(super) fn try_get_field_id_from_metadata(field: &Field) -> Result<Option<i32>> {
