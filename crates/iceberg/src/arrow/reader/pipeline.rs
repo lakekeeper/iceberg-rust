@@ -490,6 +490,34 @@ impl FileScanTaskReader {
         // so the scan-predicate carries only the optional predicate
         let final_predicate = task.predicate().cloned();
 
+        // Filters and equality deletes decode their columns outside the projection. A column the
+        // projection would refuse fails here too: its values, statistics and bloom filters are in
+        // another type or unit than the table column, and comparing them drops or keeps rows.
+        let mut filter_field_ids = CollectFieldIdVisitor {
+            field_ids: HashSet::default(),
+        };
+        if let Some(predicate) = &final_predicate {
+            visit(&mut filter_field_ids, predicate)?;
+        }
+        let filter_field_ids: Vec<i32> = filter_field_ids
+            .field_ids()
+            .into_iter()
+            .chain(
+                eq_delete_sets
+                    .iter()
+                    .flat_map(|set| set.fields.iter().map(|(_, id, _)| *id)),
+            )
+            .collect();
+        if !filter_field_ids.is_empty() {
+            ArrowReader::get_arrow_projection_mask(
+                &filter_field_ids,
+                task.schema(),
+                record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
+                use_position_fallback,
+            )?;
+        }
+
         // There are three possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.
         // Selected RowGroup index lists can come from two sources:

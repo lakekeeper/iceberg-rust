@@ -3951,6 +3951,82 @@ mod tests {
         );
     }
 
+    /// A filter or equality delete on a column the projection refuses fails the read, also with
+    /// the column not projected: a microsecond file in a `timestamp_ns` column has statistics in
+    /// microseconds, which pruning would read as nanoseconds.
+    #[tokio::test]
+    async fn test_filter_and_eq_delete_on_unreadable_column_fail() {
+        use arrow_array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+        use arrow_schema::TimeUnit;
+
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let micros = NANOSECOND_FILE_MICROS[1];
+        let data_path = format!("{loc}/data.parquet");
+        eqd_write(
+            &data_path,
+            Arc::new(ArrowSchema::new(vec![
+                eqd_field("id", DataType::Int64, 1, false),
+                eqd_field(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    2,
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![micros])),
+            ],
+        );
+        let del_path = format!("{loc}/eq-del.parquet");
+        eqd_write(
+            &del_path,
+            Arc::new(ArrowSchema::new(vec![eqd_field(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                2,
+                true,
+            )])),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![micros * 1000])) as ArrayRef],
+        );
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::TimestampNs))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let predicate = Reference::new("ts")
+            .equal_to(Datum::timestamp_nanos(micros * 1000))
+            .bind(schema.clone(), true)
+            .unwrap();
+
+        for (predicate, deletes) in [
+            (Some(predicate), vec![]),
+            (None, vec![eqd_delete_file(&del_path, vec![2])]),
+        ] {
+            let err = eqd_try_read(
+                &data_path,
+                schema.clone(),
+                vec![1],
+                deletes,
+                predicate,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "DataInvalid => Cannot read column ts (field ID 2): the data file stores it as \
+                 timestamp, which cannot be read as timestamp_ns"
+            );
+        }
+    }
+
     /// Statistics, the page index and bloom filters of a column that stores nanoseconds hold
     /// nanoseconds, so none of them may prune by the microsecond values of the table column.
     #[tokio::test]
