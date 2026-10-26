@@ -26,6 +26,7 @@ use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 
+use crate::arrow::stores_nanos_for_micros;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::decimal_utils::i128_from_be_bytes;
@@ -167,6 +168,15 @@ impl<'a> PageIndexEvaluator<'a> {
             // successful, just a bit slower
             return self.select_all_rows();
         };
+
+        if self
+            .row_group_metadata
+            .columns()
+            .get(parquet_column_index)
+            .is_some_and(|column| stores_nanos_for_micros(column.column_descr(), field_type))
+        {
+            return self.select_all_rows();
+        }
 
         // Declared byte width of a FIXED_LEN_BYTE_ARRAY column, used to detect
         // truncated page-index bounds when decoding decimals. `None` when the

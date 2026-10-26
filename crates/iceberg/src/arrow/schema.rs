@@ -31,7 +31,9 @@ use arrow_schema::{
     ArrowError, DataType, Field, FieldRef, Fields, Schema as ArrowSchema, TimeUnit,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::basic::{LogicalType, TimeUnit as ParquetTimeUnit};
 use parquet::file::statistics::Statistics;
+use parquet::schema::types::ColumnDescriptor;
 use uuid::Uuid;
 
 use crate::error::{Result, invalid_data};
@@ -334,6 +336,10 @@ pub(super) fn type_promotion_is_valid(
             Some(PrimitiveType::Date),
             Some(PrimitiveType::Timestamp | PrimitiveType::TimestampNs),
         ) => true,
+        // Nanosecond files in microsecond columns read exactly, or fail on a value with
+        // sub-microsecond digits (`PromotePlan::TimestampNanosToMicros`).
+        (Some(PrimitiveType::TimestampNs), Some(PrimitiveType::Timestamp))
+        | (Some(PrimitiveType::TimestamptzNs), Some(PrimitiveType::Timestamptz)) => true,
         (
             Some(PrimitiveType::Decimal {
                 precision: file_precision,
@@ -868,6 +874,21 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
             format!("Converting datum from type {primitive_type:?} to arrow not supported yet."),
         )),
     }
+}
+
+/// Whether `column` stores nanosecond timestamps for a microsecond Iceberg column. Its statistics,
+/// page index and bloom filter hold nanoseconds, so they cannot prune by microsecond values.
+pub(crate) fn stores_nanos_for_micros(
+    column: &ColumnDescriptor,
+    iceberg_type: &PrimitiveType,
+) -> bool {
+    matches!(
+        iceberg_type,
+        PrimitiveType::Timestamp | PrimitiveType::Timestamptz
+    ) && matches!(
+        column.logical_type_ref(),
+        Some(LogicalType::Timestamp(t)) if t.unit == ParquetTimeUnit::NANOS
+    )
 }
 
 pub(crate) fn get_parquet_stat_min_as_datum(
