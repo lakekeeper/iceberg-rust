@@ -46,31 +46,13 @@ impl ManifestMetadata {
         Self::parse_with(meta, None)
     }
 
-    /// Parse from the avro file's key-value metadata, preferring the table
-    /// metadata's schema and partition spec (looked up by the manifest's
-    /// **recorded** `schema-id` / `partition-spec-id`) over the manifest's
-    /// self-described `schema` / `partition-spec` keys.
-    ///
-    /// A manifest's embedded `schema` key is redundant with the authoritative
-    /// table metadata, and some writers (e.g. duckdb-iceberg) store a
-    /// non-conformant value there (the manifest_entry Avro record schema rather
-    /// than the Iceberg table schema). When the manifest records a `schema-id`
-    /// and `table_metadata` contains that schema, the table's schema is used
-    /// and the manifest's own `schema` key is not parsed — mirroring
-    /// iceberg-java's `ManifestReader(specsById)`, whose reading of the schema
-    /// from manifest file metadata is deprecated. The same applies to
-    /// `partition-spec-id` and the partition spec.
-    ///
-    /// The lookup happens ONLY for ids the manifest actually records. A writer
-    /// that omits the `schema-id` key (some engines do) may have written the
-    /// manifest under any historical schema — assuming the default id 0 would
-    /// mistype column bounds after a type promotion (e.g. 8-byte long bounds
-    /// decoded as int), so the manifest's self-described schema is the only
-    /// reliable description of its bytes and is parsed instead. When
-    /// `table_metadata` is `None` (or does not contain a recorded id) the
-    /// manifest's own metadata is likewise parsed, preserving the previous
-    /// self-describing behaviour.
-    pub fn parse_with(
+    /// Parse from the avro file's key-value metadata. When the manifest records a `schema-id`
+    /// and `partition-spec-id` that `table_metadata` contains, the schema and partition spec come
+    /// from the table metadata, as in Java's `ManifestReader(specsById)`, because some writers
+    /// (DuckDB 1.4) store a non-conformant `schema` key. Otherwise they are parsed from the
+    /// manifest's own keys: a manifest without recorded IDs may have been written under any
+    /// historical schema.
+    pub(crate) fn parse_with(
         meta: &HashMap<String, Vec<u8>>,
         table_metadata: Option<&TableMetadataRef>,
     ) -> Result<Self> {
@@ -184,5 +166,101 @@ impl ManifestMetadata {
     /// Get the type of content files tracked by manifest
     pub fn content(&self) -> &ManifestContentType {
         &self.content
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::spec::{
+        NestedField, PrimitiveType, SortOrder, TableMetadataBuilder, Type, UnboundPartitionSpec,
+    };
+
+    fn table_metadata() -> TableMetadataRef {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            "memory:///table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        Arc::new(metadata)
+    }
+
+    #[test]
+    fn test_manifest_metadata_parse_prefers_table_metadata_over_bad_schema() {
+        let table_metadata = table_metadata();
+        // DuckDB 1.4 writes the manifest entry's Avro schema, with Avro type names such as
+        // `array`, as the `schema` key.
+        let meta = HashMap::from([
+            ("schema-id".to_string(), b"0".to_vec()),
+            ("partition-spec-id".to_string(), b"0".to_vec()),
+            ("format-version".to_string(), b"2".to_vec()),
+            ("content".to_string(), b"data".to_vec()),
+            (
+                "schema".to_string(),
+                br#"{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":{"type":"array","items":"int"}}]}"#
+                    .to_vec(),
+            ),
+        ]);
+
+        assert!(ManifestMetadata::parse(&meta).is_err());
+        assert_eq!(
+            ManifestMetadata::parse_with(&meta, Some(&table_metadata)).unwrap(),
+            ManifestMetadata {
+                schema: table_metadata.current_schema().clone(),
+                schema_id: 0,
+                partition_spec: table_metadata.default_partition_spec().as_ref().clone(),
+                format_version: FormatVersion::V2,
+                content: ManifestContentType::Data,
+            }
+        );
+    }
+
+    #[test]
+    fn test_manifest_metadata_parse_self_describes_when_ids_not_recorded() {
+        let meta = HashMap::from([
+            ("format-version".to_string(), b"2".to_vec()),
+            ("content".to_string(), b"data".to_vec()),
+            (
+                "schema".to_string(),
+                br#"{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"foo","required":false,"type":"long"}]}"#
+                    .to_vec(),
+            ),
+            ("partition-spec".to_string(), b"[]".to_vec()),
+        ]);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "foo", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            ManifestMetadata::parse_with(&meta, Some(&table_metadata())).unwrap(),
+            ManifestMetadata {
+                partition_spec: PartitionSpec::builder(schema.clone()).build().unwrap(),
+                schema,
+                schema_id: 0,
+                format_version: FormatVersion::V2,
+                content: ManifestContentType::Data,
+            }
+        );
     }
 }

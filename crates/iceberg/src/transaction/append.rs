@@ -341,13 +341,9 @@ mod tests {
             .unwrap();
     }
 
-    /// Regression test for the write-path half of the schema-resilience fix:
-    /// `validate_duplicate_files` loads every manifest of the current
-    /// snapshot, so a `fast_append` onto a table whose current snapshot
-    /// carries a manifest with non-conformant self-described `schema`
-    /// metadata (written by a foreign engine) must not fail — the recorded
-    /// `schema-id` resolves against the table metadata, same as the scan
-    /// path.
+    /// `validate_duplicate_files` loads every manifest of the current snapshot, so it must
+    /// resolve a manifest's recorded `schema-id` against the table metadata, as the scan does,
+    /// when the manifest's own `schema` key is not a valid Iceberg schema.
     #[tokio::test]
     async fn test_fast_append_duplicate_check_tolerates_foreign_schema_metadata() {
         let (table, _tmp_dir, delete_manifest_path) = make_table_with_delete_only_manifest().await;
