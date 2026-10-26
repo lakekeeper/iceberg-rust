@@ -59,7 +59,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, Struct};
+use crate::spec::{Datum, Literal, PartitionSpec, Struct, Type};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -584,17 +584,28 @@ impl FileScanTaskReader {
         }
 
         if !eq_delete_sets.is_empty() {
-            // Identity partition values stand in for key columns the file does not store.
-            let partition_constants = match (task.partition_spec(), task.partition()) {
+            // Identity partition values, then initial defaults of top-level fields, stand in for
+            // key columns the file does not store, as projection fills them.
+            let mut absent_key_values = match (task.partition_spec(), task.partition()) {
                 (Some(spec), Some(data)) => constants_map(spec, data, task.schema())?,
                 _ => HashMap::new(),
             };
+            for (_, id, _) in eq_delete_sets.iter().flat_map(|set| &set.fields) {
+                if let Some(field) = task.schema().as_struct().field_by_id(*id)
+                    && let (Type::Primitive(ty), Some(Literal::Primitive(value))) =
+                        (&*field.field_type, &field.initial_default)
+                {
+                    absent_key_values
+                        .entry(*id)
+                        .or_insert_with(|| Datum::new(ty.clone(), value.clone()));
+                }
+            }
             row_filter_predicates.extend(ArrowReader::build_equality_delete_predicates(
                 &eq_delete_sets,
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 use_position_fallback,
-                &partition_constants,
+                &absent_key_values,
             )?);
         }
 
