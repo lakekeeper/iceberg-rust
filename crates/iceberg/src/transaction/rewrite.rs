@@ -28,10 +28,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Datelike;
 
 use crate::error::{Result, invalid_data};
 use crate::spec::{
-    DataContentType, DataFile, Literal, ManifestContentType, Operation, PartitionSpec, Struct,
+    DataContentType, DataFile, Literal, ManifestContentType, Operation, PartitionSpec,
+    PrimitiveLiteral, Struct, Transform,
 };
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
@@ -355,8 +357,9 @@ fn may_be_same_value(a: Option<&Literal>, b: Option<&Literal>) -> bool {
 }
 
 /// Whether rows of a file in `file_partition` of `file_spec` can be in
-/// `partition` of `spec`. False only when both specs have a field with the same
-/// source and transform whose values certainly differ.
+/// `partition` of `spec`. False only when both specs have a field on the same
+/// source whose values certainly differ: under the same transform, under two
+/// bucket transforms, or under two of `year`, `month`, `day` and `hour`.
 fn may_hold_rows_of(
     file_spec: &PartitionSpec,
     file_partition: &Struct,
@@ -379,10 +382,102 @@ fn may_hold_rows_of(
                 .zip(file_partition.iter())
                 .any(|(file_field, file_value)| {
                     file_field.source_id == field.source_id
-                        && file_field.transform == field.transform
-                        && !may_be_same_value(file_value, value)
+                        && certainly_differ(
+                            file_field.transform,
+                            file_value,
+                            field.transform,
+                            value,
+                        )
                 })
         })
+}
+
+/// Whether no source value can give `a` under `a_transform` and `b` under
+/// `b_transform`.
+fn certainly_differ(
+    a_transform: Transform,
+    a: Option<&Literal>,
+    b_transform: Transform,
+    b: Option<&Literal>,
+) -> bool {
+    if a_transform == b_transform {
+        return !may_be_same_value(a, b);
+    }
+    let (Some(a), Some(b)) = (a, b) else {
+        // Both transforms are null exactly when the source is null.
+        return a.is_some() != b.is_some()
+            && a_transform != Transform::Void
+            && b_transform != Transform::Void;
+    };
+    let (
+        Literal::Primitive(PrimitiveLiteral::Int(a)),
+        Literal::Primitive(PrimitiveLiteral::Int(b)),
+    ) = (a, b)
+    else {
+        return false;
+    };
+    match (a_transform, b_transform) {
+        // Both are the same non-negative hash modulo n and modulo m, so they
+        // agree modulo gcd(n, m).
+        (Transform::Bucket(n), Transform::Bucket(m)) => {
+            let gcd = i64::from(gcd(n, m));
+            gcd > 0 && i64::from(*a).rem_euclid(gcd) != i64::from(*b).rem_euclid(gcd)
+        }
+        _ => match (temporal_rank(a_transform), temporal_rank(b_transform)) {
+            // Writers have rounded values before 1970 toward zero instead of
+            // down, so only later values are compared across units.
+            (Some(a_rank), Some(b_rank)) if *a >= 0 && *b >= 0 => {
+                let coarser = a_rank.max(b_rank);
+                match (
+                    coarsen_temporal(*a, a_rank, coarser),
+                    coarsen_temporal(*b, b_rank, coarser),
+                ) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+    }
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// The temporal transforms from finest to coarsest.
+fn temporal_rank(transform: Transform) -> Option<u8> {
+    match transform {
+        Transform::Hour => Some(0),
+        Transform::Day => Some(1),
+        Transform::Month => Some(2),
+        Transform::Year => Some(3),
+        _ => None,
+    }
+}
+
+/// Converts a temporal transform value, a count of units since 1970-01-01, to
+/// the coarser unit of rank `to`.
+fn coarsen_temporal(value: i32, from: u8, to: u8) -> Option<i64> {
+    let value = i64::from(value);
+    if from == to {
+        return Some(value);
+    }
+    if from == 0 {
+        return coarsen_temporal(i32::try_from(value.div_euclid(24)).ok()?, 1, to);
+    }
+    if from == 1 {
+        let date = chrono::DateTime::UNIX_EPOCH
+            .date_naive()
+            .checked_add_signed(chrono::Duration::try_days(value)?)?;
+        let years = i64::from(date.year()) - 1970;
+        return Some(match to {
+            2 => years * 12 + i64::from(date.month0()),
+            _ => years,
+        });
+    }
+    // Months to years.
+    Some(value.div_euclid(12))
 }
 
 #[async_trait]
@@ -2511,9 +2606,17 @@ mod tests {
                 false,
             ),
             (
-                "bucket of another width",
+                "bucket of another width, other residue",
                 &bucket_8,
                 bucket(1),
+                &bucket_4,
+                bucket(3),
+                false,
+            ),
+            (
+                "bucket of another width, same residue",
+                &bucket_8,
+                bucket(7),
                 &bucket_4,
                 bucket(3),
                 true,
@@ -2574,6 +2677,132 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn test_certainly_differ_across_transforms() {
+        let int = |value: i32| Some(Literal::int(value));
+        let differ = |a_transform, a: Option<Literal>, b_transform, b: Option<Literal>| {
+            certainly_differ(a_transform, a.as_ref(), b_transform, b.as_ref())
+        };
+        // Buckets agree modulo the gcd of their widths.
+        assert!(differ(
+            Transform::Bucket(8),
+            int(5),
+            Transform::Bucket(4),
+            int(2)
+        ));
+        assert!(!differ(
+            Transform::Bucket(8),
+            int(6),
+            Transform::Bucket(4),
+            int(2)
+        ));
+        assert!(differ(
+            Transform::Bucket(6),
+            int(1),
+            Transform::Bucket(4),
+            int(2)
+        ));
+        assert!(!differ(
+            Transform::Bucket(6),
+            int(3),
+            Transform::Bucket(4),
+            int(1)
+        ));
+        assert!(!differ(
+            Transform::Bucket(3),
+            int(0),
+            Transform::Bucket(4),
+            int(1)
+        ));
+
+        // 2017-06-15 is day 17332, month 569 and year 47; its hour 16 is 415984.
+        assert!(!differ(
+            Transform::Hour,
+            int(415984),
+            Transform::Day,
+            int(17332)
+        ));
+        assert!(differ(
+            Transform::Hour,
+            int(415984),
+            Transform::Day,
+            int(17333)
+        ));
+        assert!(!differ(
+            Transform::Day,
+            int(17332),
+            Transform::Month,
+            int(569)
+        ));
+        assert!(differ(
+            Transform::Day,
+            int(17332),
+            Transform::Month,
+            int(570)
+        ));
+        assert!(!differ(
+            Transform::Day,
+            int(17332),
+            Transform::Year,
+            int(47)
+        ));
+        assert!(differ(Transform::Day, int(17332), Transform::Year, int(48)));
+        assert!(!differ(
+            Transform::Month,
+            int(569),
+            Transform::Year,
+            int(47)
+        ));
+        assert!(differ(Transform::Month, int(576), Transform::Year, int(47)));
+        assert!(!differ(
+            Transform::Hour,
+            int(415984),
+            Transform::Year,
+            int(47)
+        ));
+        // 1970-01-31 is day 30 in month 0; 1970-02-01 is day 31 in month 1.
+        assert!(!differ(Transform::Day, int(30), Transform::Month, int(0)));
+        assert!(!differ(Transform::Day, int(31), Transform::Month, int(1)));
+        assert!(differ(Transform::Day, int(31), Transform::Month, int(0)));
+        // Values before 1970 are never compared across units.
+        assert!(!differ(Transform::Day, int(-1), Transform::Month, int(5)));
+
+        // Different transforms of one source are null together.
+        assert!(differ(
+            Transform::Bucket(8),
+            None,
+            Transform::Bucket(4),
+            int(2)
+        ));
+        assert!(!differ(
+            Transform::Bucket(8),
+            None,
+            Transform::Bucket(4),
+            None
+        ));
+        assert!(!differ(Transform::Void, None, Transform::Bucket(4), int(2)));
+
+        // Unrelated transforms are never ruled out.
+        assert!(!differ(
+            Transform::Identity,
+            int(5),
+            Transform::Bucket(4),
+            int(2)
+        ));
+        assert!(!differ(
+            Transform::Truncate(10),
+            int(10),
+            Transform::Truncate(100),
+            int(200)
+        ));
+        assert!(!differ(
+            Transform::Bucket(4),
+            int(1),
+            Transform::Day,
+            int(2)
+        ));
     }
 
     /// The default spec made just before the starting snapshot, if any.
