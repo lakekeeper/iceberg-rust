@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
-use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard};
+use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard, is_equality_delete};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
@@ -32,7 +32,7 @@ use crate::encryption::{EncryptedInputFile, StandardKeyMetadata};
 use crate::error::invalid_data;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
-use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
+use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::{
     DataContentType, DataFileFormat, Datum, ListType, MapType, NestedField, NestedFieldRef,
     PartnerAccessor, PrimitiveType, Schema, SchemaRef, SchemaWithPartnerVisitor, StructType, Type,
@@ -305,6 +305,28 @@ impl CachingDeleteFileLoader {
         });
 
         rx
+    }
+
+    /// Builds the equality-delete sets that apply to `task`, after waiting for the
+    /// loads of its equality delete files that other tasks started. A file whose load
+    /// failed is loaded again.
+    pub(crate) async fn build_equality_delete_sets(
+        &self,
+        task: &FileScanTask,
+    ) -> Result<Vec<Arc<EqDeleteSet>>> {
+        for delete in task.deletes().iter().filter(|d| is_equality_delete(d)) {
+            while self
+                .delete_filter
+                .get_equality_delete_set_for_delete_file_path(delete.file_path())
+                .await
+                .is_none()
+            {
+                self.load_deletes(std::slice::from_ref(delete), task.schema_ref())
+                    .await
+                    .unwrap()?;
+            }
+        }
+        self.delete_filter.build_equality_delete_sets(task).await
     }
 
     async fn load_file_for_task(
@@ -882,8 +904,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
-    use crate::scan::FileScanTaskDeleteFile;
-    use crate::spec::{DataContentType, DataFileFormat, Datum, PrimitiveType, Schema, Type};
+    use crate::spec::{
+        DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type,
+    };
     use crate::test_utils::encode_dv_blob;
 
     #[test]
@@ -2113,5 +2136,74 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(positions, vec![1, 3, 5]);
+    }
+
+    // A task waiting for an equality delete file whose load fails, for example because
+    // a sibling delete file of the loading task failed, loads the file itself.
+    #[tokio::test]
+    async fn test_eq_del_waiter_loads_the_file_when_the_load_it_waits_for_fails() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = setup_write_equality_delete_file_1(tmp_dir.path().to_str().unwrap());
+        let eq_del = FileScanTaskDeleteFile::builder()
+            .with_file_path(path.clone())
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![2]))
+            .build()
+            .unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(0)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path("data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![2])
+            .with_deletes(vec![eq_del])
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 10, Runtime::current());
+
+        let notify = loader.delete_filter.try_start_eq_del_load(&path).unwrap();
+        loader
+            .load_deletes(task.deletes(), task.schema_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let waiter = loader.build_equality_delete_sets(&task);
+        tokio::pin!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
+        let (tx, rx) = channel::<Arc<EqDeleteSet>>();
+        loader
+            .delete_filter
+            .insert_equality_delete(&path, notify, rx);
+        drop(tx);
+
+        let sets = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must be woken")
+            .unwrap();
+        let sets: Vec<_> = sets
+            .iter()
+            .map(|set| (set.keys.clone(), set.fields.clone()))
+            .collect();
+        assert_eq!(sets, vec![(
+            HashSet::from([
+                EqDeleteKey(vec![Some(Datum::long(1))]),
+                EqDeleteKey(vec![Some(Datum::long(2))]),
+            ]),
+            vec![("y".to_string(), 2, Type::Primitive(PrimitiveType::Long))],
+        )]);
     }
 }
