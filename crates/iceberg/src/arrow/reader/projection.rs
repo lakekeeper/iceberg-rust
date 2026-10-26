@@ -2834,6 +2834,39 @@ message schema {
         }
     }
 
+    /// A column stored as `unknown` and later promoted to another type reads as NULL, with or
+    /// without field IDs.
+    #[tokio::test]
+    async fn test_read_unknown_column_promoted_to_another_type() {
+        use arrow_array::{NullArray, new_null_array};
+
+        use crate::arrow::type_to_arrow_type;
+
+        for table_type in [
+            PrimitiveType::String,
+            PrimitiveType::Long,
+            PrimitiveType::Timestamptz,
+        ] {
+            for with_field_ids in [true, false] {
+                let batches = read_single_column(
+                    Arc::new(NullArray::new(2)),
+                    with_field_ids,
+                    table_type.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    batches[0].column(0),
+                    &new_null_array(
+                        &type_to_arrow_type(&Type::Primitive(table_type.clone())).unwrap(),
+                        2
+                    ),
+                    "{table_type}, with_field_ids={with_field_ids}"
+                );
+            }
+        }
+    }
+
     /// A byte array that is not valid UTF-8 fails the read of a `string` column.
     #[tokio::test]
     async fn test_read_invalid_utf8_byte_array_as_string_fails() {

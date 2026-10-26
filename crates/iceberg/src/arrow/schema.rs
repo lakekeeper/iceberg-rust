@@ -362,6 +362,9 @@ pub(super) fn type_promotion_is_valid(
         ) => true,
         // Byte arrays without the UTF8 annotation, as Java reads them for a `string` column.
         (Some(PrimitiveType::Binary), Some(PrimitiveType::String)) => true,
+        // `unknown` may be promoted to any type. Its values are all null; the spec says to omit
+        // the column, but iceberg-rust's own writers store it as a null column.
+        (Some(PrimitiveType::Unknown), Some(_)) => true,
         _ => false,
     }
 }
