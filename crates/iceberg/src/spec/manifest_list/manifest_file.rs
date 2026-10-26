@@ -121,13 +121,13 @@ impl ManifestFile {
         self.existing_files_count.map(|c| c > 0).unwrap_or(true)
     }
 
-    /// Load the [`Manifest`](crate::spec::Manifest) this entry points at, the same way the
-    /// scan planner's [`ManifestReader`](crate::spec::ManifestReader) does: the file is read
+    /// Load the [`Manifest`](crate::spec::Manifest) this entry points at: the file is read
     /// (and decrypted) with `file_io`, and the entries inherit this entry's snapshot id,
     /// sequence numbers and `first_row_id`.
     ///
-    /// Fork convenience for maintenance callers that hold a [`ManifestFile`] and a `FileIO`
-    /// rather than a `Table`.
+    /// The schema and partition spec come from the manifest's own header, which some writers
+    /// (DuckDB 1.4) fill incorrectly. Use [`Table::manifest_reader`](crate::table::Table::manifest_reader)
+    /// to resolve them from the table metadata, as the scan planner does.
     pub async fn load_manifest(
         &self,
         file_io: &crate::io::FileIO,
