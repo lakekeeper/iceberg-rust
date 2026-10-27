@@ -206,7 +206,7 @@ impl<'a> SnapshotProducer<'a> {
 
     pub(crate) async fn validate_duplicate_files(&self) -> Result<()> {
         // Nothing to look up, so no manifest is read.
-        if self.added_data_files.is_empty() {
+        if self.added_data_files.is_empty() && self.added_delete_files.is_empty() {
             return Ok(());
         }
         let Some(current_snapshot) = self.table.metadata().current_snapshot() else {
@@ -216,6 +216,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_files: HashSet<&str> = self
             .added_data_files
             .iter()
+            .chain(&self.added_delete_files)
             .map(|df| df.file_path.as_str())
             .collect();
 
@@ -309,7 +310,7 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     // Check if the partition value is compatible with the partition type.
-    fn validate_partition_value(
+    pub(crate) fn validate_partition_value(
         partition_value: &Struct,
         partition_type: &StructType,
     ) -> Result<()> {
