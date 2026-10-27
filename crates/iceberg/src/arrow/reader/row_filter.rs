@@ -2249,6 +2249,26 @@ mod tests {
         predicate: Option<BoundPredicate>,
         row_selection_enabled: bool,
     ) -> Vec<RecordBatch> {
+        eqd_try_read(
+            data_path,
+            table_schema,
+            project_field_ids,
+            deletes,
+            predicate,
+            row_selection_enabled,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn eqd_try_read(
+        data_path: &str,
+        table_schema: SchemaRef,
+        project_field_ids: Vec<i32>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+        predicate: Option<BoundPredicate>,
+        row_selection_enabled: bool,
+    ) -> crate::Result<Vec<RecordBatch>> {
         let file_io = FileIO::new_with_fs();
         let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
             .with_row_selection_enabled(row_selection_enabled)
@@ -2267,13 +2287,7 @@ mod tests {
             .build()
             .unwrap();
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        reader
-            .read(tasks)
-            .unwrap()
-            .stream()
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .unwrap()
+        reader.read(tasks)?.stream().try_collect().await
     }
 
     fn eqd_collect_i64(batches: &[RecordBatch], col: usize) -> Vec<i64> {
@@ -3831,9 +3845,8 @@ mod tests {
         1_735_603_200_000_000,
     ];
 
-    /// Equality deletes keyed on a column the file stores in nanoseconds match by value. Where
-    /// the UTC flag of the file differs from the table column, the read of the key column fails,
-    /// so those deletes run with the key columns not projected.
+    /// Equality deletes keyed on a column the file stores in nanoseconds match by value, also
+    /// where the UTC flag of the file differs from the table column.
     #[tokio::test]
     async fn test_eq_delete_on_nanosecond_column_in_microsecond_field() {
         use arrow_array::TimestampMicrosecondArray;
@@ -3890,6 +3903,288 @@ mod tests {
                 vec![3],
                 "ts as {ts_type}, tz as {tz_type}"
             );
+        }
+    }
+
+    /// pandas writes `datetime64[ns]` without the UTC flag, also for a `timestamptz` column, and
+    /// `datetime64[ns, UTC]` with it, also for a `timestamp` column. Such columns read, filter
+    /// and match equality deletes by value, projected or not.
+    #[tokio::test]
+    async fn test_nanosecond_column_with_other_utc_flag_in_microsecond_field() {
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        let data_path = format!("{loc}/data.parquet");
+        nanosecond_file(&data_path, &NANOSECOND_FILE_MICROS, false);
+        // `ts` stores nanoseconds without UTC, `tz` with UTC.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::optional(3, "tz", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let batches = eqd_read(&data_path, schema.clone(), vec![1, 2, 3], vec![]).await;
+        assert_eq!(batches.len(), 1);
+        for (column, tz) in [(1, Some("+00:00")), (2, None)] {
+            let array = batches[0]
+                .column(column)
+                .as_primitive::<TimestampMicrosecondType>();
+            assert_eq!(array.values(), &NANOSECOND_FILE_MICROS, "column {column}");
+            assert_eq!(array.timezone(), tz, "column {column}");
+        }
+
+        let delete_file = |name: &str, id: i32, tz: Option<Arc<str>>, micros: i64| {
+            let path = format!("{loc}/{name}.parquet");
+            eqd_write(
+                &path,
+                Arc::new(ArrowSchema::new(vec![eqd_field(
+                    name,
+                    DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                    id,
+                    true,
+                )])),
+                vec![Arc::new(
+                    TimestampMicrosecondArray::from(vec![micros]).with_timezone_opt(tz),
+                )],
+            );
+            eqd_delete_file(&path, vec![id])
+        };
+        let deletes = [
+            (
+                "ts",
+                delete_file("ts", 2, Some("+00:00".into()), NANOSECOND_FILE_MICROS[0]),
+                vec![2, 3],
+            ),
+            (
+                "tz",
+                delete_file("tz", 3, None, NANOSECOND_FILE_MICROS[1]),
+                vec![1, 3],
+            ),
+        ];
+        let filters = [
+            (
+                Reference::new("ts").equal_to(Datum::timestamptz_micros(NANOSECOND_FILE_MICROS[0])),
+                vec![1],
+            ),
+            (
+                Reference::new("ts")
+                    .less_than(Datum::timestamptz_micros(NANOSECOND_FILE_MICROS[1])),
+                vec![1],
+            ),
+            (
+                Reference::new("tz").equal_to(Datum::timestamp_micros(NANOSECOND_FILE_MICROS[1])),
+                vec![2],
+            ),
+            (
+                Reference::new("tz")
+                    .greater_than(Datum::timestamp_micros(NANOSECOND_FILE_MICROS[0])),
+                vec![2, 3],
+            ),
+        ];
+        for projection in [vec![1, 2, 3], vec![1]] {
+            for (column, delete, expected) in &deletes {
+                let result = eqd_read(&data_path, schema.clone(), projection.clone(), vec![
+                    delete.clone(),
+                ])
+                .await;
+                assert_eq!(
+                    eqd_collect_i64(&result, 0),
+                    *expected,
+                    "delete on {column}, projection {projection:?}"
+                );
+            }
+            for row_selection_enabled in [false, true] {
+                for (predicate, expected) in &filters {
+                    let result = eqd_read_with(
+                        &data_path,
+                        schema.clone(),
+                        projection.clone(),
+                        vec![],
+                        Some(predicate.clone().bind(schema.clone(), true).unwrap()),
+                        row_selection_enabled,
+                    )
+                    .await;
+                    assert_eq!(
+                        eqd_collect_i64(&result, 0),
+                        *expected,
+                        "{predicate}, projection {projection:?}, row selection \
+                         {row_selection_enabled}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Writes `id` (field ID 1) and `ts` (INT96, field ID 2), as Spark does.
+    fn int96_file(path: &str, nanos: &[i64]) {
+        use parquet::data_type::{Int64Type as ParquetInt64, Int96, Int96Type};
+        use parquet::file::writer::SerializedFileWriter;
+
+        const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+        const UNIX_EPOCH_JULIAN_DAY: i64 = 2_440_588;
+        let message =
+            parse_message_type("message schema { required int64 id = 1; optional int96 ts = 2; }")
+                .unwrap();
+        let ids: Vec<i64> = (1..=nanos.len() as i64).collect();
+        let values: Vec<Int96> = nanos
+            .iter()
+            .map(|ns| {
+                let nanos_of_day = ns.rem_euclid(NANOS_PER_DAY) as u64;
+                let mut value = Int96::new();
+                value.set_data(
+                    nanos_of_day as u32,
+                    (nanos_of_day >> 32) as u32,
+                    (ns.div_euclid(NANOS_PER_DAY) + UNIX_EPOCH_JULIAN_DAY) as u32,
+                );
+                value
+            })
+            .collect();
+        let mut writer = SerializedFileWriter::new(
+            File::create(path).unwrap(),
+            Arc::new(message),
+            Default::default(),
+        )
+        .unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        let mut column = row_group.next_column().unwrap().unwrap();
+        column
+            .typed::<ParquetInt64>()
+            .write_batch(&ids, None, None)
+            .unwrap();
+        column.close().unwrap();
+        let mut column = row_group.next_column().unwrap().unwrap();
+        column
+            .typed::<Int96Type>()
+            .write_batch(&values, Some(&vec![1; values.len()]), None)
+            .unwrap();
+        column.close().unwrap();
+        row_group.close().unwrap();
+        writer.close().unwrap();
+    }
+
+    /// A filter or equality delete on a column the projection refuses fails the read, also with
+    /// the column not projected. Its values, statistics and bloom filters are in another type or
+    /// unit than the table column, so comparing them would drop or keep the wrong rows.
+    #[tokio::test]
+    async fn test_filter_and_eq_delete_on_unreadable_column_fail() {
+        use arrow_array::{TimestampMillisecondArray, TimestampNanosecondArray};
+
+        let tmp = TempDir::new().unwrap();
+        let loc = tmp.path().to_str().unwrap();
+        // 2024-01-01T00:00:00.123456 and the same instant plus one millisecond, microsecond or
+        // nanosecond, in the unit of each file. Without the check, the filters drop or keep rows
+        // and the INT96 delete removes both rows.
+        let micros = NANOSECOND_FILE_MICROS[0];
+        let data_file = |name: &str, data_type: DataType, column: ArrayRef| {
+            let path = format!("{loc}/{name}.parquet");
+            eqd_write(
+                &path,
+                Arc::new(ArrowSchema::new(vec![
+                    eqd_field("id", DataType::Int64, 1, false),
+                    eqd_field("ts", data_type, 2, true),
+                ])),
+                vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef, column],
+            );
+            path
+        };
+        let millis_path = data_file(
+            "millis",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                micros / 1000,
+                micros / 1000 + 1,
+            ])),
+        );
+        let micros_path = data_file(
+            "micros",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            Arc::new(TimestampMicrosecondArray::from(vec![micros, micros + 1])),
+        );
+        let int96_path = format!("{loc}/int96.parquet");
+        int96_file(&int96_path, &[micros * 1000, micros * 1000 + 1]);
+        let delete_file = |name: &str, data_type: DataType, column: ArrayRef| {
+            let path = format!("{loc}/{name}-delete.parquet");
+            eqd_write(
+                &path,
+                Arc::new(ArrowSchema::new(vec![eqd_field("ts", data_type, 2, true)])),
+                vec![column],
+            );
+            eqd_delete_file(&path, vec![2])
+        };
+        // Milliseconds have no Iceberg type. The reader takes INT96 as microseconds.
+        let cases = [
+            (
+                "milliseconds",
+                &millis_path,
+                PrimitiveType::Timestamp,
+                Datum::timestamp_micros(micros / 1000 * 1000),
+                delete_file(
+                    "millis",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    Arc::new(TimestampMicrosecondArray::from(vec![micros / 1000 * 1000])),
+                ),
+                "DataInvalid => Unsupported Arrow data type: Timestamp(ms)",
+            ),
+            (
+                "microseconds",
+                &micros_path,
+                PrimitiveType::TimestampNs,
+                Datum::timestamp_nanos(micros * 1000),
+                delete_file(
+                    "micros",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    Arc::new(TimestampNanosecondArray::from(vec![micros * 1000])),
+                ),
+                "DataInvalid => Cannot read column ts (field ID 2): the data file stores it as \
+                 timestamp, which cannot be read as timestamp_ns",
+            ),
+            (
+                "INT96",
+                &int96_path,
+                PrimitiveType::TimestampNs,
+                Datum::timestamp_nanos(micros * 1000 + 1),
+                delete_file(
+                    "int96",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    Arc::new(TimestampNanosecondArray::from(vec![micros * 1000])),
+                ),
+                "DataInvalid => Cannot read column ts (field ID 2): the data file stores it as \
+                 timestamp, which cannot be read as timestamp_ns",
+            ),
+        ];
+        for (name, path, table_type, literal, delete, message) in cases {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                        NestedField::optional(2, "ts", Type::Primitive(table_type.clone())).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let predicate = Reference::new("ts")
+                .equal_to(literal)
+                .bind(schema.clone(), true)
+                .unwrap();
+            for (predicate, deletes) in [(Some(predicate), vec![]), (None, vec![delete])] {
+                let kind = if predicate.is_some() {
+                    "filter"
+                } else {
+                    "delete"
+                };
+                let label = format!("{kind} on {name} in {table_type}");
+                let err = eqd_try_read(path, schema.clone(), vec![1], deletes, predicate, false)
+                    .await
+                    .map(|batches| eqd_collect_i64(&batches, 0))
+                    .expect_err(&label);
+                assert_eq!(err.to_string(), message, "{label}");
+            }
         }
     }
 
