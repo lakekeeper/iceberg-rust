@@ -22,7 +22,7 @@
 //! creation, summary computation, and delegates the final snapshot commit to
 //! [`SnapshotProducer`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use uuid::Uuid;
@@ -30,13 +30,14 @@ use uuid::Uuid;
 use crate::error::{Result, invalid_data};
 use crate::io::OutputFile;
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestStatus, ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpec, SchemaRef,
-    SnapshotSummaryCollector, Summary, TableProperties, update_snapshot_summaries,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
+    ManifestFile, ManifestStatus, ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpec,
+    SchemaRef, SnapshotSummaryCollector, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::transaction::snapshot::SnapshotProducer;
+use crate::{Error, ErrorKind};
 
 /// Create a manifest writer that handles encryption when available.
 fn new_manifest_writer(
@@ -314,6 +315,9 @@ impl ManifestFilterManager {
 pub(crate) struct MergingSnapshotProducer {
     operation: Operation,
     added_data_files: Vec<DataFile>,
+    /// Delete files to add, each with the data sequence number it is
+    /// committed with.
+    added_delete_files: Vec<(DataFile, i64)>,
     deleted_data_files: Vec<DataFile>,
     deleted_delete_files: Vec<DataFile>,
     filter_manager: ManifestFilterManager,
@@ -329,6 +333,7 @@ impl MergingSnapshotProducer {
         Self {
             operation,
             added_data_files: Vec::new(),
+            added_delete_files: Vec::new(),
             deleted_data_files: Vec::new(),
             deleted_delete_files: Vec::new(),
             filter_manager: ManifestFilterManager::new(true),
@@ -339,6 +344,10 @@ impl MergingSnapshotProducer {
 
     pub(crate) fn add_data_file(&mut self, file: DataFile) {
         self.added_data_files.push(file);
+    }
+
+    pub(crate) fn add_delete_file(&mut self, file: DataFile, data_sequence_number: i64) {
+        self.added_delete_files.push((file, data_sequence_number));
     }
 
     pub(crate) fn delete_data_file(&mut self, file: DataFile) {
@@ -353,6 +362,10 @@ impl MergingSnapshotProducer {
 
     pub(crate) fn added_data_files(&self) -> &[DataFile] {
         &self.added_data_files
+    }
+
+    pub(crate) fn added_delete_files(&self) -> &[(DataFile, i64)] {
+        &self.added_delete_files
     }
 
     pub(crate) fn deleted_data_files(&self) -> &[DataFile] {
@@ -380,6 +393,79 @@ impl MergingSnapshotProducer {
         Ok(())
     }
 
+    /// Reject an added delete file that this table cannot hold as given, as
+    /// Java's `validateNewDeleteFile` does, and check its partition against
+    /// its own spec.
+    fn validate_added_delete_files(&self, table: &Table) -> Result<()> {
+        let metadata = table.metadata();
+        let format_version = metadata.format_version();
+        let snapshot_sequence_number = metadata.next_sequence_number();
+        for (file, sequence_number) in &self.added_delete_files {
+            match file.content_type() {
+                DataContentType::Data => {
+                    return Err(invalid_data!(
+                        "Cannot add {} as a delete file: it is a data file",
+                        file.file_path
+                    ));
+                }
+                DataContentType::EqualityDeletes
+                    if file.equality_ids.as_ref().is_none_or(Vec::is_empty) =>
+                {
+                    return Err(invalid_data!(
+                        "Cannot add equality delete file {} without equality ids",
+                        file.file_path
+                    ));
+                }
+                _ => {}
+            }
+            if format_version == FormatVersion::V1 {
+                return Err(invalid_data!(
+                    "Cannot add delete file {}: delete files need format version 2 or above",
+                    file.file_path
+                ));
+            }
+            let is_deletion_vector =
+                file.file_format == DataFileFormat::Puffin || file.content_offset.is_some();
+            if is_deletion_vector {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "Cannot add deletion vector {}: adding deletion vectors is not supported",
+                        file.file_path
+                    ),
+                ));
+            }
+            if format_version >= FormatVersion::V3
+                && file.content_type() == DataContentType::PositionDeletes
+            {
+                return Err(invalid_data!(
+                    "Cannot add position delete file {}: format version {format_version} needs deletion vectors for position deletes",
+                    file.file_path
+                ));
+            }
+            if *sequence_number < 0 || *sequence_number > snapshot_sequence_number {
+                return Err(invalid_data!(
+                    "Cannot add delete file {} with data sequence number {sequence_number}: it must be between 0 and the snapshot's {snapshot_sequence_number}",
+                    file.file_path
+                ));
+            }
+            let spec = metadata
+                .partition_spec_by_id(file.partition_spec_id)
+                .ok_or_else(|| {
+                    invalid_data!(
+                        "Cannot add delete file {}: partition spec {} is not in the table",
+                        file.file_path,
+                        file.partition_spec_id
+                    )
+                })?;
+            SnapshotProducer::validate_partition_value(
+                file.partition(),
+                &spec.partition_type(metadata.current_schema())?,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Produce manifests, compute summary, and commit a new snapshot.
     ///
     /// Added files get `data_sequence_number` if set, and otherwise inherit
@@ -390,6 +476,7 @@ impl MergingSnapshotProducer {
         data_sequence_number: Option<i64>,
     ) -> Result<ActionCommit> {
         Self::validate_data_sequence_number(table, data_sequence_number)?;
+        self.validate_added_delete_files(table)?;
         // Create the SnapshotProducer first so we can use its snapshot_id
         // for new manifests. This ensures the manifest list writer can
         // assign sequence numbers to manifests from this snapshot.
@@ -398,6 +485,12 @@ impl MergingSnapshotProducer {
             .with_commit_uuid(self.commit_uuid)
             .with_snapshot_properties(HashMap::new())
             .with_added_data_files(self.added_data_files.clone())
+            .with_added_delete_files(
+                self.added_delete_files
+                    .iter()
+                    .map(|(file, _)| file.clone())
+                    .collect(),
+            )
             .build();
         snapshot_producer.validate_added_data_files()?;
         snapshot_producer.validate_duplicate_files().await?;
@@ -442,6 +535,10 @@ impl MergingSnapshotProducer {
                 .await?;
             filtered_manifests.push(added_manifest);
         }
+        filtered_manifests.extend(
+            self.write_added_delete_manifests(table, snapshot_id, &self.manifest_counter)
+                .await?,
+        );
 
         // 4. Compute summary (added + removed).
         let summary = self.build_summary(table, removed_collector)?;
@@ -500,6 +597,50 @@ impl MergingSnapshotProducer {
         writer.write_manifest_file().await
     }
 
+    /// Writes one delete manifest per partition spec of the added delete
+    /// files, each entry with its own data sequence number.
+    async fn write_added_delete_manifests(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+        manifest_counter: &AtomicU64,
+    ) -> Result<Vec<ManifestFile>> {
+        let mut by_spec: BTreeMap<i32, Vec<&(DataFile, i64)>> = BTreeMap::new();
+        for added in &self.added_delete_files {
+            by_spec
+                .entry(added.0.partition_spec_id)
+                .or_default()
+                .push(added);
+        }
+        let mut manifests = Vec::with_capacity(by_spec.len());
+        for (spec_id, files) in by_spec {
+            let new_manifest_path = format!(
+                "{}/{}-m{}.{}",
+                table.metadata().metadata_location()?,
+                self.commit_uuid,
+                manifest_counter.fetch_add(1, Ordering::Relaxed),
+                DataFileFormat::Avro,
+            );
+            let spec = table
+                .metadata()
+                .partition_spec_by_id(spec_id)
+                .ok_or_else(|| invalid_data!("Partition spec {spec_id} is not in the table"))?;
+            let mut writer = new_manifest_writer(
+                table,
+                table.file_io().new_output(new_manifest_path)?,
+                Some(snapshot_id),
+                ManifestContentType::Deletes,
+                table.metadata().current_schema().clone(),
+                spec.as_ref().clone(),
+            )?;
+            for (file, sequence_number) in files {
+                writer.add_file(file.clone(), *sequence_number)?;
+            }
+            manifests.push(writer.write_manifest_file().await?);
+        }
+        Ok(manifests)
+    }
+
     fn build_summary(
         &self,
         table: &Table,
@@ -521,6 +662,17 @@ impl MergingSnapshotProducer {
         );
         for file in &self.added_data_files {
             collector.add_file(file, schema.clone(), partition_spec.clone());
+        }
+        for (file, _) in &self.added_delete_files {
+            let spec = table_metadata
+                .partition_spec_by_id(file.partition_spec_id)
+                .ok_or_else(|| {
+                    invalid_data!(
+                        "Partition spec {} is not in the table",
+                        file.partition_spec_id
+                    )
+                })?;
+            collector.add_file(file, schema.clone(), spec.clone());
         }
 
         let summary = Summary {

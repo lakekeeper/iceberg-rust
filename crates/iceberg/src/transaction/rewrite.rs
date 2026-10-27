@@ -17,10 +17,12 @@
 
 //! Transaction action for rewriting data files (compaction).
 //!
-//! [`RewriteFilesAction`] replaces a set of data files with a new set while
-//! keeping the logical table contents unchanged. This is used for compaction —
-//! merging many small files into fewer large ones — and for removing delete
-//! files that no longer apply to any live data file.
+//! [`RewriteFilesAction`] replaces a set of data files or delete files with a
+//! new set while keeping the logical table contents unchanged. This is used
+//! for compaction — merging many small data files into fewer large ones — for
+//! removing delete files that no longer apply to any live data file, and for
+//! compacting position delete files into fewer files that keep their data
+//! sequence numbers.
 //!
 //! The resulting snapshot uses [`Operation::Replace`] to indicate that files
 //! were reorganised without changing the data.
@@ -163,8 +165,34 @@ impl RewriteFilesAction {
         self
     }
 
-    /// Set the data sequence number recorded for every added file, in place
-    /// of the starting snapshot's.
+    /// Register a delete file to be added to the table, committed with the
+    /// given data sequence number.
+    ///
+    /// This replaces delete files removed with
+    /// [`delete_delete_file`](Self::delete_delete_file), as Java's
+    /// `RewriteFiles.addFile(DeleteFile, long)`. The sequence number decides
+    /// which data files the delete records apply to, so to keep that set
+    /// unchanged, pass the maximum data sequence number of the position delete
+    /// files the added file combines. Equality delete files apply strictly
+    /// below their own sequence number, so each may only combine files of one
+    /// sequence number, and keeps it.
+    ///
+    /// The commit is refused for a data file, a file whose sequence number is
+    /// negative or above the next snapshot's, an equality delete file without
+    /// equality ids, a position delete file on a V3 table (V3 holds position
+    /// deletes as deletion vectors), any delete file on a V1 table (V1 has no
+    /// delete files), or a partition that does not match the file's own
+    /// partition spec. Adding a deletion vector is refused with
+    /// [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported).
+    pub fn add_delete_file(mut self, file: DataFile, data_sequence_number: i64) -> Self {
+        self.producer.add_delete_file(file, data_sequence_number);
+        self
+    }
+
+    /// Set the data sequence number recorded for every added data file, in
+    /// place of the starting snapshot's. An added delete file is not affected:
+    /// it carries the sequence number given to
+    /// [`add_delete_file`](Self::add_delete_file).
     ///
     /// A value below the starting snapshot's sequence number is refused at
     /// commit: older equality deletes would then apply to rows of replaced
@@ -210,6 +238,13 @@ impl RewriteFilesAction {
         if deleted_data_files.is_empty() && !self.producer.added_data_files().is_empty() {
             return Err(invalid_data!(
                 "Data files to add must be empty because there's no data file to be rewritten"
+            ));
+        }
+        // As in Java: a rewrite only reorganises delete records, it must not
+        // introduce new ones.
+        if deleted_delete_files.is_empty() && !self.producer.added_delete_files().is_empty() {
+            return Err(invalid_data!(
+                "Delete files to add must be empty because there's no delete file to be rewritten"
             ));
         }
         Ok(())
@@ -2282,6 +2317,474 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::DataInvalid, "{case}");
             assert_eq!(err.message(), message, "{case}");
         }
+    }
+
+    /// Replacing two position delete files, staged at different sequence
+    /// numbers, with one combined file: the new entry is Added in a delete
+    /// manifest with the given (maximum) data sequence number, the replaced
+    /// files are recorded Deleted with their own, and the summary counts the
+    /// swap.
+    #[tokio::test]
+    async fn test_rewrite_files_replaces_position_delete_files() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let data = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![data]).await;
+        let first = make_delete_file(
+            &table,
+            "test/1-deletes-a.parquet",
+            DataContentType::PositionDeletes,
+            2,
+        );
+        let second = make_delete_file(
+            &table,
+            "test/1-deletes-b.parquet",
+            DataContentType::PositionDeletes,
+            3,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![first.clone()]).await;
+        let first_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+        let table = stage_delete_files(&catalog, &table, vec![second.clone()]).await;
+        let second_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+        assert_eq!((first_seq, second_seq), (2, 3));
+
+        let merged = make_delete_file(
+            &table,
+            "test/1-deletes.parquet",
+            DataContentType::PositionDeletes,
+            5,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_delete_file(first)
+            .delete_delete_file(second)
+            .add_delete_file(merged, second_seq);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Replace);
+        assert_eq!(
+            snapshot.summary().additional_properties,
+            properties(&[
+                ("added-delete-files", "1"),
+                ("added-files-size", "100"),
+                ("added-position-delete-files", "1"),
+                ("added-position-deletes", "5"),
+                ("changed-partition-count", "1"),
+                ("removed-delete-files", "2"),
+                ("removed-files-size", "200"),
+                ("removed-position-delete-files", "2"),
+                ("removed-position-deletes", "5"),
+                ("total-data-files", "1"),
+                ("total-delete-files", "1"),
+                ("total-equality-deletes", "0"),
+                ("total-files-size", "200"),
+                ("total-position-deletes", "5"),
+                ("total-records", "10"),
+            ])
+        );
+
+        // The added entry carries the explicit data sequence number; its file
+        // sequence number is the new snapshot's. The replaced entries keep
+        // their own sequence numbers, owned by the removing snapshot.
+        let mut delete_entries = Vec::new();
+        for manifest_file in manifests_of(&table, ManifestContentType::Deletes).await {
+            delete_entries.extend(entries_of(&table, &manifest_file).await);
+        }
+        delete_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let snapshot_id = Some(snapshot.snapshot_id());
+        assert_eq!(delete_entries, vec![
+            (
+                "test/1-deletes-a.parquet".to_string(),
+                ManifestStatus::Deleted,
+                snapshot_id,
+                Some(first_seq),
+                Some(first_seq),
+            ),
+            (
+                "test/1-deletes-b.parquet".to_string(),
+                ManifestStatus::Deleted,
+                snapshot_id,
+                Some(second_seq),
+                Some(second_seq),
+            ),
+            (
+                "test/1-deletes.parquet".to_string(),
+                ManifestStatus::Added,
+                snapshot_id,
+                Some(second_seq),
+                Some(snapshot.sequence_number()),
+            ),
+        ]);
+    }
+
+    /// Replacing an equality delete file keeps its sequence number: an
+    /// equality delete applies strictly below its own sequence number, so the
+    /// replacement carries the replaced file's.
+    #[tokio::test]
+    async fn test_rewrite_files_replaces_an_equality_delete_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let data = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![data]).await;
+        let equality = make_delete_file(
+            &table,
+            "test/1-eq-deletes.parquet",
+            DataContentType::EqualityDeletes,
+            2,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![equality.clone()]).await;
+        let staged_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        let replacement = make_delete_file(
+            &table,
+            "test/1-eq-deletes-new.parquet",
+            DataContentType::EqualityDeletes,
+            2,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_delete_file(equality)
+            .add_delete_file(replacement, staged_seq);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let added = find_entry(&table, snapshot, "test/1-eq-deletes-new.parquet")
+            .await
+            .unwrap();
+        assert_eq!(added.status(), ManifestStatus::Added);
+        assert_eq!(added.sequence_number(), Some(staged_seq));
+        let summary = &snapshot.summary().additional_properties;
+        assert_eq!(summary.get("added-equality-delete-files").unwrap(), "1");
+        assert_eq!(summary.get("removed-equality-delete-files").unwrap(), "1");
+        assert_eq!(summary.get("total-equality-deletes").unwrap(), "2");
+    }
+
+    /// Added delete files of different partition specs go into one delete
+    /// manifest per spec, each entry under its own partition spec and with its
+    /// own data sequence number.
+    #[tokio::test]
+    async fn test_rewrite_files_adds_delete_files_under_their_own_spec() {
+        let catalog = new_memory_catalog().await;
+        let table = make_identity_ts_table(&catalog, FormatVersion::V2).await;
+        let old_data = make_file_in_spec(
+            "test/old-1.parquet",
+            10,
+            0,
+            Literal::timestamptz(TS_MORNING),
+        );
+        let table = append_files(&catalog, &table, vec![old_data]).await;
+        let old_partition = Struct::from_iter([Some(Literal::timestamptz(TS_MORNING))]);
+        let old_delete = file_in_spec(
+            "test/old-deletes.parquet",
+            DataContentType::PositionDeletes,
+            0,
+            old_partition.clone(),
+            None,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![old_delete.clone()]).await;
+        let old_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        let table = evolve_to_day_ts(&catalog, &table).await;
+        let new_data = make_file_in_spec("test/new-1.parquet", 10, 1, Literal::date(DAY));
+        let table = append_files(&catalog, &table, vec![new_data]).await;
+        let new_partition = Struct::from_iter([Some(Literal::date(DAY))]);
+        let new_delete = file_in_spec(
+            "test/new-deletes.parquet",
+            DataContentType::PositionDeletes,
+            1,
+            new_partition.clone(),
+            None,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![new_delete.clone()]).await;
+        let new_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+        assert!(old_seq < new_seq);
+
+        let old_replacement = file_in_spec(
+            "test/old-deletes-new.parquet",
+            DataContentType::PositionDeletes,
+            0,
+            old_partition,
+            None,
+        );
+        let new_replacement = file_in_spec(
+            "test/new-deletes-new.parquet",
+            DataContentType::PositionDeletes,
+            1,
+            new_partition,
+            None,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_delete_file(old_delete)
+            .delete_delete_file(new_delete)
+            .add_delete_file(old_replacement, old_seq)
+            .add_delete_file(new_replacement, new_seq);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        // Each added entry sits in a delete manifest of its own spec and
+        // keeps the sequence number it was given.
+        let mut added = Vec::new();
+        for manifest_file in manifests_of(&table, ManifestContentType::Deletes).await {
+            let manifest = table.manifest_reader().read(&manifest_file).await.unwrap();
+            for entry in manifest.entries() {
+                if entry.status() == ManifestStatus::Added {
+                    added.push((
+                        entry.file_path().to_string(),
+                        manifest_file.partition_spec_id,
+                        entry.sequence_number(),
+                    ));
+                }
+            }
+        }
+        added.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(added, vec![
+            ("test/new-deletes-new.parquet".to_string(), 1, Some(new_seq)),
+            ("test/old-deletes-new.parquet".to_string(), 0, Some(old_seq)),
+        ]);
+    }
+
+    /// An added delete file is refused what Java refuses: wrong content, a
+    /// missing rewrite target, bad equality ids, a sequence number out of
+    /// range, an unknown spec, or a path the table already references.
+    #[tokio::test]
+    async fn test_rewrite_files_refuses_invalid_delete_file_adds() {
+        let catalog = new_memory_catalog().await;
+        let (table, data, deletes) = table_with_position_delete(&catalog).await;
+        let next_seq = table.metadata().next_sequence_number();
+        let added_data = make_data_file(&table, "test/added.parquet", 10, 100);
+        let new_pos = make_delete_file(
+            &table,
+            "test/new-deletes.parquet",
+            DataContentType::PositionDeletes,
+            1,
+        );
+        let mut eq_without_ids = make_delete_file(
+            &table,
+            "test/eq-deletes.parquet",
+            DataContentType::EqualityDeletes,
+            1,
+        );
+        eq_without_ids.equality_ids = None;
+        let mut unknown_spec = make_delete_file(
+            &table,
+            "test/spec7-deletes.parquet",
+            DataContentType::PositionDeletes,
+            1,
+        );
+        unknown_spec.partition_spec_id = 7;
+        let referenced = make_delete_file(
+            &table,
+            "test/1-deletes.parquet",
+            DataContentType::PositionDeletes,
+            1,
+        );
+
+        let cases: [(&str, RewriteFilesAction, String); 7] = [
+            (
+                "data file given to add_delete_file",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(deletes.clone())
+                    .add_delete_file(added_data, 1),
+                "Cannot add test/added.parquet as a delete file: it is a data file".to_string(),
+            ),
+            (
+                "delete file added without a delete file removed",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_file(data.clone())
+                    .add_delete_file(new_pos.clone(), 1),
+                "Delete files to add must be empty because there's no delete file to be rewritten"
+                    .to_string(),
+            ),
+            (
+                "equality delete file without equality ids",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(deletes.clone())
+                    .add_delete_file(eq_without_ids, 1),
+                "Cannot add equality delete file test/eq-deletes.parquet without equality ids"
+                    .to_string(),
+            ),
+            (
+                "sequence number above the next snapshot's",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(deletes.clone())
+                    .add_delete_file(new_pos.clone(), next_seq + 1),
+                format!(
+                    "Cannot add delete file test/new-deletes.parquet with data sequence number {}: it must be between 0 and the snapshot's {next_seq}",
+                    next_seq + 1
+                ),
+            ),
+            (
+                "negative sequence number",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(deletes.clone())
+                    .add_delete_file(new_pos.clone(), -1),
+                format!(
+                    "Cannot add delete file test/new-deletes.parquet with data sequence number -1: it must be between 0 and the snapshot's {next_seq}"
+                ),
+            ),
+            (
+                "unknown partition spec",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(deletes.clone())
+                    .add_delete_file(unknown_spec, 1),
+                "Cannot add delete file test/spec7-deletes.parquet: partition spec 7 is not in the table"
+                    .to_string(),
+            ),
+            (
+                "path already referenced by the table",
+                Transaction::new(&table)
+                    .rewrite_files()
+                    .delete_delete_file(deletes.clone())
+                    .add_delete_file(referenced, 1),
+                "Cannot add files that are already referenced by table, files: test/1-deletes.parquet"
+                    .to_string(),
+            ),
+        ];
+        for (case, action, message) in cases {
+            let Err(err) = Arc::new(action).commit(&table).await else {
+                panic!("{case}: the rewrite must be refused");
+            };
+            assert_eq!(err.kind(), ErrorKind::DataInvalid, "{case}");
+            assert_eq!(err.message(), message, "{case}");
+        }
+    }
+
+    /// A V3 table holds position deletes as deletion vectors: adding a
+    /// position delete parquet file is refused, and adding a deletion vector
+    /// is not supported yet.
+    #[tokio::test]
+    async fn test_rewrite_files_refuses_delete_file_adds_on_v3() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let data = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![data]).await;
+        let staged = make_delete_file(
+            &table,
+            "test/1-deletes.parquet",
+            DataContentType::PositionDeletes,
+            2,
+        );
+        let table = stage_delete_files(&catalog, &table, vec![staged.clone()]).await;
+        let staged_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        let replacement = make_delete_file(
+            &table,
+            "test/1-deletes-new.parquet",
+            DataContentType::PositionDeletes,
+            2,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_delete_file(staged.clone())
+            .add_delete_file(replacement, staged_seq);
+        let err = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "Cannot add position delete file test/1-deletes-new.parquet: format version v3 needs deletion vectors for position deletes"
+        );
+
+        let mut vector = make_delete_file(
+            &table,
+            "test/1-deletes.puffin",
+            DataContentType::PositionDeletes,
+            2,
+        );
+        vector.file_format = DataFileFormat::Puffin;
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_delete_file(staged)
+            .add_delete_file(vector, staged_seq);
+        let err = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert_eq!(
+            err.message(),
+            "Cannot add deletion vector test/1-deletes.puffin: adding deletion vectors is not supported"
+        );
+    }
+
+    /// A V1 table has no delete files, so adding one is refused.
+    #[tokio::test]
+    async fn test_rewrite_files_refuses_delete_file_adds_on_v1() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v1_minimal_table_in_catalog(&catalog).await;
+        let data = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![data]).await;
+
+        let ghost = make_delete_file(
+            &table,
+            "test/ghost-deletes.parquet",
+            DataContentType::PositionDeletes,
+            1,
+        );
+        let replacement = make_delete_file(
+            &table,
+            "test/new-deletes.parquet",
+            DataContentType::PositionDeletes,
+            1,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_delete_file(ghost)
+            .add_delete_file(replacement, 0);
+        let err = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "Cannot add delete file test/new-deletes.parquet: delete files need format version 2 or above"
+        );
     }
 
     /// Removing one of two deletion vectors in the same Puffin file leaves the
