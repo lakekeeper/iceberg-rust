@@ -21,6 +21,8 @@ use std::num::NonZeroUsize;
 pub mod location;
 /// Utilities for working with snapshots.
 pub mod snapshot;
+/// Truncation of string and binary values to lower and upper bounds.
+pub mod truncate;
 
 // Use a default value of 1 as the safest option.
 // See https://doc.rust-lang.org/std/thread/fn.available_parallelism.html#limitations

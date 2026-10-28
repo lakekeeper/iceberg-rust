@@ -24,6 +24,7 @@ use super::TransformFunction;
 use crate::Error;
 use crate::error::invalid_data;
 use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType};
+use crate::util::truncate;
 
 #[derive(Debug)]
 pub struct Truncate {
@@ -37,15 +38,12 @@ impl Truncate {
 
     #[inline]
     fn truncate_str(s: &str, width: usize) -> &str {
-        match s.char_indices().nth(width) {
-            None => s,
-            Some((idx, _)) => &s[..idx],
-        }
+        truncate::truncate_string(s, width)
     }
 
     #[inline]
     fn truncate_binary(s: &[u8], width: usize) -> &[u8] {
-        if s.len() > width { &s[0..width] } else { s }
+        truncate::truncate_binary(s, width)
     }
 
     #[inline]

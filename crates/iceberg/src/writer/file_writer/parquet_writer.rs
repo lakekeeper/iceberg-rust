@@ -48,7 +48,8 @@ use crate::spec::{
     StructType, TableMetadata, TableProperties, Type, VariantType, visit_schema,
 };
 use crate::transform::create_transform_function;
-use crate::writer::{CurrentFileStatus, DataFile};
+use crate::writer::metrics_config::ColumnMetrics;
+use crate::writer::{CurrentFileStatus, DataFile, MetricsConfig};
 use crate::{Error, ErrorKind, Result};
 
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
@@ -58,6 +59,7 @@ pub struct ParquetWriterBuilder {
     schema: SchemaRef,
     match_mode: FieldMatchMode,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    metrics_config: MetricsConfig,
 }
 
 impl ParquetWriterBuilder {
@@ -82,6 +84,7 @@ impl ParquetWriterBuilder {
             schema,
             match_mode,
             encryption_manager: None,
+            metrics_config: MetricsConfig::full(),
         }
     }
 
@@ -125,6 +128,16 @@ impl ParquetWriterBuilder {
     /// Set the [`EncryptionManager`] used to encrypt written files.
     pub fn with_encryption_manager(mut self, encryption_manager: Arc<EncryptionManager>) -> Self {
         self.encryption_manager = Some(encryption_manager);
+        self
+    }
+
+    /// Set the [`MetricsConfig`] that decides which column metrics written
+    /// files record. Defaults to [`MetricsConfig::full`]; use
+    /// [`MetricsConfig::for_table`] to honour a table's
+    /// `write.metadata.metrics.*` properties, and
+    /// [`MetricsConfig::for_position_delete`] for position delete files.
+    pub fn with_metrics_config(mut self, metrics_config: MetricsConfig) -> Self {
+        self.metrics_config = metrics_config;
         self
     }
 }
@@ -177,6 +190,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
             key_metadata,
+            metrics_config: self.metrics_config.clone(),
         })
     }
 }
@@ -312,6 +326,7 @@ pub struct ParquetWriter {
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
     key_metadata: Option<StandardKeyMetadata>,
+    metrics_config: MetricsConfig,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -477,6 +492,7 @@ impl ParquetWriter {
                 // TODO: Implement nan_value_counts here
                 HashMap::new(),
                 None,
+                &MetricsConfig::for_table(table_metadata),
             )?;
             builder.partition_spec_id(table_metadata.default_partition_spec_id());
             let data_file = builder.build().unwrap();
@@ -486,7 +502,9 @@ impl ParquetWriter {
         Ok(data_files)
     }
 
-    /// `ParquetMetadata` to data file builder
+    /// `ParquetMetadata` to data file builder. `metrics_config` decides which
+    /// column metrics the data file records and how long its string and binary
+    /// bounds are.
     pub fn parquet_to_data_file_builder(
         schema: SchemaRef,
         metadata: Arc<ParquetMetaData>,
@@ -494,6 +512,7 @@ impl ParquetWriter {
         file_path: String,
         nan_value_counts: HashMap<i32, u64>,
         key_metadata: Option<StandardKeyMetadata>,
+        metrics_config: &MetricsConfig,
     ) -> Result<DataFileBuilder> {
         let index_by_parquet_path = {
             let mut visitor = IndexByParquetPathName::new();
@@ -548,6 +567,16 @@ impl ParquetWriter {
             )
         };
 
+        let mut metrics = ColumnMetrics {
+            column_sizes,
+            value_counts,
+            null_value_counts,
+            nan_value_counts,
+            lower_bounds,
+            upper_bounds,
+        };
+        metrics_config.apply(&mut metrics);
+
         let key_metadata = match key_metadata {
             Some(m) => Some(m.encode()?.into_vec()),
             None => None,
@@ -561,14 +590,14 @@ impl ParquetWriter {
             .partition(Struct::empty())
             .record_count(metadata.file_metadata().num_rows() as u64)
             .file_size_in_bytes(written_size as u64)
-            .column_sizes(column_sizes)
-            .value_counts(value_counts)
-            .null_value_counts(null_value_counts)
-            .nan_value_counts(nan_value_counts)
+            .column_sizes(metrics.column_sizes)
+            .value_counts(metrics.value_counts)
+            .null_value_counts(metrics.null_value_counts)
+            .nan_value_counts(metrics.nan_value_counts)
             // # NOTE:
             // - We can ignore implementing distinct_counts due to this: https://lists.apache.org/thread/j52tsojv0x4bopxyzsp7m7bqt23n5fnd
-            .lower_bounds(lower_bounds)
-            .upper_bounds(upper_bounds)
+            .lower_bounds(metrics.lower_bounds)
+            .upper_bounds(metrics.upper_bounds)
             .key_metadata(key_metadata)
             .split_offsets(Some(
                 metadata
@@ -736,6 +765,7 @@ impl FileWriter for ParquetWriter {
                 self.output_file.location().to_string(),
                 self.nan_value_count_visitor.nan_value_counts,
                 self.key_metadata,
+                &self.metrics_config,
             )?])
         }
     }
@@ -2625,6 +2655,105 @@ mod tests {
         Ok(())
     }
 
+    /// A table's `write.metadata.metrics.*` properties decide what a written
+    /// file records: Java-style `truncate(16)` bounds by default, and per-column
+    /// `counts` and `none`.
+    #[tokio::test]
+    async fn test_metrics_config_shapes_written_metrics() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "s", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(2, "b", Type::Primitive(PrimitiveType::Binary)).into(),
+                    NestedField::required(3, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let low = format!("a{}", "b".repeat(30));
+        let high = "z".repeat(30);
+        let to_write = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(arrow_array::StringArray::from(vec![
+                low.as_str(),
+                high.as_str(),
+            ])) as ArrayRef,
+            Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                low.as_bytes(),
+                high.as_bytes(),
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0, f64::NAN])) as ArrayRef,
+        ])
+        .unwrap();
+        let properties = HashMap::from([
+            (
+                format!(
+                    "{}b",
+                    TableProperties::PROPERTY_WRITE_METADATA_METRICS_COLUMN_PREFIX
+                ),
+                "counts".to_string(),
+            ),
+            (
+                format!(
+                    "{}d",
+                    TableProperties::PROPERTY_WRITE_METADATA_METRICS_COLUMN_PREFIX
+                ),
+                "none".to_string(),
+            ),
+        ]);
+        let metrics_config = MetricsConfig::from_properties(&properties, &schema, None, None);
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+            .with_metrics_config(metrics_config)
+            .build(output_file)
+            .await?;
+        pw.write(&to_write).await?;
+        let data_file = pw
+            .close()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap()
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            data_file
+                .column_sizes()
+                .keys()
+                .copied()
+                .sorted()
+                .collect_vec(),
+            vec![1, 2]
+        );
+        assert_eq!(*data_file.value_counts(), HashMap::from([(1, 2), (2, 2)]));
+        assert_eq!(
+            *data_file.null_value_counts(),
+            HashMap::from([(1, 0), (2, 0)])
+        );
+        assert_eq!(*data_file.nan_value_counts(), HashMap::new());
+        assert_eq!(
+            *data_file.lower_bounds(),
+            HashMap::from([(1, Datum::string(format!("a{}", "b".repeat(15))))])
+        );
+        assert_eq!(
+            *data_file.upper_bounds(),
+            HashMap::from([(1, Datum::string(format!("{}{{", "z".repeat(15))))])
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_column_chunk_without_statistics_or_null_count() {
         let parquet_schema = Arc::new(SchemaDescriptor::new(Arc::new(
@@ -2682,6 +2811,7 @@ mod tests {
             "file.parquet".to_string(),
             HashMap::new(),
             None,
+            &MetricsConfig::full(),
         )
         .unwrap()
         .partition_spec_id(0)

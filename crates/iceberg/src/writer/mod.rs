@@ -386,9 +386,11 @@
 
 pub mod base_writer;
 pub mod file_writer;
+mod metrics_config;
 pub mod partitioning;
 
 use arrow_array::RecordBatch;
+pub use metrics_config::{MetricsConfig, MetricsMode};
 
 use crate::Result;
 use crate::spec::{DataFile, PartitionKey};

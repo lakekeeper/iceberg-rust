@@ -1436,9 +1436,6 @@ mod test {
         // to four character, and then appending the "ボ" character,
         // which occupies the next code point after the 5th
         // character in the string above, "ホ".
-        // In the Java implementation of Iceberg, this is done by
-        // the `truncateStringMax` function, but we don't yet have
-        // this implemented in iceberg-rust.
         let above_max = "イロハニボ";
 
         let result = InclusiveMetricsEvaluator::eval(
