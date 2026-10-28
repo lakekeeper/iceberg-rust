@@ -42,6 +42,22 @@ use crate::transaction::merging::MergingSnapshotProducer;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::util::snapshot::ancestors_of;
 
+/// Context key of the error a refused rewrite returns. Its value names the
+/// rule that refused the commit: [`REWRITE_REFUSAL_NEW_DELETE`],
+/// [`REWRITE_REFUSAL_NOT_ANCESTOR`] or [`REWRITE_REFUSAL_INPUT_GONE`].
+///
+/// A caller reads it with [`Error::context_value`](crate::Error::context_value)
+/// to tell a refusal from other [`ErrorKind::DataInvalid`](crate::ErrorKind::DataInvalid)
+/// errors of the commit, for example a manifest that does not parse.
+pub const REWRITE_REFUSAL_CONTEXT_KEY: &str = "rewrite_refusal";
+/// A delete added after the starting snapshot applies to a replaced file.
+pub const REWRITE_REFUSAL_NEW_DELETE: &str = "new_delete";
+/// The starting snapshot is not in the current snapshot's history, so new
+/// deletes cannot be ruled out.
+pub const REWRITE_REFUSAL_NOT_ANCESTOR: &str = "not_ancestor";
+/// A file to remove is no longer in the current snapshot.
+pub const REWRITE_REFUSAL_INPUT_GONE: &str = "input_gone";
+
 /// A transaction action that rewrites (replaces) data files and removes
 /// delete files.
 ///
@@ -264,14 +280,16 @@ impl RewriteFilesAction {
         let Some(starting_snapshot_id) = self.starting_snapshot_id else {
             return Err(invalid_data!(
                 "Cannot rewrite files: the rewrite was planned against a table with no snapshot, and the table has been committed to since."
-            ));
+            )
+            .with_context(REWRITE_REFUSAL_CONTEXT_KEY, REWRITE_REFUSAL_NOT_ANCESTOR));
         };
         let Some(starting_snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) else {
             // Without the starting snapshot there is no sequence number to
             // compare against, so no delete can be ruled out.
             return Err(invalid_data!(
                 "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is no longer in the table, so deletes added since it cannot be ruled out."
-            ));
+            )
+            .with_context(REWRITE_REFUSAL_CONTEXT_KEY, REWRITE_REFUSAL_NOT_ANCESTOR));
         };
         // Sequence numbers tell new deletes from old ones only along the
         // starting snapshot's own history.
@@ -281,7 +299,8 @@ impl RewriteFilesAction {
             return Err(invalid_data!(
                 "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is not an ancestor of the current snapshot {}, so deletes added since it cannot be ruled out.",
                 current_snapshot.snapshot_id()
-            ));
+            )
+            .with_context(REWRITE_REFUSAL_CONTEXT_KEY, REWRITE_REFUSAL_NOT_ANCESTOR));
         }
         // A rewrite that replaces no data file cannot lose a delete.
         if self.producer.deleted_data_files().is_empty() {
@@ -333,7 +352,8 @@ impl RewriteFilesAction {
                         delete.content_type(),
                         delete.file_path,
                         replaced.file_path
-                    ));
+                    )
+                    .with_context(REWRITE_REFUSAL_CONTEXT_KEY, REWRITE_REFUSAL_NEW_DELETE));
                 }
             }
         }
@@ -728,13 +748,13 @@ mod tests {
         let tx = action.apply(tx).unwrap();
         let result = tx.commit(&catalog).await;
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .message()
-                .contains("at least one file to delete")
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.message(),
+            "Rewrite files requires at least one file to delete"
         );
+        // A misuse of the action is not a refusal of the commit.
+        assert_eq!(err.context_value(REWRITE_REFUSAL_CONTEXT_KEY), None);
     }
 
     /// Partial rewrite: delete 2 of 3 files, keeping one.
@@ -1159,6 +1179,10 @@ mod tests {
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert_eq!(
+            err.context_value(REWRITE_REFUSAL_CONTEXT_KEY),
+            Some(REWRITE_REFUSAL_NOT_ANCESTOR)
+        );
+        assert_eq!(
             err.message(),
             format!(
                 "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is not an ancestor of the current snapshot {rolled_back_to}, so deletes added since it cannot be ruled out."
@@ -1186,6 +1210,10 @@ mod tests {
             panic!("a rewrite planned against an empty table must be rejected");
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.context_value(REWRITE_REFUSAL_CONTEXT_KEY),
+            Some(REWRITE_REFUSAL_NOT_ANCESTOR)
+        );
         assert_eq!(
             err.message(),
             "Cannot rewrite files: the rewrite was planned against a table with no snapshot, and the table has been committed to since."
@@ -1229,6 +1257,10 @@ mod tests {
             panic!("an expired starting snapshot must be rejected");
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.context_value(REWRITE_REFUSAL_CONTEXT_KEY),
+            Some(REWRITE_REFUSAL_NOT_ANCESTOR)
+        );
         assert_eq!(
             err.message(),
             format!(
@@ -2273,6 +2305,10 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert_eq!(
+            err.context_value(REWRITE_REFUSAL_CONTEXT_KEY),
+            Some(REWRITE_REFUSAL_INPUT_GONE)
+        );
+        assert_eq!(
             err.message(),
             "Failed to find the following files to delete in the current snapshot: test/ghost-deletes.parquet"
         );
@@ -3105,6 +3141,12 @@ mod tests {
 
             let outcome = action.commit(&table).await.map(|_| ()).map_err(|err| {
                 assert_eq!(err.kind(), ErrorKind::DataInvalid, "{}", case.name);
+                assert_eq!(
+                    err.context_value(REWRITE_REFUSAL_CONTEXT_KEY),
+                    Some(REWRITE_REFUSAL_NEW_DELETE),
+                    "{}",
+                    case.name
+                );
                 err.message().to_string()
             });
             let expected = case.refused.map_or(Ok(()), |content| {
@@ -3699,6 +3741,12 @@ mod tests {
                 .map(|_| ())
                 .map_err(|err| {
                     assert_eq!(err.kind(), ErrorKind::DataInvalid, "{}", case.name);
+                    assert_eq!(
+                        err.context_value(REWRITE_REFUSAL_CONTEXT_KEY),
+                        Some(REWRITE_REFUSAL_NEW_DELETE),
+                        "{}",
+                        case.name
+                    );
                     err.message().to_string()
                 });
             let expected = case.refused.map_or(Ok(()), |replaced| {
@@ -3852,6 +3900,10 @@ mod tests {
             panic!("a new delete for the replaced file must be rejected");
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.context_value(REWRITE_REFUSAL_CONTEXT_KEY),
+            Some(REWRITE_REFUSAL_NEW_DELETE)
+        );
         assert_eq!(
             err.message(),
             format!(

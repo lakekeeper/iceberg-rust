@@ -331,6 +331,19 @@ impl Error {
     pub fn message(&self) -> &str {
         self.message.as_str()
     }
+
+    /// Return the context entries added with [`Error::with_context`], in order.
+    pub fn context(&self) -> &[(&'static str, String)] {
+        &self.context
+    }
+
+    /// Return the value of the first context entry with `key`.
+    pub fn context_value(&self, key: &str) -> Option<&str> {
+        self.context
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 macro_rules! define_from_err {
@@ -571,6 +584,21 @@ Context:
 Source: networking error
 "#
         )
+    }
+
+    #[test]
+    fn test_error_context_entries() {
+        let err = Error::new(ErrorKind::DataInvalid, "refused")
+            .with_context("rule", "first")
+            .with_context("path", "s3://bucket/file.parquet")
+            .with_context("rule", "second");
+        assert_eq!(err.context(), &[
+            ("rule", "first".to_string()),
+            ("path", "s3://bucket/file.parquet".to_string()),
+            ("rule", "second".to_string()),
+        ]);
+        assert_eq!(err.context_value("rule"), Some("first"));
+        assert_eq!(err.context_value("missing"), None);
     }
 
     #[test]

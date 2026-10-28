@@ -81,7 +81,10 @@ use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 pub use crate::transaction::overwrite::OverwriteAction;
-pub use crate::transaction::rewrite::RewriteFilesAction;
+pub use crate::transaction::rewrite::{
+    REWRITE_REFUSAL_CONTEXT_KEY, REWRITE_REFUSAL_INPUT_GONE, REWRITE_REFUSAL_NEW_DELETE,
+    REWRITE_REFUSAL_NOT_ANCESTOR, RewriteFilesAction,
+};
 pub use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;

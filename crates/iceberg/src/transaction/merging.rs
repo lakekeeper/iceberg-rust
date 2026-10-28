@@ -36,6 +36,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+use crate::transaction::rewrite::{REWRITE_REFUSAL_CONTEXT_KEY, REWRITE_REFUSAL_INPUT_GONE};
 use crate::transaction::snapshot::SnapshotProducer;
 use crate::{Error, ErrorKind};
 
@@ -291,7 +292,8 @@ impl ManifestFilterManager {
                 return Err(invalid_data!(
                     "Failed to find the following files to delete in the current snapshot: {}",
                     missing.join(", "),
-                ));
+                )
+                .with_context(REWRITE_REFUSAL_CONTEXT_KEY, REWRITE_REFUSAL_INPUT_GONE));
             }
         }
 
