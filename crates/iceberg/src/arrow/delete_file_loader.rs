@@ -28,7 +28,7 @@ use crate::arrow::scan_metrics::ScanMetrics;
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{Schema, SchemaRef};
-use crate::{Error, ErrorKind, Result};
+use crate::{Error, Result};
 
 /// Delete File Loader
 #[allow(unused)]
@@ -105,7 +105,7 @@ impl BasicDeleteFileLoader {
         let record_batch_stream =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata)
                 .build()?
-                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}")));
+                .map_err(Error::from);
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
