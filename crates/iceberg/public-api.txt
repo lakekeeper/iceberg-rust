@@ -3047,6 +3047,11 @@ pub const iceberg::spec::TableProperties<'_>::PROPERTY_SNAPSHOT_COUNT: &'static 
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_UUID: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_DATA_LOCATION: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_METADATA_METRICS_COLUMN_PREFIX: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_METADATA_METRICS_DEFAULT: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_METADATA_METRICS_DEFAULT_DEFAULT: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_METADATA_METRICS_MAX_INFERRED_COLUMN_DEFAULTS: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_METADATA_METRICS_MAX_INFERRED_COLUMN_DEFAULTS_DEFAULT: usize
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_METADATA_PATH: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED_DEFAULT: bool
@@ -3593,6 +3598,13 @@ pub mod iceberg::util::location
 pub mod iceberg::util::snapshot
 pub fn iceberg::util::snapshot::ancestors_between(table_metadata: &iceberg::spec::TableMetadataRef, latest_snapshot_id: i64, oldest_snapshot_id: core::option::Option<i64>) -> impl core::iter::traits::iterator::Iterator<Item = iceberg::spec::SnapshotRef> + core::marker::Send
 pub fn iceberg::util::snapshot::ancestors_of(table_metadata: &iceberg::spec::TableMetadataRef, snapshot_id: i64) -> impl core::iter::traits::iterator::Iterator<Item = iceberg::spec::SnapshotRef> + core::marker::Send
+pub mod iceberg::util::truncate
+pub fn iceberg::util::truncate::truncate_binary(input: &[u8], length: usize) -> &[u8]
+pub fn iceberg::util::truncate::truncate_binary_max(input: &[u8], length: usize) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn iceberg::util::truncate::truncate_binary_min(input: &[u8], length: usize) -> &[u8]
+pub fn iceberg::util::truncate::truncate_string(input: &str, length: usize) -> &str
+pub fn iceberg::util::truncate::truncate_string_max(input: &str, length: usize) -> core::option::Option<alloc::string::String>
+pub fn iceberg::util::truncate::truncate_string_min(input: &str, length: usize) -> &str
 pub mod iceberg::writer
 pub mod iceberg::writer::base_writer
 pub mod iceberg::writer::base_writer::data_file_writer
@@ -3713,7 +3725,7 @@ impl<B: core::fmt::Debug + iceberg::writer::file_writer::FileWriterBuilder, L: c
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::writer::file_writer::ParquetWriter
 impl iceberg::writer::file_writer::ParquetWriter
-pub fn iceberg::writer::file_writer::ParquetWriter::parquet_to_data_file_builder(schema: iceberg::spec::SchemaRef, metadata: alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>, written_size: usize, file_path: alloc::string::String, nan_value_counts: std::collections::hash::map::HashMap<i32, u64>, key_metadata: core::option::Option<iceberg::encryption::StandardKeyMetadata>) -> iceberg::Result<iceberg::spec::DataFileBuilder>
+pub fn iceberg::writer::file_writer::ParquetWriter::parquet_to_data_file_builder(schema: iceberg::spec::SchemaRef, metadata: alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>, written_size: usize, file_path: alloc::string::String, nan_value_counts: std::collections::hash::map::HashMap<i32, u64>, key_metadata: core::option::Option<iceberg::encryption::StandardKeyMetadata>, metrics_config: &iceberg::writer::MetricsConfig) -> iceberg::Result<iceberg::spec::DataFileBuilder>
 impl iceberg::writer::CurrentFileStatus for iceberg::writer::file_writer::ParquetWriter
 pub fn iceberg::writer::file_writer::ParquetWriter::current_file_path(&self) -> alloc::string::String
 pub fn iceberg::writer::file_writer::ParquetWriter::current_row_num(&self) -> usize
@@ -3728,6 +3740,7 @@ pub fn iceberg::writer::file_writer::ParquetWriterBuilder::new(props: parquet::f
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::new_with_match_mode(props: parquet::file::properties::WriterProperties, schema: iceberg::spec::SchemaRef, match_mode: iceberg::arrow::FieldMatchMode) -> Self
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::with_encryption_manager(self, encryption_manager: alloc::sync::Arc<iceberg::encryption::EncryptionManager>) -> Self
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::with_match_mode(self, match_mode: iceberg::arrow::FieldMatchMode) -> Self
+pub fn iceberg::writer::file_writer::ParquetWriterBuilder::with_metrics_config(self, metrics_config: iceberg::writer::MetricsConfig) -> Self
 impl core::clone::Clone for iceberg::writer::file_writer::ParquetWriterBuilder
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::clone(&self) -> iceberg::writer::file_writer::ParquetWriterBuilder
 impl core::fmt::Debug for iceberg::writer::file_writer::ParquetWriterBuilder
@@ -3777,6 +3790,48 @@ pub fn iceberg::writer::partitioning::clustered_writer::ClusteredWriter<B, I, O>
 impl<B, I, O> iceberg::writer::partitioning::PartitioningWriter<I, O> for iceberg::writer::partitioning::fanout_writer::FanoutWriter<B, I, O> where B: iceberg::writer::IcebergWriterBuilder<I, O>, I: core::marker::Send + 'static, O: core::iter::traits::collect::IntoIterator + core::iter::traits::collect::FromIterator<<O as core::iter::traits::collect::IntoIterator>::Item> + core::marker::Send + 'static, <O as core::iter::traits::collect::IntoIterator>::Item: core::marker::Send + core::clone::Clone
 pub fn iceberg::writer::partitioning::fanout_writer::FanoutWriter<B, I, O>::close<'async_trait>(self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<O>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait
 pub fn iceberg::writer::partitioning::fanout_writer::FanoutWriter<B, I, O>::write<'life0, 'async_trait>(&'life0 mut self, partition_key: iceberg::spec::PartitionKey, input: I) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub enum iceberg::writer::MetricsMode
+pub iceberg::writer::MetricsMode::Counts
+pub iceberg::writer::MetricsMode::Full
+pub iceberg::writer::MetricsMode::None
+pub iceberg::writer::MetricsMode::Truncate(core::num::nonzero::NonZeroUsize)
+impl iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsMode::has_bounds(&self) -> bool
+impl core::clone::Clone for iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsMode::clone(&self) -> iceberg::writer::MetricsMode
+impl core::cmp::Eq for iceberg::writer::MetricsMode
+impl core::cmp::PartialEq for iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsMode::eq(&self, other: &iceberg::writer::MetricsMode) -> bool
+impl core::default::Default for iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsMode::default() -> Self
+impl core::fmt::Debug for iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsMode::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsMode::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsMode::hash<__H: core::hash::Hasher>(&self, state: &mut __H)
+impl core::marker::Copy for iceberg::writer::MetricsMode
+impl core::marker::StructuralPartialEq for iceberg::writer::MetricsMode
+impl core::str::traits::FromStr for iceberg::writer::MetricsMode
+pub type iceberg::writer::MetricsMode::Err = iceberg::Error
+pub fn iceberg::writer::MetricsMode::from_str(mode: &str) -> iceberg::Result<Self>
+pub struct iceberg::writer::MetricsConfig
+impl iceberg::writer::MetricsConfig
+pub fn iceberg::writer::MetricsConfig::column_mode(&self, field_id: i32) -> iceberg::writer::MetricsMode
+pub fn iceberg::writer::MetricsConfig::for_position_delete() -> Self
+pub fn iceberg::writer::MetricsConfig::for_table(metadata: &iceberg::spec::TableMetadata) -> Self
+pub fn iceberg::writer::MetricsConfig::from_properties(properties: &std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>, schema: &iceberg::spec::Schema, sort_order: core::option::Option<&iceberg::spec::SortOrder>, spec: core::option::Option<&iceberg::spec::PartitionSpec>) -> Self
+pub fn iceberg::writer::MetricsConfig::full() -> Self
+impl core::clone::Clone for iceberg::writer::MetricsConfig
+pub fn iceberg::writer::MetricsConfig::clone(&self) -> iceberg::writer::MetricsConfig
+impl core::cmp::Eq for iceberg::writer::MetricsConfig
+impl core::cmp::PartialEq for iceberg::writer::MetricsConfig
+pub fn iceberg::writer::MetricsConfig::eq(&self, other: &iceberg::writer::MetricsConfig) -> bool
+impl core::default::Default for iceberg::writer::MetricsConfig
+pub fn iceberg::writer::MetricsConfig::default() -> Self
+impl core::fmt::Debug for iceberg::writer::MetricsConfig
+pub fn iceberg::writer::MetricsConfig::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg::writer::MetricsConfig
 pub trait iceberg::writer::CurrentFileStatus
 pub fn iceberg::writer::CurrentFileStatus::current_file_path(&self) -> alloc::string::String
 pub fn iceberg::writer::CurrentFileStatus::current_row_num(&self) -> usize

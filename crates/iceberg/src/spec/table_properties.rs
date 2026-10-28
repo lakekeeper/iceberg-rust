@@ -537,6 +537,22 @@ impl TableProperties<'_> {
     /// Default Parquet dictionary page size in bytes.
     pub const PROPERTY_PARQUET_DICT_SIZE_BYTES_DEFAULT: usize = 2 * 1024 * 1024;
 
+    /// Metrics mode for every column of a written data file: `none`, `counts`,
+    /// `truncate(<length>)` or `full`. See [`crate::writer::MetricsConfig`].
+    pub const PROPERTY_WRITE_METADATA_METRICS_DEFAULT: &'static str =
+        "write.metadata.metrics.default";
+    /// Metrics mode of a column whose mode is not set otherwise.
+    pub const PROPERTY_WRITE_METADATA_METRICS_DEFAULT_DEFAULT: &'static str = "truncate(16)";
+    /// Prefix of a per-column metrics mode, followed by the column's full name,
+    /// e.g. `write.metadata.metrics.column.location.lat`.
+    pub const PROPERTY_WRITE_METADATA_METRICS_COLUMN_PREFIX: &'static str =
+        "write.metadata.metrics.column.";
+    /// Number of columns that get metrics when `write.metadata.metrics.default` is not set.
+    pub const PROPERTY_WRITE_METADATA_METRICS_MAX_INFERRED_COLUMN_DEFAULTS: &'static str =
+        "write.metadata.metrics.max-inferred-column-defaults";
+    /// Default for [`Self::PROPERTY_WRITE_METADATA_METRICS_MAX_INFERRED_COLUMN_DEFAULTS`].
+    pub const PROPERTY_WRITE_METADATA_METRICS_MAX_INFERRED_COLUMN_DEFAULTS_DEFAULT: usize = 100;
+
     /// Property key for the master key id used to encrypt the table's manifest
     /// list and data files as defined in <https://iceberg.apache.org/docs/nightly/encryption/>.
     pub const PROPERTY_ENCRYPTION_KEY_ID: &'static str = "encryption.key-id";

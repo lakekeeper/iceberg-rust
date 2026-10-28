@@ -24,7 +24,6 @@ use crate::Result;
 use crate::spec::DataFile;
 use crate::spec::{DataFileFormat, PartitionKey, SchemaRef};
 use crate::table::Table;
-use crate::writer::IcebergWriterBuilder;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -32,6 +31,7 @@ use crate::writer::file_writer::location_generator::{
     ObjectStorageLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::{IcebergWriterBuilder, MetricsConfig};
 
 /// Builds a boxed replacement-data-file writer.
 ///
@@ -64,7 +64,8 @@ pub(crate) async fn build_replacement_writer(
         ));
     }
     let mut parquet_builder =
-        ParquetWriterBuilder::from_table_properties(&table_props, write_schema)?;
+        ParquetWriterBuilder::from_table_properties(&table_props, write_schema)?
+            .with_metrics_config(MetricsConfig::for_table(table.metadata()));
     // Replacement files must not silently downgrade an encrypted table to
     // plaintext: source rows were read through decryption, so re-encrypt the
     // rewritten rows when the table carries an encryption manager.
