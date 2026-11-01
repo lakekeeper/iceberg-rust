@@ -419,20 +419,23 @@ async fn write_manifest(
     writer.write_manifest_file().await
 }
 
-/// What a reader trusts of a live entry: identity, sequence numbers, snapshot
-/// id, partition and size.
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// A live entry as a reader sees it: the whole data file, including its
+/// column metrics, with sequence numbers and snapshot id.
+#[derive(Debug, PartialEq, Eq)]
 struct EntryKey {
-    file_path: String,
-    content: i32,
+    data_file: DataFile,
     sequence_number: Option<i64>,
     file_sequence_number: Option<i64>,
     snapshot_id: Option<i64>,
-    partition_spec_id: i32,
-    partition: Struct,
-    record_count: u64,
-    file_size_in_bytes: u64,
-    equality_ids: Option<Vec<i32>>,
+}
+
+impl std::hash::Hash for EntryKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.data_file.file_path.hash(state);
+        self.sequence_number.hash(state);
+        self.file_sequence_number.hash(state);
+        self.snapshot_id.hash(state);
+    }
 }
 
 /// A multiset of [`EntryKey`]s.
@@ -441,18 +444,11 @@ struct EntryCounts(HashMap<EntryKey, usize>);
 
 impl EntryCounts {
     fn add(&mut self, entry: &ManifestEntry) {
-        let file = entry.data_file();
         let key = EntryKey {
-            file_path: file.file_path.clone(),
-            content: file.content as i32,
+            data_file: entry.data_file().clone(),
             sequence_number: entry.sequence_number(),
             file_sequence_number: entry.file_sequence_number,
             snapshot_id: entry.snapshot_id(),
-            partition_spec_id: file.partition_spec_id,
-            partition: file.partition.clone(),
-            record_count: file.record_count,
-            file_size_in_bytes: file.file_size_in_bytes,
-            equality_ids: file.equality_ids.clone(),
         };
         *self.0.entry(key).or_default() += 1;
     }
@@ -1749,5 +1745,55 @@ mod tests {
         .await;
 
         assert_eq!(message, "the kept manifests changed");
+    }
+
+    /// Bounds that exclude every value make readers skip the file.
+    #[tokio::test]
+    async fn test_verification_fails_on_changed_column_bounds() {
+        let (_, message) = verification_error(
+            |entries| {
+                entries[0]
+                    .data_file
+                    .lower_bounds
+                    .insert(1, Datum::long(1000));
+                entries[0].data_file.upper_bounds.insert(1, Datum::long(0));
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(message, ENTRIES_DIFFER);
+    }
+
+    #[tokio::test]
+    async fn test_verification_fails_on_changed_null_counts() {
+        let (_, message) = verification_error(
+            |entries| {
+                let record_count = entries[0].data_file.record_count;
+                entries[0]
+                    .data_file
+                    .null_value_counts
+                    .insert(1, record_count);
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(message, ENTRIES_DIFFER);
+    }
+
+    #[tokio::test]
+    async fn test_verification_fails_on_changed_file_metadata() {
+        let (_, message) = verification_error(
+            |entries| {
+                entries[0].data_file.key_metadata = Some(vec![1, 2, 3]);
+                entries[0].data_file.split_offsets = Some(vec![4, 999]);
+                entries[0].data_file.sort_order_id = Some(77);
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(message, ENTRIES_DIFFER);
     }
 }
