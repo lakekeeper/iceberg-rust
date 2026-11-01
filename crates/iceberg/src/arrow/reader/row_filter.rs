@@ -34,7 +34,8 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
-use crate::arrow::caching_delete_file_loader::{EqDeleteKey, EqDeleteSet};
+use crate::arrow::caching_delete_file_loader::EqDeleteKey;
+use crate::arrow::equality_delete_index::EqDeleteProbe;
 use crate::arrow::{arrow_primitive_to_literal, arrow_type_to_type, type_to_arrow_type};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
@@ -87,11 +88,12 @@ impl ArrowReader {
         )))
     }
 
-    /// Builds one Arrow row-filter predicate per equality-delete set. The predicate is based
-    /// on a hash-set lookup (see `EqDeleteSet`). It keeps a row unless its key tuple is present
-    /// in that set. A row is deleted when it matches any set (the predicates are AND-ed by the `RowFilter`).
+    /// Builds one Arrow row-filter predicate per equality-delete probe. The predicate is based
+    /// on a hash lookup (see `EqDeleteProbe`). It keeps a row unless one of the probe's delete
+    /// files holds its key tuple. A row is deleted when it matches any probe (the predicates are
+    /// AND-ed by the `RowFilter`).
     pub(super) fn build_equality_delete_predicates(
-        sets: &[Arc<EqDeleteSet>],
+        probes: &[EqDeleteProbe],
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
         use_position_fallback: bool,
@@ -101,15 +103,15 @@ impl ArrowReader {
             Self::resolve_field_id_map(parquet_schema, arrow_schema, use_position_fallback)?;
 
         let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
-        for set in sets {
-            if set.is_empty() {
+        for probe in probes {
+            if probe.is_empty() {
                 continue;
             }
 
             // Parquet leaf index for each key column, in `fields` order; a column dropped
             // from this file by schema evolution has no entry.
-            let leaf_indices: Vec<Option<usize>> = set
-                .fields
+            let leaf_indices: Vec<Option<usize>> = probe
+                .fields()
                 .iter()
                 .map(|(_, id, _)| field_id_map.get(id).copied())
                 .collect();
@@ -131,8 +133,8 @@ impl ArrowReader {
 
             // A key column absent from this file probes as the value projection fills in for
             // it (`absent_key_values`), as Java's reader does, and as null when there is none.
-            let absent_values: Vec<Option<Datum>> = set
-                .fields
+            let absent_values: Vec<Option<Datum>> = probe
+                .fields()
                 .iter()
                 .map(|(_, id, ty)| {
                     absent_key_values
@@ -148,9 +150,10 @@ impl ArrowReader {
                         })
                 })
                 .collect();
-            let target_types: Vec<Type> = set.fields.iter().map(|(_, _, ty)| ty.clone()).collect();
-            let num_cols = set.fields.len();
-            let set = set.clone();
+            let target_types: Vec<Type> =
+                probe.fields().iter().map(|(_, _, ty)| ty.clone()).collect();
+            let num_cols = probe.fields().len();
+            let probe = probe.clone();
 
             let predicate_func =
                 move |batch: RecordBatch| -> std::result::Result<BooleanArray, ArrowError> {
@@ -210,10 +213,11 @@ impl ArrowReader {
                     }
 
                     // One hash lookup per row.
+                    let matcher = probe.matcher();
                     let mut keep = Vec::with_capacity(num_rows);
                     // Absent columns keep their value for the whole batch; present ones are set
                     // per row.
-                    let mut probe = EqDeleteKey(absent_values.clone());
+                    let mut key = EqDeleteKey(absent_values.clone());
                     for row in 0..num_rows {
                         let mut unmatchable = false;
                         for (i, column) in columns.iter_mut().enumerate() {
@@ -222,7 +226,7 @@ impl ArrowReader {
                             };
                             unmatchable |= column.inexact.as_ref().is_some_and(|rows| rows[row]);
                             // we can `take` because each cell is probed once.
-                            probe.0[i] = match column.literals[row].take() {
+                            key.0[i] = match column.literals[row].take() {
                                 Some(Literal::Primitive(primitive)) => {
                                     Some(Datum::new(column.primitive.clone(), primitive))
                                 }
@@ -235,7 +239,7 @@ impl ArrowReader {
                                 None => None,
                             };
                         }
-                        keep.push(unmatchable || !set.keys.contains(&probe));
+                        keep.push(unmatchable || !matcher.contains(&key));
                     }
                     Ok(BooleanArray::from(keep))
                 };

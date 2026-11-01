@@ -65,6 +65,8 @@ pub fn iceberg::arrow::ArrowFileReader::get_metadata(&mut self, options: core::o
 pub struct iceberg::arrow::ArrowReader
 impl iceberg::arrow::ArrowReader
 pub fn iceberg::arrow::ArrowReader::read(self, tasks: iceberg::scan::FileScanTaskStream) -> iceberg::Result<iceberg::scan::ScanResult>
+impl iceberg::arrow::ArrowReader
+pub fn iceberg::arrow::ArrowReader::with_batch_size(self, batch_size: core::option::Option<usize>) -> Self
 impl core::clone::Clone for iceberg::arrow::ArrowReader
 pub fn iceberg::arrow::ArrowReader::clone(&self) -> iceberg::arrow::ArrowReader
 pub struct iceberg::arrow::ArrowReaderBuilder
