@@ -17,6 +17,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -28,8 +29,8 @@ use crate::error::Result;
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, Literal, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestList, ManifestListWriter, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, SchemaId, SchemaRef, Snapshot, SnapshotReference, Struct,
-    Summary, TableProperties, partition_summaries,
+    ManifestWriterBuilder, Operation, PrimitiveLiteral, SchemaId, SchemaRef, Snapshot,
+    SnapshotReference, Struct, Summary, TableProperties, partition_summaries,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{generate_unique_snapshot_id, main_branch_retention};
@@ -156,7 +157,9 @@ impl TransactionAction for RewriteManifestsAction {
         let commit_uuid = Uuid::now_v7();
         let snapshot_id = generate_unique_snapshot_id(table);
 
-        let loaded: Vec<_> = stream::iter(to_rewrite)
+        // Manifests are consumed as they arrive, so at most `MANIFEST_READ_CONCURRENCY`
+        // parsed manifests are held besides the live entries taken from them.
+        let mut loaded = stream::iter(to_rewrite)
             .map(|m| {
                 let reader = table.manifest_reader();
                 async move {
@@ -164,18 +167,16 @@ impl TransactionAction for RewriteManifestsAction {
                     reader.read(&m).await.map(|manifest| (length, manifest))
                 }
             })
-            .buffer_unordered(16)
-            .try_collect()
-            .await?;
+            .buffer_unordered(MANIFEST_READ_CONCURRENCY);
 
         // Each new manifest keeps the schema its entries were written with, so
         // their partition values keep fitting their types after a promotion or
         // a dropped source column.
         let mut groups: BTreeMap<SchemaId, SchemaGroup> = BTreeMap::new();
         let mut entries_processed: u64 = 0;
-        let mut expected_entries = EntryCounts::default();
+        let mut expected_entries = EntryDigest::default();
 
-        for (length, manifest) in loaded {
+        while let Some((length, manifest)) = loaded.try_next().await? {
             let schema = manifest.metadata().schema().clone();
             let group = groups
                 .entry(schema.schema_id())
@@ -185,7 +186,8 @@ impl TransactionAction for RewriteManifestsAction {
                     entries: Vec::new(),
                 });
             group.input_bytes = group.input_bytes.saturating_add(length);
-            for entry in manifest.entries() {
+            let (entries, _) = manifest.into_parts();
+            for entry in entries {
                 if !entry.is_alive() {
                     continue;
                 }
@@ -201,13 +203,14 @@ impl TransactionAction for RewriteManifestsAction {
                         "Live manifest entry is missing sequence_number",
                     )
                 })?;
+                expected_entries.add(&entry);
+                let entry = Arc::unwrap_or_clone(entry);
                 group.entries.push(ExistingEntry {
-                    data_file: entry.data_file().clone(),
+                    data_file: entry.data_file,
                     snapshot_id: entry_snapshot_id,
                     sequence_number,
                     file_sequence_number: entry.file_sequence_number,
                 });
-                expected_entries.add(entry);
                 entries_processed += 1;
             }
         }
@@ -419,38 +422,176 @@ async fn write_manifest(
     writer.write_manifest_file().await
 }
 
-/// A live entry as a reader sees it: the whole data file, including its
-/// column metrics, with sequence numbers and snapshot id.
-#[derive(Debug, PartialEq, Eq)]
-struct EntryKey {
-    data_file: DataFile,
-    sequence_number: Option<i64>,
-    file_sequence_number: Option<i64>,
-    snapshot_id: Option<i64>,
+/// Live entries read in parallel at most this many manifests at a time.
+const MANIFEST_READ_CONCURRENCY: usize = 4;
+
+/// A multiset of live entries as a reader sees them: the whole data file,
+/// including its column metrics, with sequence numbers and snapshot id.
+/// It keeps only the number of entries and the wrapping sum of a 128-bit
+/// hash of each, so its size does not depend on the entries.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EntryDigest {
+    count: u64,
+    sum: u128,
 }
 
-impl std::hash::Hash for EntryKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.data_file.file_path.hash(state);
-        self.sequence_number.hash(state);
-        self.file_sequence_number.hash(state);
-        self.snapshot_id.hash(state);
+impl EntryDigest {
+    fn add(&mut self, entry: &ManifestEntry) {
+        self.count += 1;
+        self.sum = self.sum.wrapping_add(entry_hash(entry));
     }
 }
 
-/// A multiset of [`EntryKey`]s.
-#[derive(Debug, Default, PartialEq)]
-struct EntryCounts(HashMap<EntryKey, usize>);
+/// A 128-bit hash of everything [`EntryDigest`] compares, from two SipHash
+/// runs told apart by a leading byte.
+fn entry_hash(entry: &ManifestEntry) -> u128 {
+    let half = |seed: u8| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        seed.hash(&mut hasher);
+        hash_entry(entry, &mut hasher);
+        hasher.finish()
+    };
+    (u128::from(half(0)) << 64) | u128::from(half(1))
+}
 
-impl EntryCounts {
-    fn add(&mut self, entry: &ManifestEntry) {
-        let key = EntryKey {
-            data_file: entry.data_file().clone(),
-            sequence_number: entry.sequence_number(),
-            file_sequence_number: entry.file_sequence_number,
-            snapshot_id: entry.snapshot_id(),
-        };
-        *self.0.entry(key).or_default() += 1;
+/// Feeds a live entry into `hasher`: its sequence numbers, snapshot id and every
+/// field of its data file. Each value goes in with its variant or length, maps in
+/// key order, and floats as their bits with one pattern for every NaN, so two
+/// entries feed the same input exactly when they are equal.
+fn hash_entry(entry: &ManifestEntry, hasher: &mut impl Hasher) {
+    // No `..`: a new field must be decided on here and in `hash_data_file`.
+    let ManifestEntry {
+        // Every new manifest holds `EXISTING` entries; `verify_output` checks that.
+        status: _,
+        snapshot_id,
+        sequence_number,
+        file_sequence_number,
+        data_file,
+    } = entry;
+    snapshot_id.hash(hasher);
+    sequence_number.hash(hasher);
+    file_sequence_number.hash(hasher);
+    hash_data_file(data_file, hasher);
+}
+
+fn hash_data_file(data_file: &DataFile, hasher: &mut impl Hasher) {
+    let DataFile {
+        content,
+        file_path,
+        file_format,
+        partition,
+        record_count,
+        file_size_in_bytes,
+        column_sizes,
+        value_counts,
+        null_value_counts,
+        nan_value_counts,
+        lower_bounds,
+        upper_bounds,
+        key_metadata,
+        split_offsets,
+        equality_ids,
+        sort_order_id,
+        first_row_id,
+        partition_spec_id,
+        referenced_data_file,
+        content_offset,
+        content_size_in_bytes,
+    } = data_file;
+    std::mem::discriminant(content).hash(hasher);
+    file_path.hash(hasher);
+    std::mem::discriminant(file_format).hash(hasher);
+    hash_struct(partition, hasher);
+    record_count.hash(hasher);
+    file_size_in_bytes.hash(hasher);
+    for counts in [
+        column_sizes,
+        value_counts,
+        null_value_counts,
+        nan_value_counts,
+    ] {
+        hash_by_key(counts, hasher, |count, hasher| count.hash(hasher));
+    }
+    for bounds in [lower_bounds, upper_bounds] {
+        hash_by_key(bounds, hasher, |bound, hasher| {
+            bound.data_type().hash(hasher);
+            hash_primitive(bound.literal(), hasher);
+        });
+    }
+    key_metadata.hash(hasher);
+    split_offsets.hash(hasher);
+    equality_ids.hash(hasher);
+    sort_order_id.hash(hasher);
+    first_row_id.hash(hasher);
+    partition_spec_id.hash(hasher);
+    referenced_data_file.hash(hasher);
+    content_offset.hash(hasher);
+    content_size_in_bytes.hash(hasher);
+}
+
+fn hash_by_key<V, H: Hasher>(map: &HashMap<i32, V>, hasher: &mut H, value: impl Fn(&V, &mut H)) {
+    let mut pairs: Vec<_> = map.iter().collect();
+    pairs.sort_unstable_by_key(|(key, _)| **key);
+    pairs.len().hash(hasher);
+    for (key, v) in pairs {
+        key.hash(hasher);
+        value(v, hasher);
+    }
+}
+
+fn hash_struct(value: &Struct, hasher: &mut impl Hasher) {
+    value.fields().len().hash(hasher);
+    for field in value.iter() {
+        hash_optional_literal(field, hasher);
+    }
+}
+
+fn hash_optional_literal(value: Option<&Literal>, hasher: &mut impl Hasher) {
+    value.is_some().hash(hasher);
+    let Some(value) = value else {
+        return;
+    };
+    std::mem::discriminant(value).hash(hasher);
+    match value {
+        Literal::Primitive(primitive) => hash_primitive(primitive, hasher),
+        Literal::Struct(fields) => hash_struct(fields, hasher),
+        Literal::List(items) => {
+            items.len().hash(hasher);
+            for item in items {
+                hash_optional_literal(item.as_ref(), hasher);
+            }
+        }
+        Literal::Map(map) => {
+            map.len().hash(hasher);
+            for (key, item) in map.clone() {
+                hash_optional_literal(Some(&key), hasher);
+                hash_optional_literal(item.as_ref(), hasher);
+            }
+        }
+    }
+}
+
+/// Floats go in as bits, so `-0.0` and `0.0` differ, as they do for
+/// [`PrimitiveLiteral`]'s equality, which also takes every NaN as one value.
+fn hash_primitive(value: &PrimitiveLiteral, hasher: &mut impl Hasher) {
+    std::mem::discriminant(value).hash(hasher);
+    match value {
+        PrimitiveLiteral::Boolean(v) => v.hash(hasher),
+        PrimitiveLiteral::Int(v) => v.hash(hasher),
+        PrimitiveLiteral::Long(v) => v.hash(hasher),
+        PrimitiveLiteral::Float(v) => {
+            let v = if v.is_nan() { f32::NAN } else { v.into_inner() };
+            v.to_bits().hash(hasher);
+        }
+        PrimitiveLiteral::Double(v) => {
+            let v = if v.is_nan() { f64::NAN } else { v.into_inner() };
+            v.to_bits().hash(hasher);
+        }
+        PrimitiveLiteral::String(v) => v.hash(hasher),
+        PrimitiveLiteral::Binary(v) => v.hash(hasher),
+        PrimitiveLiteral::Int128(v) => v.hash(hasher),
+        PrimitiveLiteral::UInt128(v) => v.hash(hasher),
+        PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => {}
     }
 }
 
@@ -464,7 +605,7 @@ async fn verify_output(
     snapshot_id: i64,
     sequence_number: i64,
     kept: &[ManifestFile],
-    expected: EntryCounts,
+    expected: EntryDigest,
 ) -> Result<()> {
     let metadata = table.metadata();
     let format_version = metadata.format_version();
@@ -483,7 +624,7 @@ async fn verify_output(
     }
 
     let spec = metadata.default_partition_spec();
-    let mut actual = EntryCounts::default();
+    let mut actual = EntryDigest::default();
     for manifest_file in created {
         let manifest = table.manifest_reader().read(manifest_file).await?;
         let entries = manifest.entries();
@@ -1795,5 +1936,234 @@ mod tests {
         .await;
 
         assert_eq!(message, ENTRIES_DIFFER);
+    }
+
+    /// A partition of the four values, with the last value nested in a struct.
+    fn partition_of(
+        first: Option<Literal>,
+        second: Option<Literal>,
+        third: Option<Literal>,
+        nested: Literal,
+    ) -> Struct {
+        Struct::from_iter([
+            first,
+            second,
+            third,
+            Some(Literal::Struct(Struct::from_iter([Some(nested)]))),
+        ])
+    }
+
+    /// A live entry with every field of its data file set, NaN bounds, and 64 column sizes.
+    fn entry_with_every_field() -> ManifestEntry {
+        let data_file = DataFile {
+            content: DataContentType::PositionDeletes,
+            file_path: "test/a.parquet".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: partition_of(
+                Some(Literal::double(0.0)),
+                None,
+                Some(Literal::float(0.0_f32)),
+                Literal::long(1),
+            ),
+            record_count: 10,
+            file_size_in_bytes: 100,
+            column_sizes: (1..=64_u8)
+                .map(|id| (i32::from(id), 40 + u64::from(id)))
+                .collect(),
+            value_counts: HashMap::from([(1, 10), (2, 10)]),
+            null_value_counts: HashMap::from([(1, 0)]),
+            nan_value_counts: HashMap::from([(2, 0)]),
+            lower_bounds: HashMap::from([
+                (1, Datum::long(1)),
+                (2, Datum::double(0.0)),
+                (3, Datum::int(1)),
+            ]),
+            upper_bounds: HashMap::from([
+                (1, Datum::long(9)),
+                (2, Datum::double(f64::NAN)),
+                (4, Datum::float(f32::NAN)),
+            ]),
+            key_metadata: Some(vec![1, 2]),
+            split_offsets: Some(vec![4, 60]),
+            equality_ids: Some(vec![1]),
+            sort_order_id: Some(1),
+            first_row_id: Some(7),
+            partition_spec_id: 0,
+            referenced_data_file: Some("test/d.parquet".to_string()),
+            content_offset: Some(4),
+            content_size_in_bytes: Some(20),
+        };
+        ManifestEntry {
+            status: ManifestStatus::Existing,
+            snapshot_id: Some(1),
+            sequence_number: Some(2),
+            file_sequence_number: Some(3),
+            data_file,
+        }
+    }
+
+    /// Two entries hash alike exactly when they are equal: a change to any field
+    /// changes the hash, `-0.0` differs from `0.0` in either width, a bound's type
+    /// counts beside its literal, a value cannot move to a neighbouring map, null or
+    /// struct, a value's variant counts beside its bits, and neither the NaN's bits
+    /// nor the order of a map matter.
+    #[test]
+    fn test_entry_hash_follows_entry_equality() {
+        type Edit = fn(&mut ManifestEntry);
+        let base = entry_with_every_field();
+        let edits: &[(&str, Edit)] = &[
+            ("snapshot_id", |e| e.snapshot_id = None),
+            ("sequence_number", |e| e.sequence_number = Some(3)),
+            ("file_sequence_number", |e| e.file_sequence_number = Some(2)),
+            ("content", |e| {
+                e.data_file.content = DataContentType::EqualityDeletes;
+            }),
+            ("file_path", |e| e.data_file.file_path.push('x')),
+            ("file_format", |e| {
+                e.data_file.file_format = DataFileFormat::Orc
+            }),
+            ("partition -0.0", |e| {
+                e.data_file.partition = partition_of(
+                    Some(Literal::double(-0.0)),
+                    None,
+                    Some(Literal::float(0.0_f32)),
+                    Literal::long(1),
+                );
+            }),
+            ("partition float -0.0", |e| {
+                e.data_file.partition = partition_of(
+                    Some(Literal::double(0.0)),
+                    None,
+                    Some(Literal::float(-0.0_f32)),
+                    Literal::long(1),
+                );
+            }),
+            ("partition null", |e| {
+                e.data_file.partition =
+                    partition_of(Some(Literal::double(0.0)), None, None, Literal::long(1));
+            }),
+            ("partition value and null swapped", |e| {
+                e.data_file.partition = partition_of(
+                    None,
+                    Some(Literal::double(0.0)),
+                    Some(Literal::float(0.0_f32)),
+                    Literal::long(1),
+                );
+            }),
+            ("partition int with the float's bits", |e| {
+                e.data_file.partition = partition_of(
+                    Some(Literal::double(0.0)),
+                    None,
+                    Some(Literal::int(0)),
+                    Literal::long(1),
+                );
+            }),
+            ("partition list with the struct's items", |e| {
+                e.data_file.partition = Struct::from_iter([
+                    Some(Literal::double(0.0)),
+                    None,
+                    Some(Literal::float(0.0_f32)),
+                    Some(Literal::List(vec![Some(Literal::long(1))])),
+                ]);
+            }),
+            ("partition value moved out of the nested struct", |e| {
+                e.data_file.partition = Struct::from_iter([
+                    Some(Literal::double(0.0)),
+                    None,
+                    Some(Literal::float(0.0_f32)),
+                    Some(Literal::Struct(Struct::from_iter([]))),
+                    Some(Literal::long(1)),
+                ]);
+            }),
+            ("partition fields", |e| {
+                e.data_file.partition = Struct::from_iter([Some(Literal::double(0.0)), None]);
+            }),
+            ("record_count", |e| e.data_file.record_count = 11),
+            ("file_size_in_bytes", |e| {
+                e.data_file.file_size_in_bytes = 99
+            }),
+            ("column_sizes", |e| {
+                e.data_file.column_sizes.insert(3, 0);
+            }),
+            ("value_counts", |e| {
+                e.data_file.value_counts.insert(2, 9);
+            }),
+            ("null_value_counts", |e| {
+                e.data_file.null_value_counts.remove(&1);
+            }),
+            ("nan_value_counts", |e| {
+                e.data_file.nan_value_counts.insert(2, 1);
+            }),
+            ("null count moved to the nan counts", |e| {
+                e.data_file.null_value_counts.remove(&1);
+                e.data_file.nan_value_counts.insert(1, 0);
+            }),
+            ("lower bound -0.0", |e| {
+                e.data_file.lower_bounds.insert(2, Datum::double(-0.0));
+            }),
+            ("lower bound type", |e| {
+                e.data_file.lower_bounds.insert(1, Datum::int(1));
+            }),
+            ("lower bound type, same literal", |e| {
+                e.data_file.lower_bounds.insert(3, Datum::date(1));
+            }),
+            ("upper_bounds", |e| {
+                e.data_file.upper_bounds.insert(1, Datum::long(10));
+            }),
+            ("key_metadata", |e| e.data_file.key_metadata = None),
+            ("split_offsets", |e| {
+                e.data_file.split_offsets = Some(vec![4])
+            }),
+            ("equality_ids", |e| e.data_file.equality_ids = Some(vec![2])),
+            ("sort_order_id", |e| e.data_file.sort_order_id = Some(0)),
+            ("first_row_id", |e| e.data_file.first_row_id = None),
+            ("referenced_data_file", |e| {
+                e.data_file.referenced_data_file = None;
+            }),
+            ("partition_spec_id", |e| e.data_file.partition_spec_id = 1),
+            ("content_offset", |e| e.data_file.content_offset = Some(5)),
+            ("content_size_in_bytes", |e| {
+                e.data_file.content_size_in_bytes = Some(19);
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut edited = base.clone();
+            edit(&mut edited);
+            assert_ne!(edited, base, "{field}");
+            assert_ne!(
+                super::entry_hash(&edited),
+                super::entry_hash(&base),
+                "{field}"
+            );
+        }
+
+        let mut same = base.clone();
+        same.status = ManifestStatus::Added;
+        let other_nan = f64::from_bits(f64::NAN.to_bits() | 1);
+        same.data_file
+            .upper_bounds
+            .insert(2, Datum::double(other_nan));
+        let other_float_nan = f32::from_bits(f32::NAN.to_bits() | 1);
+        same.data_file
+            .upper_bounds
+            .insert(4, Datum::float(other_float_nan));
+        let mut sizes: Vec<(i32, u64)> = base
+            .data_file
+            .column_sizes
+            .iter()
+            .map(|(id, size)| (*id, *size))
+            .collect();
+        sizes.reverse();
+        same.data_file.column_sizes = sizes.into_iter().collect();
+        // Each map has its own hasher seed, so 64 keys come out in another order.
+        assert!(
+            !same
+                .data_file
+                .column_sizes
+                .keys()
+                .eq(base.data_file.column_sizes.keys())
+        );
+        assert_eq!(same.data_file, base.data_file);
+        assert_eq!(super::entry_hash(&same), super::entry_hash(&base));
     }
 }
