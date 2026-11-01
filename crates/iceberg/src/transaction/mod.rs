@@ -288,15 +288,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use uuid::Uuid;
+
     use crate::catalog::{MockCatalog, TableCommit};
+    use crate::error::Result;
     use crate::io::FileIO;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
-        SnapshotReference, SnapshotRetention, Struct, TableMetadata, TableProperties,
+        ManifestEntry, ManifestFile, Operation, SnapshotReference, SnapshotRetention, Struct,
+        TableMetadata, TableProperties,
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
+    use crate::transaction::snapshot::{
+        DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    };
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent, TableUpdate};
 
@@ -323,6 +330,59 @@ mod tests {
         let tx = Transaction::new(table);
         let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
         tx.commit(catalog).await.unwrap()
+    }
+
+    /// Adds delete files and keeps every live manifest, as a merge-on-read
+    /// writer does.
+    pub(crate) struct AddDeletesOperation;
+
+    impl SnapshotProduceOperation for AddDeletesOperation {
+        fn operation(&self) -> Operation {
+            Operation::Overwrite
+        }
+
+        fn truncate_full_table(&self) -> bool {
+            false
+        }
+
+        async fn delete_entries(&self, _: &SnapshotProducer<'_>) -> Result<Vec<ManifestEntry>> {
+            Ok(vec![])
+        }
+
+        async fn existing_manifest(
+            &self,
+            producer: &SnapshotProducer<'_>,
+        ) -> Result<Vec<ManifestFile>> {
+            let snapshot = producer.table.metadata().current_snapshot().unwrap();
+            let manifest_list = producer.table.manifest_list_reader(snapshot).load().await?;
+            Ok(manifest_list
+                .consume_entries()
+                .into_iter()
+                .filter(|m| m.has_added_files() || m.has_existing_files())
+                .collect())
+        }
+    }
+
+    /// Commit `delete_files` in one new delete manifest.
+    pub(crate) async fn stage_delete_files(
+        catalog: &impl Catalog,
+        table: &Table,
+        delete_files: Vec<DataFile>,
+    ) -> Table {
+        let mut commit = SnapshotProducer::builder()
+            .with_table(table)
+            .with_commit_uuid(Uuid::now_v7())
+            .with_added_delete_files(delete_files)
+            .build()
+            .commit(AddDeletesOperation, DefaultManifestProcess)
+            .await
+            .unwrap();
+        let table_commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .updates(commit.take_updates())
+            .requirements(commit.take_requirements())
+            .build();
+        catalog.update_table(table_commit).await.unwrap()
     }
 
     pub fn make_v1_table() -> Table {
@@ -442,7 +502,7 @@ mod tests {
         format_version: crate::spec::FormatVersion,
     ) -> Table {
         let table_ident =
-            TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
+            TableIdent::from_strs([format!("ns1-{}", Uuid::new_v4()), "test1".to_string()])
                 .unwrap();
 
         catalog

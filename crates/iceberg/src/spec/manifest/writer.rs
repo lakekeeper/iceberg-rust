@@ -34,7 +34,7 @@ use crate::spec::manifest::_serde::{ManifestEntryV1, ManifestEntryV2};
 use crate::spec::manifest::{manifest_schema_v1, manifest_schema_v2};
 use crate::spec::{
     DataContentType, DataFile, FieldSummary, ManifestEntry, ManifestFile, ManifestMetadata,
-    ManifestStatus, PrimitiveLiteral, SchemaRef, StructType, Type,
+    ManifestStatus, PrimitiveLiteral, SchemaRef, Struct, StructType, Type,
 };
 
 /// Placeholder for snapshot ID. The field with this value must be replaced
@@ -230,24 +230,6 @@ impl ManifestWriter {
             manifest_entries: Vec::new(),
             metadata,
         }
-    }
-
-    fn construct_partition_summaries(
-        &mut self,
-        partition_type: &StructType,
-    ) -> Result<Vec<FieldSummary>> {
-        let mut field_stats: Vec<_> = partition_type
-            .fields()
-            .iter()
-            .map(|f| PartitionFieldStats::new(f.field_type.as_primitive_type().unwrap().clone()))
-            .collect();
-        for partition in self.manifest_entries.iter().map(|e| &e.data_file.partition) {
-            for (literal, stat) in partition.iter().zip_eq(field_stats.iter_mut()) {
-                let primitive_literal = literal.map(|v| v.as_primitive_literal().unwrap());
-                stat.update(primitive_literal)?;
-            }
-        }
-        Ok(field_stats.into_iter().map(|stat| stat.finish()).collect())
     }
 
     fn check_data_file(&self, data_file: &DataFile) -> Result<()> {
@@ -458,7 +440,10 @@ impl ManifestWriter {
             }
         }
 
-        let partition_summary = self.construct_partition_summaries(&partition_type)?;
+        let partition_summary = partition_summaries(
+            &partition_type,
+            self.manifest_entries.iter().map(|e| &e.data_file.partition),
+        )?;
         // Write manifest entries
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {
@@ -504,6 +489,25 @@ impl ManifestWriter {
             first_row_id: self.first_row_id,
         })
     }
+}
+
+/// The partition summaries of a manifest holding entries with `partitions`.
+pub(crate) fn partition_summaries<'a>(
+    partition_type: &StructType,
+    partitions: impl IntoIterator<Item = &'a Struct>,
+) -> Result<Vec<FieldSummary>> {
+    let mut field_stats: Vec<_> = partition_type
+        .fields()
+        .iter()
+        .map(|f| PartitionFieldStats::new(f.field_type.as_primitive_type().unwrap().clone()))
+        .collect();
+    for partition in partitions {
+        for (literal, stat) in partition.iter().zip_eq(field_stats.iter_mut()) {
+            let primitive_literal = literal.map(|v| v.as_primitive_literal().unwrap());
+            stat.update(primitive_literal)?;
+        }
+    }
+    Ok(field_stats.into_iter().map(|stat| stat.finish()).collect())
 }
 
 struct PartitionFieldStats {
