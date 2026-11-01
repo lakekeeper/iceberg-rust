@@ -1363,7 +1363,7 @@ pub iceberg::scan::FileScanTask::case_sensitive: bool
 pub iceberg::scan::FileScanTask::data_file_format: iceberg::spec::DataFileFormat
 pub iceberg::scan::FileScanTask::data_file_path: alloc::string::String
 pub iceberg::scan::FileScanTask::data_sequence_number: core::option::Option<i64>
-pub iceberg::scan::FileScanTask::deletes: alloc::vec::Vec<iceberg::scan::FileScanTaskDeleteFile>
+pub iceberg::scan::FileScanTask::deletes: alloc::vec::Vec<alloc::sync::Arc<iceberg::scan::FileScanTaskDeleteFile>>
 pub iceberg::scan::FileScanTask::file_size_in_bytes: u64
 pub iceberg::scan::FileScanTask::first_row_id: core::option::Option<i64>
 pub iceberg::scan::FileScanTask::key_metadata: core::option::Option<alloc::boxed::Box<[u8]>>
@@ -1372,7 +1372,7 @@ pub iceberg::scan::FileScanTask::name_mapping: core::option::Option<alloc::sync:
 pub iceberg::scan::FileScanTask::partition: core::option::Option<iceberg::spec::Struct>
 pub iceberg::scan::FileScanTask::partition_spec: core::option::Option<alloc::sync::Arc<iceberg::spec::PartitionSpec>>
 pub iceberg::scan::FileScanTask::predicate: core::option::Option<iceberg::expr::BoundPredicate>
-pub iceberg::scan::FileScanTask::project_field_ids: alloc::vec::Vec<i32>
+pub iceberg::scan::FileScanTask::project_field_ids: alloc::sync::Arc<[i32]>
 pub iceberg::scan::FileScanTask::record_count: core::option::Option<u64>
 pub iceberg::scan::FileScanTask::schema: iceberg::spec::SchemaRef
 pub iceberg::scan::FileScanTask::sort_order: core::option::Option<iceberg::spec::SortOrderRef>
@@ -1384,7 +1384,7 @@ pub fn iceberg::scan::FileScanTask::case_sensitive(&self) -> bool
 pub fn iceberg::scan::FileScanTask::data_file_format(&self) -> iceberg::spec::DataFileFormat
 pub fn iceberg::scan::FileScanTask::data_file_path(&self) -> &str
 pub fn iceberg::scan::FileScanTask::data_sequence_number(&self) -> core::option::Option<i64>
-pub fn iceberg::scan::FileScanTask::deletes(&self) -> &[iceberg::scan::FileScanTaskDeleteFile]
+pub fn iceberg::scan::FileScanTask::deletes(&self) -> &[alloc::sync::Arc<iceberg::scan::FileScanTaskDeleteFile>]
 pub fn iceberg::scan::FileScanTask::file_size_in_bytes(&self) -> u64
 pub fn iceberg::scan::FileScanTask::first_row_id(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::key_metadata(&self) -> core::option::Option<&[u8]>
@@ -2015,6 +2015,7 @@ pub fn iceberg::spec::DataFile::sort_order_id(&self) -> core::option::Option<i32
 pub fn iceberg::spec::DataFile::split_offsets(&self) -> core::option::Option<&[i64]>
 pub fn iceberg::spec::DataFile::upper_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
 pub fn iceberg::spec::DataFile::value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+pub fn iceberg::spec::DataFile::without_column_metrics(&self) -> iceberg::spec::DataFile
 impl core::clone::Clone for iceberg::spec::DataFile
 pub fn iceberg::spec::DataFile::clone(&self) -> iceberg::spec::DataFile
 impl core::cmp::Eq for iceberg::spec::DataFile

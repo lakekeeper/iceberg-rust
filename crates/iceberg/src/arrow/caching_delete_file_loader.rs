@@ -204,7 +204,7 @@ impl CachingDeleteFileLoader {
     /// ```
     pub(crate) fn load_deletes(
         &self,
-        delete_file_entries: &[FileScanTaskDeleteFile],
+        delete_file_entries: &[Arc<FileScanTaskDeleteFile>],
         schema: SchemaRef,
     ) -> Receiver<Result<DeleteFilter>> {
         let (tx, rx) = channel();
@@ -1697,7 +1697,11 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap().unwrap();
+        let delete_filter = loader
+            .load_deletes(&[Arc::new(dv)], schema)
+            .await
+            .unwrap()
+            .unwrap();
 
         let delete_vector = delete_filter
             .get_delete_vector_for_path(&data_file_path)
@@ -1753,7 +1757,11 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap().unwrap();
+        let delete_filter = loader
+            .load_deletes(&[Arc::new(dv)], schema)
+            .await
+            .unwrap()
+            .unwrap();
 
         let delete_vector = delete_filter
             .get_delete_vector_for_path(&data_file_path)
@@ -1796,7 +1804,7 @@ mod tests {
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
         let err = loader
-            .load_deletes(&[dv], schema)
+            .load_deletes(&[Arc::new(dv)], schema)
             .await
             .unwrap()
             .unwrap_err();
@@ -2032,7 +2040,7 @@ mod tests {
         // The file opens but fails to parse, so the load is abandoned after the open.
         let invalid = write(vec![-1]);
         let err = loader
-            .load_deletes(&[invalid], Arc::clone(&schema))
+            .load_deletes(&[Arc::new(invalid)], Arc::clone(&schema))
             .await
             .unwrap()
             .err()
@@ -2043,7 +2051,7 @@ mod tests {
         let valid = write(vec![1, 3]);
         let filter = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            loader.load_deletes(&[valid], schema),
+            loader.load_deletes(&[Arc::new(valid)], schema),
         )
         .await
         .expect("retry waited on the failed load")
@@ -2094,7 +2102,7 @@ mod tests {
         else {
             panic!("expected Load for a new file");
         };
-        let waiter = loader.load_deletes(std::slice::from_ref(&pos_del), schema);
+        let waiter = loader.load_deletes(&[Arc::new(pos_del.clone())], schema);
         // On this single-thread runtime, the spawned load runs until it waits for `guard`.
         tokio::task::yield_now().await;
         drop(guard);

@@ -78,15 +78,18 @@ pub struct FileScanTask {
 
     /// The schema of the file to scan.
     pub schema: SchemaRef,
-    /// The field ids to project.
-    pub project_field_ids: Vec<i32>,
+    /// The field ids to project. Every task of a scan shares one list.
+    #[builder(setter(into))]
+    pub project_field_ids: Arc<[i32]>,
     /// The predicate to filter.
     #[builder(default)]
     pub predicate: Option<BoundPredicate>,
 
-    /// The list of delete files that may need to be applied to this data file
-    #[builder(default)]
-    pub deletes: Vec<FileScanTaskDeleteFile>,
+    /// The list of delete files that may need to be applied to this data file.
+    /// Planning hands every task a delete file applies to the same `Arc`, so a
+    /// delete file that applies to many data files is held once.
+    #[builder(default, setter(transform = |deletes: Vec<FileScanTaskDeleteFile>| deletes.into_iter().map(Arc::new).collect()))]
+    pub deletes: Vec<Arc<FileScanTaskDeleteFile>>,
 
     /// Partition data from the manifest entry, used to identify which columns can use
     /// constant values from partition metadata vs. reading from the data file.
@@ -224,7 +227,7 @@ impl FileScanTask {
     }
 
     /// Returns the delete files that may need to be applied to the data file.
-    pub fn deletes(&self) -> &[FileScanTaskDeleteFile] {
+    pub fn deletes(&self) -> &[Arc<FileScanTaskDeleteFile>] {
         &self.deletes
     }
 
@@ -497,7 +500,7 @@ mod _serde {
         project_field_ids: &'a [i32],
         #[serde(skip_serializing_if = "Option::is_none")]
         predicate: Option<&'a BoundPredicate>,
-        deletes: &'a [FileScanTaskDeleteFile],
+        deletes: &'a [Arc<FileScanTaskDeleteFile>],
         #[serde(skip_serializing_if = "Option::is_none")]
         partition: Option<RawLiteral>,
         #[serde(skip_serializing_if = "Option::is_none")]

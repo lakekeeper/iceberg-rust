@@ -563,7 +563,7 @@ mod differential_tests {
                         2 => vec![4, 2],
                         _ => vec![4],
                     })
-                    .with_deletes(task_deletes)
+                    .with_deletes(task_deletes.iter().map(|d| (**d).clone()).collect())
                     .with_data_sequence_number(Some(data.seq))
                     .with_case_sensitive(false)
                     .build()
