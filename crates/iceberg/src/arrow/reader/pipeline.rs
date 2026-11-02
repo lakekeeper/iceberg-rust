@@ -481,13 +481,13 @@ impl FileScanTaskReader {
         }
 
         let delete_filter = delete_filter_rx.await.unwrap()?;
-        let eq_delete_sets = self
+        let eq_delete_probes = self
             .delete_file_loader
-            .build_equality_delete_sets(&task)
+            .build_equality_delete_probes(&task)
             .await?;
 
-        // Equality deletes are applied as a row-filter predicate based on a hash-set (see below),
-        // so the scan-predicate carries only the optional predicate
+        // Equality deletes are applied as a row-filter predicate based on a hash lookup (see
+        // below), so the scan-predicate carries only the optional predicate
         let final_predicate = task.predicate().cloned();
 
         // Filters and equality deletes decode their columns outside the projection. A column the
@@ -503,9 +503,9 @@ impl FileScanTaskReader {
             .field_ids()
             .into_iter()
             .chain(
-                eq_delete_sets
+                eq_delete_probes
                     .iter()
-                    .flat_map(|set| set.fields.iter().map(|(_, id, _)| *id)),
+                    .flat_map(|probe| probe.fields().iter().map(|(_, id, _)| *id)),
             )
             .collect();
         if !filter_field_ids.is_empty() {
@@ -548,7 +548,7 @@ impl FileScanTaskReader {
 
         // Values that projection fills in for fields the file does not store; filters and
         // equality deletes on those fields are decided against them.
-        let absent_values = if final_predicate.is_some() || !eq_delete_sets.is_empty() {
+        let absent_values = if final_predicate.is_some() || !eq_delete_probes.is_empty() {
             absent_field_values(
                 task.schema(),
                 task.partition_spec().map(Arc::as_ref),
@@ -650,9 +650,9 @@ impl FileScanTaskReader {
             }
         }
 
-        if !eq_delete_sets.is_empty() {
+        if !eq_delete_probes.is_empty() {
             row_filter_predicates.extend(ArrowReader::build_equality_delete_predicates(
-                &eq_delete_sets,
+                &eq_delete_probes,
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 use_position_fallback,

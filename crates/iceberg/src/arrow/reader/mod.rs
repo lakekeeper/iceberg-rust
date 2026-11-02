@@ -177,3 +177,119 @@ pub struct ArrowReader {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
 }
+
+impl ArrowReader {
+    /// Sets the size of batches in the response, or the default for `None`. Clones of one
+    /// reader share their loaded delete files whatever their batch sizes.
+    pub fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
+    use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+
+    fn write_ids(path: &str, ids: impl IntoIterator<Item = i64>) -> u64 {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int64Array::from_iter_values(ids),
+        )])
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    // Clones with their own batch sizes read with them, and load an equality delete file once.
+    #[tokio::test]
+    async fn test_with_batch_size_keeps_the_shared_delete_files() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path().to_str().unwrap();
+        let data_path = format!("{dir}/data.parquet");
+        let data_size = write_ids(&data_path, 0..20);
+        let eq_path = format!("{dir}/eq.parquet");
+        let eq_size = write_ids(&eq_path, [0, 1]);
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(data_size)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            ))
+            .with_project_field_ids(vec![1])
+            .with_deletes(vec![
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path(eq_path)
+                    .with_file_size_in_bytes(eq_size)
+                    .with_file_type(DataContentType::EqualityDeletes)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .with_equality_ids(Some(vec![1]))
+                    .build()
+                    .unwrap(),
+            ])
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let mut batch_rows = Vec::new();
+        for batch_size in [Some(3), Some(5), None] {
+            let stream = Box::pin(futures::stream::iter([Ok(task.clone())])) as FileScanTaskStream;
+            let batches: Vec<RecordBatch> = reader
+                .clone()
+                .with_batch_size(batch_size)
+                .read(stream)
+                .unwrap()
+                .stream()
+                .try_collect()
+                .await
+                .unwrap();
+            batch_rows.push(
+                batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        // 18 rows are left after the deletes.
+        assert_eq!(batch_rows, vec![
+            vec![3, 3, 3, 3, 3, 3],
+            vec![5, 5, 5, 3],
+            vec![18]
+        ]);
+
+        let (indexes, loaded) = reader
+            .delete_file_loader
+            .delete_filter()
+            .equality_delete_indexes();
+        assert_eq!((indexes.len(), loaded, indexes[0].len()), (1, 1, 2));
+    }
+}

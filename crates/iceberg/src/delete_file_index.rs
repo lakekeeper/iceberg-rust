@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{Sender, channel};
@@ -53,14 +53,47 @@ enum DeleteFileIndexState {
 
 #[derive(Debug)]
 struct PopulatedDeleteFileIndex {
-    global_equality_deletes: Vec<Arc<DeleteFileContext>>,
-    eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
-    pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
-    pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
+    global_equality_deletes: Vec<Arc<IndexedDelete>>,
+    eq_deletes_by_partition: HashMap<Struct, Vec<Arc<IndexedDelete>>>,
+    pos_deletes_by_partition: HashMap<Struct, Vec<Arc<IndexedDelete>>>,
+    pos_deletes_by_path: HashMap<String, Vec<Arc<IndexedDelete>>>,
     // V3 deletion vectors, keyed by the data file they apply to (referenced_data_file). At most
     // one exists per data file per snapshot, and when one applies it supersedes any position
     // delete files for that data file, partition-scoped or path-scoped alike.
-    dvs_by_referenced_data_file: HashMap<String, Arc<DeleteFileContext>>,
+    dvs_by_referenced_data_file: HashMap<String, Arc<IndexedDelete>>,
+}
+
+/// A delete file in the index, with the task reference every scan task it applies to shares.
+#[derive(Debug)]
+struct IndexedDelete {
+    context: DeleteFileContext,
+    task_file: OnceLock<Arc<FileScanTaskDeleteFile>>,
+}
+
+impl IndexedDelete {
+    fn new(context: DeleteFileContext) -> Self {
+        Self {
+            context,
+            task_file: OnceLock::new(),
+        }
+    }
+
+    /// The scan-task reference to this delete file, built on first use.
+    fn task_file(&self) -> Result<Arc<FileScanTaskDeleteFile>> {
+        if let Some(task_file) = self.task_file.get() {
+            return Ok(task_file.clone());
+        }
+        let task_file = Arc::new(FileScanTaskDeleteFile::try_from(&self.context)?);
+        Ok(self.task_file.get_or_init(|| task_file).clone())
+    }
+}
+
+impl Deref for IndexedDelete {
+    type Target = DeleteFileContext;
+
+    fn deref(&self) -> &DeleteFileContext {
+        &self.context
+    }
 }
 
 /// Rebuilds an owned `Error` from the boxed `Error` cached in `DeleteFileIndexState::Failed`.
@@ -112,7 +145,7 @@ impl DeleteFileIndex {
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
-    ) -> Result<Vec<FileScanTaskDeleteFile>> {
+    ) -> Result<Vec<Arc<FileScanTaskDeleteFile>>> {
         // Create the `Notified` while holding the read lock. The read lock ensures that
         // when we go inside it, either the state is already at Populated or it is still
         // at Populating AND `notify_waiters()` has not been called yet. Any `Notified`
@@ -162,19 +195,18 @@ impl PopulatedDeleteFileIndex {
     /// 4. Equality deletes stored with an unpartitioned spec are applied as global
     ///    deletes, per the spec. All other equality deletes are indexed by partition.
     fn new(files: Vec<DeleteFileContext>) -> Result<PopulatedDeleteFileIndex> {
-        let mut eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
+        let mut eq_deletes_by_partition: HashMap<Struct, Vec<Arc<IndexedDelete>>> =
             HashMap::default();
-        let mut pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
+        let mut pos_deletes_by_partition: HashMap<Struct, Vec<Arc<IndexedDelete>>> =
             HashMap::default();
-        let mut pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>> =
-            HashMap::default();
-        let mut dvs_by_referenced_data_file: HashMap<String, Arc<DeleteFileContext>> =
+        let mut pos_deletes_by_path: HashMap<String, Vec<Arc<IndexedDelete>>> = HashMap::default();
+        let mut dvs_by_referenced_data_file: HashMap<String, Arc<IndexedDelete>> =
             HashMap::default();
 
-        let mut global_equality_deletes: Vec<Arc<DeleteFileContext>> = vec![];
+        let mut global_equality_deletes: Vec<Arc<IndexedDelete>> = vec![];
 
         for ctx in files {
-            let arc_ctx = Arc::new(ctx);
+            let arc_ctx = Arc::new(IndexedDelete::new(ctx));
 
             let data_file = arc_ctx.manifest_entry.data_file();
             let partition = data_file.partition();
@@ -255,7 +287,7 @@ impl PopulatedDeleteFileIndex {
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
-    ) -> Result<Vec<FileScanTaskDeleteFile>> {
+    ) -> Result<Vec<Arc<FileScanTaskDeleteFile>>> {
         let mut results = vec![];
 
         for delete in self.global_equality_deletes.iter().filter(|&delete| {
@@ -264,7 +296,7 @@ impl PopulatedDeleteFileIndex {
                 .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
                 .unwrap_or_else(|| true)
         }) {
-            results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+            results.push(delete.task_file()?);
         }
 
         if let Some(deletes) = self.eq_deletes_by_partition.get(data_file.partition()) {
@@ -275,7 +307,7 @@ impl PopulatedDeleteFileIndex {
                     .unwrap_or_else(|| true)
                     && data_file.partition_spec_id == delete.partition_spec_id
             }) {
-                results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+                results.push(delete.task_file()?);
             }
         }
 
@@ -312,7 +344,7 @@ impl PopulatedDeleteFileIndex {
                     ));
                 }
             }
-            results.push(FileScanTaskDeleteFile::try_from(dv.as_ref())?);
+            results.push(dv.task_file()?);
             return Ok(results);
         }
 
@@ -327,7 +359,7 @@ impl PopulatedDeleteFileIndex {
                         && data_file.partition_spec_id == delete.partition_spec_id
                 })
             {
-                results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+                results.push(delete.task_file()?);
             }
         }
 
@@ -344,7 +376,7 @@ impl PopulatedDeleteFileIndex {
                         .unwrap_or(true)
                 })
             {
-                results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+                results.push(delete.task_file()?);
             }
         }
 
@@ -685,6 +717,39 @@ mod tests {
             .get_deletes_for_data_file(&build_partitioned_data_file(&pos_zero, spec_id), Some(0))
             .unwrap();
         assert!(deletes_for_pos_zero.is_empty());
+    }
+
+    /// Every data file a delete file applies to gets the same reference to it.
+    #[test]
+    fn test_data_files_share_the_reference_to_a_delete_file() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+        let delete_contexts: Vec<DeleteFileContext> = [
+            build_partitioned_eq_delete(&partition, spec_id),
+            build_partitioned_pos_delete(&partition, spec_id),
+            build_unpartitioned_eq_delete(),
+        ]
+        .iter()
+        .map(|delete| DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(4, delete).into(),
+            partition_spec_id: delete.partition_spec_id,
+            partition_spec: None,
+        })
+        .collect();
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts).unwrap();
+
+        let first = delete_file_index
+            .get_deletes_for_data_file(&build_partitioned_data_file(&partition, spec_id), Some(0))
+            .unwrap();
+        let second = delete_file_index
+            .get_deletes_for_data_file(&build_partitioned_data_file(&partition, spec_id), Some(0))
+            .unwrap();
+
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        for (a, b) in first.iter().zip(&second) {
+            assert!(Arc::ptr_eq(a, b), "{}", a.file_path());
+        }
     }
 
     #[test]

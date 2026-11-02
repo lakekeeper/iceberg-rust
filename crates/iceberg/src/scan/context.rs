@@ -42,7 +42,7 @@ pub(crate) struct ManifestFileContext {
 
     sender: Sender<ManifestEntryContext>,
 
-    field_ids: Arc<Vec<i32>>,
+    field_ids: Arc<[i32]>,
     bound_predicates: Option<Arc<BoundPredicates>>,
     object_cache: Arc<ObjectCache>,
     snapshot_schema: SchemaRef,
@@ -62,7 +62,7 @@ pub(crate) struct ManifestEntryContext {
     pub manifest_entry: ManifestEntryRef,
 
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
-    pub field_ids: Arc<Vec<i32>>,
+    pub field_ids: Arc<[i32]>,
     pub bound_predicates: Option<Arc<BoundPredicates>>,
     pub partition_spec_id: i32,
     pub snapshot_schema: SchemaRef,
@@ -208,12 +208,11 @@ impl ManifestEntryContext {
             .with_data_file_path(self.manifest_entry.file_path().to_string())
             .with_data_file_format(self.manifest_entry.file_format())
             .with_schema(self.snapshot_schema)
-            .with_project_field_ids(self.field_ids.to_vec())
+            .with_project_field_ids(self.field_ids)
             .with_predicate(
                 self.bound_predicates
                     .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
             )
-            .with_deletes(deletes)
             .with_partition(Some(self.manifest_entry.data_file.partition.clone()))
             .with_partition_spec(self.partition_spec.clone())
             .with_name_mapping(self.name_mapping)
@@ -223,6 +222,11 @@ impl ManifestEntryContext {
             .with_sort_order_id(self.sort_order_id)
             .with_sort_order(self.sort_order)
             .build()
+            .map(|mut task| {
+                // The delete index's shared references.
+                task.deletes = deletes;
+                task
+            })
     }
 
     /// Consume this `ManifestEntryContext`, returning a COW rewrite file candidate.
@@ -258,7 +262,7 @@ pub(crate) struct PlanContext {
     pub predicate: Option<Arc<Predicate>>,
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
     pub object_cache: Arc<ObjectCache>,
-    pub field_ids: Arc<Vec<i32>>,
+    pub field_ids: Arc<[i32]>,
     pub name_mapping: Option<Arc<NameMapping>>,
 
     pub partition_filter_cache: Arc<PartitionFilterCache>,

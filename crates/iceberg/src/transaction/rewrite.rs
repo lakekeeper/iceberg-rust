@@ -580,18 +580,15 @@ mod tests {
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
-        MAIN_BRANCH, ManifestEntry, ManifestEntryRef, ManifestFile, ManifestListWriter,
-        ManifestStatus, ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema,
-        SnapshotRef, SnapshotReference, SnapshotRetention, Struct, Transform, Type,
-        UnboundPartitionField, UnboundPartitionSpec,
+        MAIN_BRANCH, ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, SnapshotRef,
+        SnapshotReference, SnapshotRetention, Struct, Transform, Type, UnboundPartitionField,
+        UnboundPartitionSpec,
     };
     use crate::table::Table;
-    use crate::transaction::snapshot::{
-        DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
-    };
     use crate::transaction::tests::{
         append_files, make_data_file, make_v1_minimal_table_in_catalog,
-        make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
+        make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog, stage_delete_files,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, ErrorKind, NamespaceIdent, TableCommit, TableCreation, TableUpdate};
@@ -1978,59 +1975,6 @@ mod tests {
 
     // Removing delete files: the writer side is staged with `SnapshotProducer`,
     // which also records the delete totals the removal lowers.
-
-    /// Adds delete files and keeps every live manifest, as a merge-on-read
-    /// writer does.
-    struct AddDeletesOperation;
-
-    impl SnapshotProduceOperation for AddDeletesOperation {
-        fn operation(&self) -> Operation {
-            Operation::Overwrite
-        }
-
-        fn truncate_full_table(&self) -> bool {
-            false
-        }
-
-        async fn delete_entries(&self, _: &SnapshotProducer<'_>) -> Result<Vec<ManifestEntry>> {
-            Ok(vec![])
-        }
-
-        async fn existing_manifest(
-            &self,
-            producer: &SnapshotProducer<'_>,
-        ) -> Result<Vec<ManifestFile>> {
-            let snapshot = producer.table.metadata().current_snapshot().unwrap();
-            let manifest_list = producer.table.manifest_list_reader(snapshot).load().await?;
-            Ok(manifest_list
-                .consume_entries()
-                .into_iter()
-                .filter(|m| m.has_added_files() || m.has_existing_files())
-                .collect())
-        }
-    }
-
-    /// Commit `delete_files` in one new delete manifest.
-    async fn stage_delete_files(
-        catalog: &impl Catalog,
-        table: &Table,
-        delete_files: Vec<DataFile>,
-    ) -> Table {
-        let mut commit = SnapshotProducer::builder()
-            .with_table(table)
-            .with_commit_uuid(Uuid::now_v7())
-            .with_added_delete_files(delete_files)
-            .build()
-            .commit(AddDeletesOperation, DefaultManifestProcess)
-            .await
-            .unwrap();
-        let table_commit = TableCommit::builder()
-            .ident(table.identifier().clone())
-            .updates(commit.take_updates())
-            .requirements(commit.take_requirements())
-            .build();
-        catalog.update_table(table_commit).await.unwrap()
-    }
 
     fn make_delete_file(
         table: &Table,

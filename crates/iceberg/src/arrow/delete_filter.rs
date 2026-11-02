@@ -23,16 +23,26 @@ use tokio::sync::futures::OwnedNotified;
 use tokio::sync::oneshot::Receiver;
 
 use crate::arrow::caching_delete_file_loader::EqDeleteSet;
+use crate::arrow::equality_delete_index::{EqDeleteIndex, EqDeleteProbe};
 use crate::delete_vector::DeleteVector;
 use crate::runtime::Runtime;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
-use crate::spec::DataContentType;
+use crate::spec::{DataContentType, Type};
 use crate::{Error, ErrorKind, Result};
 
 #[derive(Debug)]
 enum EqDelState {
     Loading(Arc<Notify>),
-    Loaded(Arc<EqDeleteSet>),
+    Loaded(LoadedEqDelete),
+}
+
+/// An equality delete file whose keys are in an [`EqDeleteIndex`].
+#[derive(Clone, Debug)]
+pub(crate) struct LoadedEqDelete {
+    /// The file's id in `index`. A file loaded again after a failed load gets a new id.
+    id: u64,
+    index: Arc<EqDeleteIndex>,
+    key_count: usize,
 }
 
 /// State tracking for positional delete files.
@@ -51,7 +61,34 @@ enum PosDelState {
 struct DeleteFileFilterState {
     delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
     equality_deletes: HashMap<String, EqDelState>,
+    /// One index per equality-column layout (field ids and types).
+    equality_delete_indexes: Vec<Arc<EqDeleteIndex>>,
+    next_equality_delete_id: u64,
     positional_deletes: HashMap<String, PosDelState>,
+}
+
+impl DeleteFileFilterState {
+    /// The index for the layout `fields` and a new file id in it.
+    fn equality_delete_slot(
+        &mut self,
+        fields: &[(String, i32, Type)],
+    ) -> (Arc<EqDeleteIndex>, u64) {
+        let index = match self
+            .equality_delete_indexes
+            .iter()
+            .find(|index| index.layout_matches(fields))
+        {
+            Some(index) => index.clone(),
+            None => {
+                let index = Arc::new(EqDeleteIndex::new(fields.to_vec()));
+                self.equality_delete_indexes.push(index.clone());
+                index
+            }
+        };
+        let id = self.next_equality_delete_id;
+        self.next_equality_delete_id += 1;
+        (index, id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,11 +252,12 @@ impl DeleteFilter {
         }
     }
 
-    /// Retrieve the equality delete set for a given eq delete file path
-    pub(crate) async fn get_equality_delete_set_for_delete_file_path(
+    /// Waits for a load of the equality delete file `file_path` that a task started.
+    /// `None` if no load was started or it failed.
+    pub(crate) async fn get_loaded_equality_delete(
         &self,
         file_path: &str,
-    ) -> Option<Arc<EqDeleteSet>> {
+    ) -> Option<LoadedEqDelete> {
         // Build the `Notified` while holding the read lock. `notified_owned()` records tokio's
         // `notify_waiters_calls` counter at construction and completes on first poll if that
         // counter has since advanced. Reading the counter under the lock guarantees it is taken
@@ -229,37 +267,34 @@ impl DeleteFilter {
             match self.state.read().unwrap().equality_deletes.get(file_path) {
                 None => return None,
                 Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
-                Some(EqDelState::Loaded(set)) => {
-                    return Some(set.clone());
+                Some(EqDelState::Loaded(loaded)) => {
+                    return Some(loaded.clone());
                 }
             }
         };
 
         notified.await;
 
-        // A failed load leaves no set.
+        // A failed load leaves no entry.
         match self.state.read().unwrap().equality_deletes.get(file_path) {
-            Some(EqDelState::Loaded(set)) => Some(set.clone()),
+            Some(EqDelState::Loaded(loaded)) => Some(loaded.clone()),
             _ => None,
         }
     }
 
-    /// Builds the equality-delete sets applicable to the given task, one per distinct
-    /// equality-column layout.
-    pub(crate) async fn build_equality_delete_sets(
+    /// Builds the equality-delete probes for the given task, one per distinct
+    /// equality-column layout. A row is deleted if it matches any probe.
+    pub(crate) async fn build_equality_delete_probes(
         &self,
         file_scan_task: &FileScanTask,
-    ) -> Result<Vec<Arc<EqDeleteSet>>> {
-        let mut groups: HashMap<Vec<i32>, Vec<Arc<EqDeleteSet>>> = HashMap::new();
+    ) -> Result<Vec<EqDeleteProbe>> {
+        let mut probes: Vec<(Vec<i32>, EqDeleteProbe)> = Vec::new();
         for delete in file_scan_task.deletes() {
             if !is_equality_delete(delete) {
                 continue;
             }
 
-            let Some(set) = self
-                .get_equality_delete_set_for_delete_file_path(delete.file_path())
-                .await
-            else {
+            let Some(loaded) = self.get_loaded_equality_delete(delete.file_path()).await else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
                     format!(
@@ -269,39 +304,46 @@ impl DeleteFilter {
                 ));
             };
 
-            let layout = set.fields.iter().map(|(_, id, _)| *id).collect();
-            groups.entry(layout).or_default().push(set);
-        }
-
-        let mut result = Vec::with_capacity(groups.len());
-        for mut sets in groups.into_values() {
-            if sets.len() == 1 {
-                result.push(sets.pop().unwrap());
-            } else {
-                let base = sets
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, set)| set.keys.len())
-                    .map(|(idx, _)| idx)
-                    .expect("group is non-empty");
-                let mut combined = (*sets.swap_remove(base)).clone();
-                for other in &sets {
-                    // The layouts always match here: every set in this group was parsed
-                    // after `BasicDeleteFileLoader::evolve_schema` normalised its batch
-                    // stream against the same `task.schema`, so one field id has one
-                    // recorded type across the scan. `union` re-checks rather than
-                    // trusting that, because the invariant lives in the caller: the
-                    // equality-delete cache is keyed by delete-file path alone, with no
-                    // record of the schema an entry was evolved against, and
-                    // `ArrowReader` is `Clone` with a caller-supplied
-                    // `FileScanTaskStream`. Two tasks with different schemas through one
-                    // reader would reach this point, and an error beats a wrong read.
-                    combined.union(other)?;
+            let ids: Vec<i32> = loaded.index.fields().iter().map(|(_, id, _)| *id).collect();
+            match probes.iter_mut().find(|(probe_ids, _)| *probe_ids == ids) {
+                Some((_, probe)) => {
+                    // Delete files are parsed against the schema of the task that loads them
+                    // first, and `ArrowReader` takes caller-supplied tasks: two tasks with
+                    // different schemas could give one field id two types. An error beats a
+                    // wrong read.
+                    if !Arc::ptr_eq(probe.index(), &loaded.index) {
+                        return Err(Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "Cannot combine equality deletes with different layouts: \
+                                 {:?} vs {:?}",
+                                probe.fields(),
+                                loaded.index.fields()
+                            ),
+                        ));
+                    }
+                    probe.add_file(loaded.id, loaded.key_count);
                 }
-                result.push(Arc::new(combined));
+                None => {
+                    let mut probe = EqDeleteProbe::new(loaded.index);
+                    probe.add_file(loaded.id, loaded.key_count);
+                    probes.push((ids, probe));
+                }
             }
         }
-        Ok(result)
+        Ok(probes.into_iter().map(|(_, probe)| probe).collect())
+    }
+
+    /// The equality-delete indexes, one per layout, and the number of loaded files.
+    #[cfg(test)]
+    pub(crate) fn equality_delete_indexes(&self) -> (Vec<Arc<EqDeleteIndex>>, usize) {
+        let state = self.state.read().unwrap();
+        let loaded = state
+            .equality_deletes
+            .values()
+            .filter(|state| matches!(state, EqDelState::Loaded(_)))
+            .count();
+        (state.equality_delete_indexes.clone(), loaded)
     }
 
     pub(crate) fn upsert_delete_vector(
@@ -321,29 +363,43 @@ impl DeleteFilter {
         *entry.lock().unwrap() |= delete_vector;
     }
 
-    /// Stores the equality delete set that `eq_del` delivers, and wakes the tasks
-    /// waiting on `notify`, the notifier from [`Self::try_start_eq_del_load`].
+    /// Adds the keys of the equality delete file that `eq_del` delivers to the index of its
+    /// layout, and wakes the tasks waiting on `notify`, the notifier from
+    /// [`Self::try_start_eq_del_load`]. The parsed set is dropped once added.
     pub(crate) fn insert_equality_delete(
         &self,
         delete_file_path: &str,
         notify: Arc<Notify>,
-        eq_del: Receiver<Arc<EqDeleteSet>>,
+        eq_del: Receiver<EqDeleteSet>,
     ) {
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         self.runtime.cpu().spawn(async move {
-            let eq_del = eq_del.await;
+            // A panic before the wake-up below would leave the waiters waiting forever.
+            let loaded = eq_del.await.ok().map(|eq_del| {
+                let (index, id) = state
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .equality_delete_slot(&eq_del.fields);
+                let key_count = eq_del.keys.len();
+                // Outside the state lock: other files load meanwhile.
+                index.insert_file(eq_del.keys, id);
+                LoadedEqDelete {
+                    id,
+                    index,
+                    key_count,
+                }
+            });
             {
-                // A panic here would leave the waiters waiting forever.
                 let mut state = state.write().unwrap_or_else(PoisonError::into_inner);
-                match eq_del {
-                    Ok(eq_del) => {
+                match loaded {
+                    Some(loaded) => {
                         state
                             .equality_deletes
-                            .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                            .insert(delete_file_path, EqDelState::Loaded(loaded));
                     }
                     // The load failed: a later task loads the file again.
-                    Err(_) => {
+                    None => {
                         state.equality_deletes.remove(&delete_file_path);
                     }
                 }
@@ -680,7 +736,7 @@ pub(crate) mod tests {
         let notify = filter.try_start_eq_del_load(path).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete(path, notify, rx);
-        tx.send(Arc::new(set)).unwrap();
+        tx.send(set).unwrap();
     }
 
     // A task that finds the load started before the loader stores its receiver
@@ -690,23 +746,24 @@ pub(crate) mod tests {
         let filter = DeleteFilter::new(Runtime::current());
         let path = "eq-a.parquet";
         let notify = filter.try_start_eq_del_load(path).unwrap();
-        let waiter = filter.get_equality_delete_set_for_delete_file_path(path);
+        let waiter = filter.get_loaded_equality_delete(path);
         tokio::pin!(waiter);
         assert!(futures::poll!(&mut waiter).is_pending());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete(path, notify, rx);
-        let set = Arc::new(EqDeleteSet {
+        tx.send(EqDeleteSet {
             keys: HashSet::from([EqDeleteKey(vec![Some(Datum::long(1))])]),
             fields: vec![("id".to_string(), 1, Type::Primitive(PrimitiveType::Long))],
-        });
-        tx.send(set.clone()).unwrap();
+        })
+        .unwrap();
 
         let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await
             .expect("the waiter must be woken")
             .unwrap();
-        assert!(Arc::ptr_eq(&loaded, &set));
+        assert_eq!(loaded.key_count, 1);
+        assert_eq!(loaded.index.len(), 1);
     }
 
     // A task waiting for a failed equality delete load fails, and a later task loads
@@ -717,11 +774,11 @@ pub(crate) mod tests {
         let path = "eq-a.parquet";
         let task = task_with_eq_deletes(&[path]);
         let notify = filter.try_start_eq_del_load(path).unwrap();
-        let waiter = filter.build_equality_delete_sets(&task);
+        let waiter = filter.build_equality_delete_probes(&task);
         tokio::pin!(waiter);
         assert!(futures::poll!(&mut waiter).is_pending());
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<Arc<EqDeleteSet>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<EqDeleteSet>();
         filter.insert_equality_delete(path, notify, rx);
         drop(tx);
 
@@ -745,11 +802,8 @@ pub(crate) mod tests {
         let pos_path = "pos-a.parquet";
         let eq_notify = filter.try_start_eq_del_load(eq_path).unwrap();
         let eq_filter = filter.clone();
-        let mut eq_waiter = Box::pin(async move {
-            eq_filter
-                .get_equality_delete_set_for_delete_file_path(eq_path)
-                .await
-        });
+        let mut eq_waiter =
+            Box::pin(async move { eq_filter.get_loaded_equality_delete(eq_path).await });
         assert!(futures::poll!(&mut eq_waiter).is_pending());
         let PosDelLoadAction::Load(pos_load) = filter.try_start_pos_del_load(pos_path) else {
             panic!("expected Load for a new file");
@@ -768,7 +822,7 @@ pub(crate) mod tests {
         assert!(filter.state.is_poisoned());
 
         let timeout = std::time::Duration::from_secs(5);
-        let (tx, rx) = tokio::sync::oneshot::channel::<Arc<EqDeleteSet>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<EqDeleteSet>();
         filter.insert_equality_delete(eq_path, eq_notify, rx);
         drop(tx);
         let eq_result = tokio::time::timeout(timeout, tokio::spawn(eq_waiter))
@@ -784,7 +838,7 @@ pub(crate) mod tests {
 
     // Delete files that key on different equality columns must not be merged.
     #[tokio::test]
-    async fn test_build_equality_delete_sets_mixed_ids_not_merged() {
+    async fn test_build_equality_delete_probes_mixed_ids_not_merged() {
         let task = task_with_eq_deletes(&["eq-a.parquet", "eq-b.parquet"]);
         let filter = DeleteFilter::new(Runtime::current());
 
@@ -797,34 +851,34 @@ pub(crate) mod tests {
             fields: vec![("id2".to_string(), 2, Type::Primitive(PrimitiveType::Long))],
         });
 
-        let sets = filter.build_equality_delete_sets(&task).await.unwrap();
-        assert_eq!(sets.len(), 2);
+        let probes = filter.build_equality_delete_probes(&task).await.unwrap();
+        assert_eq!(probes.len(), 2);
     }
 
-    // `union` must refuse a mismatch itself rather than trusting the caller to have grouped.
-    #[test]
-    fn test_union_rejects_mismatched_layout() {
-        let mut a = EqDeleteSet {
+    // Delete files with one field id in two types are refused, not probed with either type.
+    #[tokio::test]
+    async fn test_build_equality_delete_probes_rejects_mismatched_layout() {
+        let task = task_with_eq_deletes(&["eq-a.parquet", "eq-b.parquet"]);
+        let filter = DeleteFilter::new(Runtime::current());
+        insert_set(&filter, "eq-a.parquet", EqDeleteSet {
             keys: HashSet::from([EqDeleteKey(vec![Some(Datum::long(1))])]),
             fields: vec![("id".to_string(), 1, Type::Primitive(PrimitiveType::Long))],
-        };
-        let b = EqDeleteSet {
+        });
+        insert_set(&filter, "eq-b.parquet", EqDeleteSet {
             keys: HashSet::from([EqDeleteKey(vec![Some(Datum::int(2))])]),
             fields: vec![("id".to_string(), 1, Type::Primitive(PrimitiveType::Int))],
-        };
-        assert!(!a.layout_matches(&b));
-        let err = a.union(&b).expect_err("differing types must be rejected");
+        });
+
+        let err = filter
+            .build_equality_delete_probes(&task)
+            .await
+            .expect_err("differing types must be rejected");
         assert!(err.to_string().contains("different layouts"), "{err}");
-        assert_eq!(
-            a.keys.len(),
-            1,
-            "a rejected union must not mutate the target"
-        );
     }
 
-    // Delete files sharing an equality-column layout are unioned into a single set.
+    // Delete files sharing an equality-column layout share one probe.
     #[tokio::test]
-    async fn test_build_equality_delete_sets_same_layout_unioned() {
+    async fn test_build_equality_delete_probes_same_layout_shared() {
         let task = task_with_eq_deletes(&["eq-a.parquet", "eq-b.parquet"]);
         let filter = DeleteFilter::new(Runtime::current());
 
@@ -838,10 +892,10 @@ pub(crate) mod tests {
             fields,
         });
 
-        let sets = filter.build_equality_delete_sets(&task).await.unwrap();
-        assert_eq!(sets.len(), 1);
+        let probes = filter.build_equality_delete_probes(&task).await.unwrap();
+        assert_eq!(probes.len(), 1);
         assert_eq!(
-            sets[0].keys,
+            probes[0].keys(),
             HashSet::from([
                 EqDeleteKey(vec![Some(Datum::long(1))]),
                 EqDeleteKey(vec![Some(Datum::long(2))]),

@@ -254,6 +254,59 @@ impl DataFile {
             .collect())
     }
 
+    /// This data file without its column metrics: sizes, value, null and NaN
+    /// counts, and bounds. Removing a file needs only its identity and
+    /// partition, so a caller that holds many files to remove keeps them small.
+    pub fn without_column_metrics(&self) -> DataFile {
+        // No `..`: a new field must be decided on here.
+        let DataFile {
+            content,
+            file_path,
+            file_format,
+            partition,
+            record_count,
+            file_size_in_bytes,
+            column_sizes: _,
+            value_counts: _,
+            null_value_counts: _,
+            nan_value_counts: _,
+            lower_bounds: _,
+            upper_bounds: _,
+            key_metadata,
+            split_offsets,
+            equality_ids,
+            sort_order_id,
+            first_row_id,
+            partition_spec_id,
+            referenced_data_file,
+            content_offset,
+            content_size_in_bytes,
+        } = self;
+        DataFile {
+            content: *content,
+            file_path: file_path.clone(),
+            file_format: *file_format,
+            partition: partition.clone(),
+            record_count: *record_count,
+            file_size_in_bytes: *file_size_in_bytes,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: key_metadata.clone(),
+            split_offsets: split_offsets.clone(),
+            equality_ids: equality_ids.clone(),
+            sort_order_id: *sort_order_id,
+            first_row_id: *first_row_id,
+            partition_spec_id: *partition_spec_id,
+            referenced_data_file: referenced_data_file.clone(),
+            content_offset: *content_offset,
+            content_size_in_bytes: *content_size_in_bytes,
+        }
+    }
+
     /// Get the content type of the data file (data, equality deletes, or position deletes)
     pub fn content_type(&self) -> DataContentType {
         self.content
@@ -795,5 +848,42 @@ mod test {
                 .kind(),
             ErrorKind::DataInvalid
         );
+    }
+
+    #[test]
+    fn test_without_column_metrics_keeps_every_other_field() {
+        let file = DataFile {
+            content: DataContentType::PositionDeletes,
+            file_path: "a.parquet".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: Struct::from_iter([Some(Literal::int(7))]),
+            record_count: 10,
+            file_size_in_bytes: 100,
+            column_sizes: HashMap::from([(1, 40)]),
+            value_counts: HashMap::from([(1, 10)]),
+            null_value_counts: HashMap::from([(1, 0)]),
+            nan_value_counts: HashMap::from([(1, 0)]),
+            lower_bounds: HashMap::from([(1, Datum::long(1))]),
+            upper_bounds: HashMap::from([(1, Datum::long(9))]),
+            key_metadata: Some(vec![1]),
+            split_offsets: Some(vec![4]),
+            equality_ids: Some(vec![1]),
+            sort_order_id: Some(1),
+            first_row_id: Some(7),
+            partition_spec_id: 2,
+            referenced_data_file: Some("d.parquet".to_string()),
+            content_offset: Some(4),
+            content_size_in_bytes: Some(20),
+        };
+
+        assert_eq!(file.without_column_metrics(), DataFile {
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            ..file.clone()
+        });
     }
 }

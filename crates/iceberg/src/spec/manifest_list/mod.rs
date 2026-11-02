@@ -30,7 +30,6 @@ pub use reader::*;
 pub use serde_bytes::ByteBuf;
 pub use writer::*;
 
-use self::_const_schema::MANIFEST_LIST_AVRO_SCHEMA_V1;
 use super::FormatVersion;
 use crate::error::Result;
 
@@ -61,9 +60,9 @@ impl ManifestList {
     pub fn parse_with_version(bs: &[u8], version: FormatVersion) -> Result<ManifestList> {
         match version {
             FormatVersion::V1 => {
-                let reader = Reader::builder(bs)
-                    .reader_schema(&MANIFEST_LIST_AVRO_SCHEMA_V1)
-                    .build()?;
+                // Avro schema resolution matches fields by name, and v1 writers use two names
+                // for the file counts; serde aliases on `ManifestFileV1` accept both.
+                let reader = Reader::new(bs)?;
                 let values = Value::Array(reader.collect::<std::result::Result<Vec<Value>, _>>()?);
                 from_value::<_serde::ManifestListV1>(&values)?.try_into()
             }
@@ -95,7 +94,8 @@ impl ManifestList {
 mod test {
     use std::fs;
 
-    use apache_avro::{Codec, Writer};
+    use apache_avro::types::{Record, Value};
+    use apache_avro::{Codec, Schema as AvroSchema, Writer};
     use tempfile::TempDir;
 
     use super::_const_schema::MANIFEST_LIST_AVRO_SCHEMA_V2;
@@ -235,6 +235,117 @@ mod test {
             ManifestList::parse_with_version(&bs, FormatVersion::V2).unwrap();
 
         assert_eq!(manifest_list, parsed_manifest_list);
+    }
+
+    /// A v1 manifest list as Java Iceberg 1.5 and later writes it: the file counts are named
+    /// `added_files_count` etc., as in the spec (`V1Metadata.MANIFEST_LIST_SCHEMA`).
+    fn java_v1_manifest_list() -> Vec<u8> {
+        let opt = |name: &str, ty: &str, id: i32| {
+            format!(r#"{{"name":"{name}","type":["null","{ty}"],"default":null,"field-id":{id}}}"#)
+        };
+        let schema = AvroSchema::parse_str(&format!(
+            r#"{{"type":"record","name":"manifest_file","fields":[
+                {{"name":"manifest_path","type":"string","field-id":500}},
+                {{"name":"manifest_length","type":"long","field-id":501}},
+                {{"name":"partition_spec_id","type":"int","field-id":502}},
+                {{"name":"added_snapshot_id","type":"long","field-id":503}},
+                {},{},{},
+                {{"name":"partitions","type":["null",{{"type":"array","items":{{"type":"record",
+                    "name":"r508","fields":[
+                    {{"name":"contains_null","type":"boolean","field-id":509}},
+                    {},{},{}]}},"element-id":508}}],"default":null,"field-id":507}},
+                {},{},{},{}]}}"#,
+            opt("added_files_count", "int", 504),
+            opt("existing_files_count", "int", 505),
+            opt("deleted_files_count", "int", 506),
+            opt("contains_nan", "boolean", 518),
+            opt("lower_bound", "bytes", 510),
+            opt("upper_bound", "bytes", 511),
+            opt("added_rows_count", "long", 512),
+            opt("existing_rows_count", "long", 513),
+            opt("deleted_rows_count", "long", 514),
+            opt("key_metadata", "bytes", 519),
+        ))
+        .unwrap();
+        let some = |v: Value| Value::Union(1, Box::new(v));
+        let bound = |n: i64| some(Value::Bytes(Datum::long(n).to_bytes().unwrap().to_vec()));
+        let summary = Value::Record(vec![
+            ("contains_null".to_string(), Value::Boolean(false)),
+            ("contains_nan".to_string(), some(Value::Boolean(false))),
+            ("lower_bound".to_string(), bound(1)),
+            ("upper_bound".to_string(), bound(4)),
+        ]);
+        let mut record = Record::new(&schema).unwrap();
+        record.put("manifest_path", "s3://bucket/t/metadata/java-m0.avro");
+        record.put("manifest_length", 6000i64);
+        record.put("partition_spec_id", 0i32);
+        record.put("added_snapshot_id", 77i64);
+        record.put("added_files_count", some(Value::Int(3)));
+        record.put("existing_files_count", some(Value::Int(2)));
+        record.put("deleted_files_count", some(Value::Int(1)));
+        record.put("partitions", some(Value::Array(vec![summary])));
+        record.put("added_rows_count", some(Value::Long(30)));
+        record.put("existing_rows_count", some(Value::Long(20)));
+        record.put("deleted_rows_count", some(Value::Long(10)));
+        record.put("key_metadata", Value::Union(0, Box::new(Value::Null)));
+        let mut writer = Writer::new(&schema, Vec::new()).unwrap();
+        writer.append_value(record).unwrap();
+        writer.into_inner().unwrap()
+    }
+
+    fn java_v1_manifest_file() -> ManifestFile {
+        ManifestFile {
+            manifest_path: "s3://bucket/t/metadata/java-m0.avro".to_string(),
+            manifest_length: 6000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 77,
+            added_files_count: Some(3),
+            existing_files_count: Some(2),
+            deleted_files_count: Some(1),
+            added_rows_count: Some(30),
+            existing_rows_count: Some(20),
+            deleted_rows_count: Some(10),
+            partitions: Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan: Some(false),
+                lower_bound: Some(Datum::long(1).to_bytes().unwrap()),
+                upper_bound: Some(Datum::long(4).to_bytes().unwrap()),
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_manifest_list_v1_with_java_field_names() {
+        let parsed =
+            ManifestList::parse_with_version(&java_v1_manifest_list(), FormatVersion::V1).unwrap();
+
+        assert_eq!(parsed.entries(), &[java_v1_manifest_file()]);
+    }
+
+    /// A v1 table carries a Java-written manifest into a new manifest list and is then upgraded
+    /// to v2, where the file counts are required.
+    #[tokio::test]
+    async fn test_java_v1_manifest_carried_forward_keeps_counts_after_upgrade() {
+        let carried =
+            ManifestList::parse_with_version(&java_v1_manifest_list(), FormatVersion::V1).unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!("{}/carried.avro", tmp_dir.path().to_str().unwrap());
+        let output = FileIO::new_with_fs().new_output(path.clone()).unwrap();
+        let mut writer = ManifestListWriter::v1(output.writer().await.unwrap(), 78, Some(77));
+        writer
+            .add_manifests(carried.consume_entries().into_iter())
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let parsed =
+            ManifestList::parse_with_version(&fs::read(path).unwrap(), FormatVersion::V2).unwrap();
+
+        assert_eq!(parsed.entries(), &[java_v1_manifest_file()]);
     }
 
     #[test]

@@ -25,6 +25,7 @@ use tokio::sync::oneshot::{Receiver, channel};
 
 use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard, is_equality_delete};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
+use crate::arrow::equality_delete_index::EqDeleteProbe;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::DeleteVector;
@@ -45,7 +46,7 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub(crate) struct EqDeleteKey(pub(crate) Vec<Option<Datum>>);
 
-/// The parsed contents of equality-delete files sharing one column layout.
+/// The parsed contents of one equality delete file.
 #[derive(Debug, Clone)]
 pub(crate) struct EqDeleteSet {
     pub(crate) keys: HashSet<EqDeleteKey>,
@@ -58,37 +59,6 @@ impl EqDeleteSet {
             keys: HashSet::new(),
             fields,
         }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
-    /// Check if the layout of `other` matches `self`'s layout by Id and Type.
-    pub(crate) fn layout_matches(&self, other: &EqDeleteSet) -> bool {
-        self.fields.len() == other.fields.len()
-            && self
-                .fields
-                .iter()
-                .zip(other.fields.iter())
-                .all(|((_, id, ty), (_, other_id, other_ty))| id == other_id && ty == other_ty)
-    }
-
-    /// Merges `other`'s keys into this set if the layouts match, errors if
-    /// they do not match.
-    pub(crate) fn union(&mut self, other: &EqDeleteSet) -> Result<()> {
-        if !self.layout_matches(other) {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                format!(
-                    "Cannot union equality-delete sets with different layouts: \
-                     {:?} vs {:?}",
-                    self.fields, other.fields
-                ),
-            ));
-        }
-        self.keys.extend(other.keys.iter().cloned());
-        Ok(())
     }
 }
 
@@ -113,7 +83,7 @@ enum DeleteFileContext {
     FreshEqDel {
         batch_stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
-        sender: tokio::sync::oneshot::Sender<Arc<EqDeleteSet>>,
+        sender: tokio::sync::oneshot::Sender<EqDeleteSet>,
     },
     // A V3 deletion vector: the raw deletion-vector-v1 blob bytes, the data file whose rows it
     // deletes, and the manifest's expected cardinality. The blob is decoded and validated in the
@@ -191,7 +161,8 @@ impl CachingDeleteFileLoader {
     ///    delete tasks, or a single (data file path, delete vector) pair for a deletion vector
     ///    task. For equality delete file tasks, this results in an equality-delete set.
     ///  * The equality-delete sets resulting from equality deletes are sent to their associated
-    ///    oneshot channel to store them in the right place in the delete file managers state.
+    ///    oneshot channel, which adds their keys to the delete filter's index for their layout
+    ///    and drops the set.
     ///  * The results of all of these futures are awaited on in parallel with the specified
     ///    level of concurrency and collected into a vec. We then combine all the delete
     ///    vector maps that resulted from any positional delete or delete vector files into a
@@ -233,7 +204,7 @@ impl CachingDeleteFileLoader {
     /// ```
     pub(crate) fn load_deletes(
         &self,
-        delete_file_entries: &[FileScanTaskDeleteFile],
+        delete_file_entries: &[Arc<FileScanTaskDeleteFile>],
         schema: SchemaRef,
     ) -> Receiver<Result<DeleteFilter>> {
         let (tx, rx) = channel();
@@ -307,17 +278,22 @@ impl CachingDeleteFileLoader {
         rx
     }
 
-    /// Builds the equality-delete sets that apply to `task`, after waiting for the
+    #[cfg(test)]
+    pub(crate) fn delete_filter(&self) -> &DeleteFilter {
+        &self.delete_filter
+    }
+
+    /// Builds the equality-delete probes that apply to `task`, after waiting for the
     /// loads of its equality delete files that other tasks started. A file whose load
     /// failed is loaded again.
-    pub(crate) async fn build_equality_delete_sets(
+    pub(crate) async fn build_equality_delete_probes(
         &self,
         task: &FileScanTask,
-    ) -> Result<Vec<Arc<EqDeleteSet>>> {
+    ) -> Result<Vec<EqDeleteProbe>> {
         for delete in task.deletes().iter().filter(|d| is_equality_delete(d)) {
             while self
                 .delete_filter
-                .get_equality_delete_set_for_delete_file_path(delete.file_path())
+                .get_loaded_equality_delete(delete.file_path())
                 .await
                 .is_none()
             {
@@ -326,7 +302,7 @@ impl CachingDeleteFileLoader {
                     .unwrap()?;
             }
         }
-        self.delete_filter.build_equality_delete_sets(task).await
+        self.delete_filter.build_equality_delete_probes(task).await
     }
 
     async fn load_file_for_task(
@@ -550,7 +526,7 @@ impl CachingDeleteFileLoader {
                         .await?;
 
                 sender
-                    .send(Arc::new(eq_delete_set))
+                    .send(eq_delete_set)
                     .map_err(|_| {
                         Error::new(
                             ErrorKind::Unexpected,
@@ -1557,11 +1533,11 @@ mod tests {
 
         // Verify both delete types can be processed together
         let result = delete_filter
-            .build_equality_delete_sets(&file_scan_task)
+            .build_equality_delete_probes(&file_scan_task)
             .await;
         assert!(
             result.is_ok(),
-            "Failed to build equality delete sets: {:?}",
+            "Failed to build equality delete probes: {:?}",
             result.err()
         );
     }
@@ -1721,7 +1697,11 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap().unwrap();
+        let delete_filter = loader
+            .load_deletes(&[Arc::new(dv)], schema)
+            .await
+            .unwrap()
+            .unwrap();
 
         let delete_vector = delete_filter
             .get_delete_vector_for_path(&data_file_path)
@@ -1777,7 +1757,11 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap().unwrap();
+        let delete_filter = loader
+            .load_deletes(&[Arc::new(dv)], schema)
+            .await
+            .unwrap()
+            .unwrap();
 
         let delete_vector = delete_filter
             .get_delete_vector_for_path(&data_file_path)
@@ -1820,7 +1804,7 @@ mod tests {
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
         let err = loader
-            .load_deletes(&[dv], schema)
+            .load_deletes(&[Arc::new(dv)], schema)
             .await
             .unwrap()
             .unwrap_err();
@@ -2056,7 +2040,7 @@ mod tests {
         // The file opens but fails to parse, so the load is abandoned after the open.
         let invalid = write(vec![-1]);
         let err = loader
-            .load_deletes(&[invalid], Arc::clone(&schema))
+            .load_deletes(&[Arc::new(invalid)], Arc::clone(&schema))
             .await
             .unwrap()
             .err()
@@ -2067,7 +2051,7 @@ mod tests {
         let valid = write(vec![1, 3]);
         let filter = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            loader.load_deletes(&[valid], schema),
+            loader.load_deletes(&[Arc::new(valid)], schema),
         )
         .await
         .expect("retry waited on the failed load")
@@ -2118,7 +2102,7 @@ mod tests {
         else {
             panic!("expected Load for a new file");
         };
-        let waiter = loader.load_deletes(std::slice::from_ref(&pos_del), schema);
+        let waiter = loader.load_deletes(&[Arc::new(pos_del.clone())], schema);
         // On this single-thread runtime, the spawned load runs until it waits for `guard`.
         tokio::task::yield_now().await;
         drop(guard);
@@ -2181,22 +2165,22 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let waiter = loader.build_equality_delete_sets(&task);
+        let waiter = loader.build_equality_delete_probes(&task);
         tokio::pin!(waiter);
         assert!(futures::poll!(&mut waiter).is_pending());
-        let (tx, rx) = channel::<Arc<EqDeleteSet>>();
+        let (tx, rx) = channel::<EqDeleteSet>();
         loader
             .delete_filter
             .insert_equality_delete(&path, notify, rx);
         drop(tx);
 
-        let sets = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        let probes = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await
             .expect("the waiter must be woken")
             .unwrap();
-        let sets: Vec<_> = sets
+        let sets: Vec<_> = probes
             .iter()
-            .map(|set| (set.keys.clone(), set.fields.clone()))
+            .map(|probe| (probe.keys(), probe.fields().to_vec()))
             .collect();
         assert_eq!(sets, vec![(
             HashSet::from([
@@ -2205,5 +2189,118 @@ mod tests {
             ]),
             vec![("y".to_string(), 2, Type::Primitive(PrimitiveType::Long))],
         )]);
+    }
+
+    // Flink upsert shape: data file j sees the delete files of the later commits. However many
+    // data files are read at once, the reader holds each key once, in one index shared by
+    // every data file, and each data file matches only its own delete files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_equality_delete_keys_do_not_grow_with_concurrency() {
+        const COMMITS: i64 = 40;
+        const KEYS_PER_FILE: i64 = 500;
+        let tmp_dir = TempDir::new().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        // Commit c deletes keys c * KEYS_PER_FILE .. + KEYS_PER_FILE, and key 0 again.
+        let delete_files: Vec<FileScanTaskDeleteFile> = (0..COMMITS)
+            .map(|c| {
+                let path = format!("{}/eq-{c}.parquet", tmp_dir.path().to_str().unwrap());
+                let keys = Int64Array::from_iter_values(
+                    (c * KEYS_PER_FILE..(c + 1) * KEYS_PER_FILE).chain((c > 0).then_some(0)),
+                );
+                let batch =
+                    RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(keys)]).unwrap();
+                let mut writer =
+                    ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema.clone(), None)
+                        .unwrap();
+                writer.write(&batch).unwrap();
+                writer.close().unwrap();
+                FileScanTaskDeleteFile::builder()
+                    .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+                    .with_file_path(path)
+                    .with_file_type(DataContentType::EqualityDeletes)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .with_equality_ids(Some(vec![1]))
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let tasks: Vec<FileScanTask> = (0..COMMITS as usize)
+            .map(|j| {
+                FileScanTask::builder()
+                    .with_file_size_in_bytes(0)
+                    .with_start(0)
+                    .with_length(0)
+                    .with_data_file_path(format!("data-{j}.parquet"))
+                    .with_data_file_format(DataFileFormat::Parquet)
+                    .with_schema(schema.clone())
+                    .with_project_field_ids(vec![1])
+                    .with_deletes(delete_files[j + 1..].to_vec())
+                    .with_case_sensitive(false)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+
+        for concurrency in [1, 4, 16] {
+            let loader = CachingDeleteFileLoader::new(
+                FileIO::new_with_fs(),
+                concurrency,
+                Runtime::current(),
+            );
+            // Every data file's probes stay alive, as for data files read at once.
+            let probes: Vec<Vec<EqDeleteProbe>> = futures::stream::iter(&tasks)
+                .map(|task| {
+                    let loader = loader.clone();
+                    async move {
+                        loader
+                            .load_deletes(task.deletes(), task.schema_ref())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        loader.build_equality_delete_probes(task).await.unwrap()
+                    }
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
+
+            let (indexes, loaded) = loader.delete_filter.equality_delete_indexes();
+            assert_eq!(loaded, COMMITS as usize - 1, "concurrency {concurrency}");
+            assert_eq!(indexes.len(), 1, "concurrency {concurrency}");
+            // Keys of commits 1.., key 0 included once.
+            assert_eq!(
+                indexes[0].len(),
+                ((COMMITS - 1) * KEYS_PER_FILE + 1) as usize,
+                "concurrency {concurrency}"
+            );
+            for (j, probes) in probes.iter().enumerate() {
+                if j + 1 == COMMITS as usize {
+                    assert!(probes.is_empty());
+                    continue;
+                }
+                assert_eq!(probes.len(), 1);
+                assert!(Arc::ptr_eq(probes[0].index(), &indexes[0]));
+                let expected: HashSet<EqDeleteKey> = ((j as i64 + 1) * KEYS_PER_FILE
+                    ..COMMITS * KEYS_PER_FILE)
+                    .chain([0])
+                    .map(|k| EqDeleteKey(vec![Some(Datum::long(k))]))
+                    .collect();
+                assert_eq!(probes[0].keys(), expected, "data file {j}");
+            }
+        }
     }
 }
