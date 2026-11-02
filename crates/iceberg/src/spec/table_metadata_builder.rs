@@ -22,9 +22,9 @@ use uuid::Uuid;
 
 use super::{
     DEFAULT_PARTITION_SPEC_ID, DEFAULT_SCHEMA_ID, FormatVersion, MAIN_BRANCH, MetadataLog,
-    ONE_MINUTE_MS, PartitionSpec, PartitionSpecBuilder, PartitionStatisticsFile, Schema, SchemaRef,
-    Snapshot, SnapshotLog, SnapshotReference, SnapshotRetention, SortOrder, SortOrderRef,
-    StatisticsFile, StructType, TableMetadata, TableProperties, UNPARTITIONED_LAST_ASSIGNED_ID,
+    PartitionSpec, PartitionSpecBuilder, PartitionStatisticsFile, Schema, SchemaRef, Snapshot,
+    SnapshotLog, SnapshotReference, SnapshotRetention, SortOrder, SortOrderRef, StatisticsFile,
+    StructType, TableMetadata, TableProperties, UNPARTITIONED_LAST_ASSIGNED_ID,
     UnboundPartitionSpec,
 };
 use crate::error::{Error, ErrorKind, Result, invalid_data};
@@ -355,30 +355,6 @@ impl TableMetadataBuilder {
             )));
         }
 
-        if let Some(last) = self.metadata.snapshot_log.last() {
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
-            if snapshot.timestamp_ms() - last.timestamp_ms < -ONE_MINUTE_MS {
-                return Err(invalid_data!(
-                    "Invalid snapshot timestamp {}: before last snapshot timestamp {}",
-                    snapshot.timestamp_ms(),
-                    last.timestamp_ms
-                ));
-            }
-        }
-
-        let max_last_updated = self
-            .last_updated_ms
-            .unwrap_or_default()
-            .max(self.metadata.last_updated_ms);
-        if snapshot.timestamp_ms() - max_last_updated < -ONE_MINUTE_MS {
-            return Err(invalid_data!(
-                "Invalid snapshot timestamp {}: before last updated timestamp {}",
-                snapshot.timestamp_ms(),
-                max_last_updated
-            ));
-        }
-
         let mut added_rows = None;
         if self.metadata.format_version >= MIN_FORMAT_VERSION_ROW_LINEAGE {
             if let Some((first_row_id, added_rows_count)) = snapshot.row_range() {
@@ -490,12 +466,13 @@ impl TableMetadataBuilder {
     /// refs, this rewinds the branch as if the discarded snapshots had never been committed:
     /// it resets the branch reference (and, for `main`, the current-snapshot pointer) to
     /// `snapshot_id`, drops the discarded snapshots together with their statistics and
-    /// snapshot-log entries, and lowers `last_sequence_number` and the last-updated timestamp
-    /// back to the retained snapshots. Lowering those watermarks frees the discarded sequence
-    /// numbers again, so a subsequent [`Self::add_snapshot`] may commit a snapshot that was
-    /// originally built on top of `snapshot_id` — reusing its sequence number and an earlier
-    /// timestamp. The `metadata_log` is left untouched: the discarded snapshots' metadata files
-    /// remain valid previous versions of the table.
+    /// snapshot-log entries, and lowers `last_sequence_number` back to the retained snapshots.
+    /// That frees the discarded sequence numbers again, so a subsequent [`Self::add_snapshot`]
+    /// may commit a snapshot that was originally built on top of `snapshot_id`, reusing its
+    /// sequence number. [`Self::build`] still refuses such a snapshot if its timestamp is more
+    /// than one minute before the previous file's `last-updated-ms`. The `metadata_log` is left
+    /// untouched: the discarded snapshots' metadata files remain valid previous versions of the
+    /// table.
     ///
     /// The change is recorded as a [`TableUpdate::SetSnapshotRef`] followed by a
     /// [`TableUpdate::RemoveSnapshots`]. Callers are responsible for ensuring the discarded
@@ -610,8 +587,8 @@ impl TableMetadataBuilder {
             snapshot_ids: discarded,
         });
 
-        // Lower the sequence-number and updated-timestamp watermarks to the retained snapshots
-        // so a rebased commit can reuse the freed sequence numbers.
+        // Lower the sequence-number watermark to the retained snapshots so a rebased commit can
+        // reuse the freed sequence numbers.
         self.metadata.last_sequence_number = self
             .metadata
             .snapshots
@@ -619,15 +596,6 @@ impl TableMetadataBuilder {
             .map(|s| s.sequence_number())
             .max()
             .unwrap_or(0);
-        let last_updated_ms = self
-            .metadata
-            .snapshots
-            .values()
-            .map(|s| s.timestamp_ms())
-            .max()
-            .unwrap_or(self.metadata.last_updated_ms);
-        self.metadata.last_updated_ms = last_updated_ms;
-        self.last_updated_ms = Some(last_updated_ms);
 
         Ok(self)
     }
@@ -1223,6 +1191,14 @@ impl TableMetadataBuilder {
     }
 
     /// Build the table metadata.
+    ///
+    /// # Errors
+    /// - The default partition spec or sort order does not fit the current schema.
+    /// - The snapshot log does not end with the current snapshot.
+    /// - The result fails the checks every reader makes when it loads the metadata, for example:
+    ///   snapshot-log or metadata-log entries out of order by more than one minute, or a
+    ///   `last-updated-ms` more than one minute before the last entry of either log. The
+    ///   metadata-log check includes the entry for the previous metadata file.
     pub fn build(mut self) -> Result<TableMetadataBuildResult> {
         self.metadata.last_updated_ms = self
             .last_updated_ms
@@ -1246,12 +1222,12 @@ impl TableMetadataBuilder {
             .build(&schema)?;
 
         self.update_snapshot_log()?;
-        self.metadata.try_normalize()?;
-
+        // Validate the metadata log with the entry for the previous file, as every reader does.
         if let Some(hist_entry) = self.previous_history_entry.take() {
             self.metadata.metadata_log.push(hist_entry);
         }
         let expired_metadata_logs = self.expire_metadata_log();
+        self.metadata.try_normalize()?;
 
         Ok(TableMetadataBuildResult {
             metadata: self.metadata,
@@ -2435,7 +2411,7 @@ mod tests {
         assert_eq!(rolled.snapshot_log.len(), 1);
         assert_eq!(rolled.snapshot_log[0].snapshot_id, 1);
 
-        // A writer's snapshot pre-assigned seq 2 (and an older timestamp) now applies cleanly.
+        // A writer's snapshot pre-assigned seq 2 now applies cleanly.
         let writer = Snapshot::builder()
             .with_snapshot_id(3)
             .with_parent_snapshot_id(Some(1))
@@ -2915,6 +2891,229 @@ mod tests {
         );
         assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
         assert!(err.retryable());
+    }
+
+    const PREVIOUS_FILE: &str = "s3://bucket/test/location/metadata/previous.json";
+
+    /// `metadata` as a reader loads it.
+    fn reload(metadata: &TableMetadata) -> TableMetadata {
+        serde_json::from_value(serde_json::to_value(metadata).unwrap()).unwrap()
+    }
+
+    fn snapshot_at(
+        snapshot_id: i64,
+        parent: Option<i64>,
+        sequence_number: i64,
+        timestamp_ms: i64,
+    ) -> Snapshot {
+        Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_parent_snapshot_id(parent)
+            .with_timestamp_ms(timestamp_ms)
+            .with_sequence_number(sequence_number)
+            .with_schema_id(0)
+            .with_manifest_list(format!("/snap-{snapshot_id}"))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build()
+    }
+
+    /// Builds the commit of a catalog that stores `metadata` at `PREVIOUS_FILE`; what it
+    /// builds must load.
+    fn commit(
+        metadata: TableMetadata,
+        update: impl FnOnce(TableMetadataBuilder) -> Result<TableMetadataBuilder>,
+    ) -> Result<TableMetadata> {
+        let built = update(metadata.into_builder(Some(PREVIOUS_FILE.to_string())))?
+            .build()?
+            .metadata;
+        assert_eq!(reload(&built), built);
+        Ok(built)
+    }
+
+    #[test]
+    fn test_snapshot_before_the_previous_last_updated_ms_is_refused_in_build() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let slow = base.last_updated_ms - 2 * 60_000;
+        for branch in [MAIN_BRANCH, "b"] {
+            let err = commit(base.clone(), |builder| {
+                builder.set_branch_snapshot(snapshot_at(1, None, 1, slow), branch)
+            })
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DataInvalid, "{branch}");
+            assert_eq!(
+                err.message(),
+                format!(
+                    "Invalid update timestamp {slow}: before last metadata log entry at {}",
+                    base.last_updated_ms
+                ),
+                "{branch}"
+            );
+        }
+
+        let within_tolerance = base.last_updated_ms - 30_000;
+        let metadata = commit(base, |builder| {
+            builder.set_branch_snapshot(snapshot_at(1, None, 1, within_tolerance), MAIN_BRANCH)
+        })
+        .unwrap();
+        assert_eq!(metadata.last_updated_ms, within_tolerance);
+    }
+
+    #[test]
+    fn test_snapshot_before_the_snapshot_log_is_refused_in_build() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let main_at = base.last_updated_ms + 10 * 60_000;
+        let on_main = commit(base, |builder| {
+            builder.set_branch_snapshot(snapshot_at(1, None, 1, main_at), MAIN_BRANCH)
+        })
+        .unwrap();
+        let slow = main_at - 2 * 60_000;
+        for previous_file in [Some(PREVIOUS_FILE.to_string()), None] {
+            let on_branch = on_main
+                .clone()
+                .into_builder(previous_file.clone())
+                .set_branch_snapshot(snapshot_at(2, Some(1), 2, slow), "b")
+                .unwrap()
+                .build()
+                .unwrap_err();
+            assert_eq!(
+                on_branch.kind(),
+                ErrorKind::DataInvalid,
+                "{previous_file:?}"
+            );
+            assert_eq!(
+                on_branch.message(),
+                format!(
+                    "Invalid update timestamp {slow}: before last snapshot log entry at {main_at}"
+                ),
+                "{previous_file:?}"
+            );
+            let on_main = on_main
+                .clone()
+                .into_builder(previous_file.clone())
+                .set_branch_snapshot(snapshot_at(2, Some(1), 2, slow), MAIN_BRANCH)
+                .unwrap()
+                .build()
+                .unwrap_err();
+            assert_eq!(on_main.kind(), ErrorKind::DataInvalid, "{previous_file:?}");
+            assert_eq!(
+                on_main.message(),
+                "Expected sorted snapshot log entries",
+                "{previous_file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_snapshot_at_the_lowest_time_is_refused_in_build() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let err = commit(base.clone(), |builder| {
+            builder.set_branch_snapshot(snapshot_at(1, None, 1, i64::MIN), MAIN_BRANCH)
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            format!(
+                "Invalid update timestamp {}: before last metadata log entry at {}",
+                i64::MIN,
+                base.last_updated_ms
+            )
+        );
+    }
+
+    /// A rollback minutes after the rolled-back commit builds, and a rebased snapshot older
+    /// than the previous file's `last-updated-ms` is refused in `build()`.
+    #[test]
+    fn test_rollback_branch_to_snapshot_minutes_later() {
+        let created = TableMetadataBuilder::new(
+            schema(),
+            partition_spec(),
+            sort_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let t0 = created.last_updated_ms - 30 * 60_000;
+        let after_a = created
+            .into_builder(None)
+            .set_branch_snapshot(snapshot_at(1, None, 1, t0), MAIN_BRANCH)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let after_c = commit(after_a, |builder| {
+            builder.set_branch_snapshot(snapshot_at(2, Some(1), 2, t0 + 10 * 60_000), MAIN_BRANCH)
+        })
+        .unwrap();
+
+        let rolled = commit(after_c.clone(), |builder| {
+            builder.rollback_branch_to_snapshot(MAIN_BRANCH, 1)
+        })
+        .unwrap();
+        assert_eq!(rolled.current_snapshot_id, Some(1));
+        assert_eq!(rolled.last_sequence_number, 1);
+        assert!(rolled.last_updated_ms > t0 + 10 * 60_000);
+
+        let rebased = t0 + 5 * 60_000;
+        let err = commit(after_c, |builder| {
+            builder
+                .rollback_branch_to_snapshot(MAIN_BRANCH, 1)?
+                .set_branch_snapshot(snapshot_at(3, Some(1), 2, rebased), MAIN_BRANCH)
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            format!(
+                "Invalid update timestamp {rebased}: before last metadata log entry at {}",
+                t0 + 10 * 60_000
+            )
+        );
+    }
+
+    #[test]
+    fn test_metadata_change_after_a_fast_branch_snapshot_is_refused_in_build() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let fast = base.last_updated_ms + 2 * 60 * 60_000;
+        let on_branch = commit(base, |builder| {
+            builder.set_branch_snapshot(snapshot_at(1, None, 1, fast), "b")
+        })
+        .unwrap();
+        assert_eq!(on_branch.last_updated_ms, fast);
+
+        // The change takes the current time, two hours before the previous file's entry.
+        let err = commit(on_branch, |builder| {
+            builder.set_properties(HashMap::from([("k".to_string(), "v".to_string())]))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().starts_with("Invalid update timestamp ")
+                && err
+                    .message()
+                    .ends_with(&format!(": before last metadata log entry at {fast}")),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]

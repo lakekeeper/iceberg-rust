@@ -715,7 +715,7 @@ impl TableMetadata {
             let (prev, curr) = (&window[0], &window[1]);
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
-            if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
+            if curr.timestamp_ms.saturating_sub(prev.timestamp_ms) < -ONE_MINUTE_MS {
                 return Err(invalid_data!("Expected sorted snapshot log entries"));
             }
         }
@@ -723,7 +723,7 @@ impl TableMetadata {
         if let Some(last) = self.snapshot_log.last() {
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
-            if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
+            if self.last_updated_ms.saturating_sub(last.timestamp_ms) < -ONE_MINUTE_MS {
                 return Err(invalid_data!(
                     "Invalid update timestamp {}: before last snapshot log entry at {}",
                     self.last_updated_ms,
@@ -739,7 +739,7 @@ impl TableMetadata {
             let (prev, curr) = (&window[0], &window[1]);
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
-            if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
+            if curr.timestamp_ms.saturating_sub(prev.timestamp_ms) < -ONE_MINUTE_MS {
                 return Err(invalid_data!("Expected sorted metadata log entries"));
             }
         }
@@ -747,7 +747,7 @@ impl TableMetadata {
         if let Some(last) = self.metadata_log.last() {
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
-            if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
+            if self.last_updated_ms.saturating_sub(last.timestamp_ms) < -ONE_MINUTE_MS {
                 return Err(invalid_data!(
                     "Invalid update timestamp {}: before last metadata log entry at {}",
                     self.last_updated_ms,
