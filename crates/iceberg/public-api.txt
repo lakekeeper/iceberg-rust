@@ -3499,6 +3499,7 @@ impl iceberg::transaction::TransactionAction for iceberg::transaction::RewriteFi
 pub fn iceberg::transaction::RewriteFilesAction::commit<'life0, 'async_trait>(self: alloc::sync::Arc<Self>, table: &'life0 iceberg::table::Table) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<iceberg::transaction::ActionCommit>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub struct iceberg::transaction::RewriteManifestsAction
 impl iceberg::transaction::RewriteManifestsAction
+pub async fn iceberg::transaction::RewriteManifestsAction::rebase(base: &iceberg::table::Table, planned: &iceberg::spec::Snapshot, table: &iceberg::table::Table) -> iceberg::Result<core::option::Option<iceberg::transaction::ActionCommit>>
 pub fn iceberg::transaction::RewriteManifestsAction::rewrite_if(self, predicate: impl core::ops::function::Fn(&iceberg::spec::ManifestFile) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
 pub fn iceberg::transaction::RewriteManifestsAction::set_target_size_bytes(self, target_size_bytes: u64) -> Self
