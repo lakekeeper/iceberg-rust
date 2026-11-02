@@ -326,8 +326,10 @@ impl TableMetadataBuilder {
     ///
     /// # Errors
     /// - Snapshot id already exists.
-    /// - For format version > 1: the sequence number of the snapshot is lower than the highest sequence number specified so far.
+    /// - For format version > 1: the snapshot has a parent and its sequence number is not above the last sequence number.
+    ///   The error is a retryable [`ErrorKind::CatalogCommitConflicts`].
     /// - For format version >= 3: the first-row-id of the snapshot is lower than the next-row-id of the table.
+    ///   The error is a retryable [`ErrorKind::CatalogCommitConflicts`].
     /// - For format version >= 3: added-rows is null or first-row-id is null.
     /// - For format version >= 3: next-row-id would overflow when adding added-rows.
     pub fn add_snapshot(mut self, snapshot: Snapshot) -> Result<Self> {
@@ -346,11 +348,11 @@ impl TableMetadataBuilder {
             && snapshot.sequence_number() <= self.metadata.last_sequence_number
             && snapshot.parent_snapshot_id().is_some()
         {
-            return Err(invalid_data!(
+            return Err(stale_snapshot(format!(
                 "Cannot add snapshot with sequence number {} older than last sequence number {}",
                 snapshot.sequence_number(),
                 self.metadata.last_sequence_number
-            ));
+            )));
         }
 
         if let Some(last) = self.metadata.snapshot_log.last() {
@@ -381,10 +383,10 @@ impl TableMetadataBuilder {
         if self.metadata.format_version >= MIN_FORMAT_VERSION_ROW_LINEAGE {
             if let Some((first_row_id, added_rows_count)) = snapshot.row_range() {
                 if first_row_id < self.metadata.next_row_id {
-                    return Err(invalid_data!(
+                    return Err(stale_snapshot(format!(
                         "Cannot add a snapshot, first-row-id is behind table next-row-id: {first_row_id} < {}",
                         self.metadata.next_row_id
-                    ));
+                    )));
                 }
 
                 added_rows = Some(added_rows_count);
@@ -1536,6 +1538,11 @@ impl From<TableMetadataBuildResult> for TableMetadata {
     fn from(result: TableMetadataBuildResult) -> Self {
         result.metadata
     }
+}
+
+/// A snapshot built on outdated table metadata: the client can reload the table and retry.
+fn stale_snapshot(message: String) -> Error {
+    Error::new(ErrorKind::CatalogCommitConflicts, message).with_retryable(true)
 }
 
 #[cfg(test)]
@@ -2906,6 +2913,45 @@ mod tests {
             err.to_string()
                 .contains("Cannot add snapshot with sequence number")
         );
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
+    }
+
+    #[test]
+    fn test_stale_sequence_number_of_existing_snapshot_is_not_retryable() {
+        let builder = builder_without_changes(FormatVersion::V2);
+        let snapshot = |id: i64, parent: Option<i64>, sequence_number: i64| {
+            Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_timestamp_ms(builder.metadata.last_updated_ms + 1)
+                .with_sequence_number(sequence_number)
+                .with_schema_id(0)
+                .with_manifest_list(format!("/snap-{id}"))
+                .with_parent_snapshot_id(parent)
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build()
+        };
+        let metadata = builder
+            .clone()
+            .set_branch_snapshot(snapshot(1, None, 1), MAIN_BRANCH)
+            .unwrap()
+            .set_branch_snapshot(snapshot(2, Some(1), 2), MAIN_BRANCH)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        // A resend of a snapshot that already landed must not be retried as a conflict.
+        let err = metadata
+            .into_builder(None)
+            .add_snapshot(snapshot(2, Some(1), 2))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert_eq!(err.message(), "Snapshot already exists for: '2'");
     }
 
     #[test]
@@ -3691,6 +3737,8 @@ mod tests {
                 "Cannot add a snapshot, first-row-id is behind table next-row-id: 29 < 30"
             )
         );
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
     }
 
     #[test]
