@@ -55,6 +55,7 @@ pub struct TableMetadataBuilder {
     // None if this is a new table (from_metadata) method not used
     previous_history_entry: Option<MetadataLog>,
     last_updated_ms: Option<i64>,
+    last_updated_ms_override: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +125,7 @@ impl TableMetadataBuilder {
                 next_row_id: INITIAL_ROW_ID,
             },
             last_updated_ms: None,
+            last_updated_ms_override: None,
             changes: vec![],
             last_added_schema_id: Some(schema_id),
             last_added_spec_id: None,
@@ -160,6 +162,7 @@ impl TableMetadataBuilder {
             last_added_spec_id: None,
             last_added_order_id: None,
             last_updated_ms: None,
+            last_updated_ms_override: None,
         }
     }
 
@@ -190,6 +193,20 @@ impl TableMetadataBuilder {
             format_version,
             properties,
         )
+    }
+
+    /// Sets the `last-updated-ms` that [`Self::build`] stores, in place of the time of the last
+    /// added snapshot or the current time.
+    ///
+    /// A catalog uses it to stamp each commit with its own clock. Call it before the updates: a
+    /// `main` ref set to a snapshot that this build did not add is logged at this value. Snapshot
+    /// times, and the log entries of snapshots added in this build, keep their own time.
+    /// [`Self::build`] refuses a value more than one minute before the last metadata-log entry or
+    /// the last snapshot-log entry. With the previous file's location passed to
+    /// [`Self::new_from_metadata`], the last metadata-log entry is the previous `last-updated-ms`.
+    pub fn set_last_updated_ms(mut self, last_updated_ms: i64) -> Self {
+        self.last_updated_ms_override = Some(last_updated_ms);
+        self
     }
 
     /// Changes uuid of table metadata.
@@ -470,7 +487,8 @@ impl TableMetadataBuilder {
     /// That frees the discarded sequence numbers again, so a subsequent [`Self::add_snapshot`]
     /// may commit a snapshot that was originally built on top of `snapshot_id`, reusing its
     /// sequence number. [`Self::build`] still refuses such a snapshot if its timestamp is more
-    /// than one minute before the previous file's `last-updated-ms`. The `metadata_log` is left
+    /// than one minute before the previous file's `last-updated-ms`, unless the catalog sets the
+    /// new `last-updated-ms` with [`Self::set_last_updated_ms`]. The `metadata_log` is left
     /// untouched: the discarded snapshots' metadata files remain valid previous versions of the
     /// table.
     ///
@@ -632,12 +650,14 @@ impl TableMetadataBuilder {
         // Current snapshot id is set only for the main branch
         if ref_name == MAIN_BRANCH {
             self.metadata.current_snapshot_id = Some(snapshot.snapshot_id());
-            let timestamp_ms = if let Some(last_updated_ms) = self.last_updated_ms {
-                last_updated_ms
-            } else {
-                let last_updated_ms = chrono::Utc::now().timestamp_millis();
-                self.last_updated_ms = Some(last_updated_ms);
-                last_updated_ms
+            let timestamp_ms = match (self.last_updated_ms_override, self.last_updated_ms) {
+                (Some(last_updated_ms), _) if !is_added_snapshot => last_updated_ms,
+                (_, Some(last_updated_ms)) => last_updated_ms,
+                (_, None) => {
+                    let last_updated_ms = chrono::Utc::now().timestamp_millis();
+                    self.last_updated_ms = Some(last_updated_ms);
+                    last_updated_ms
+                }
             };
 
             self.metadata.snapshot_log.push(SnapshotLog {
@@ -1201,7 +1221,8 @@ impl TableMetadataBuilder {
     ///   metadata-log check includes the entry for the previous metadata file.
     pub fn build(mut self) -> Result<TableMetadataBuildResult> {
         self.metadata.last_updated_ms = self
-            .last_updated_ms
+            .last_updated_ms_override
+            .or(self.last_updated_ms)
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
         // Check compatibility of the current schema to the default partition spec and sort order.
@@ -3114,6 +3135,320 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[test]
+    fn test_set_last_updated_ms_changes_only_the_stored_last_updated_ms() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let snapshot_ms = base.last_updated_ms + 1;
+        let last_updated_ms = base.last_updated_ms + 1000;
+
+        let metadata = commit(base.clone(), |builder| {
+            builder
+                .set_last_updated_ms(last_updated_ms)
+                .set_branch_snapshot(snapshot_at(1, None, 1, snapshot_ms), MAIN_BRANCH)
+        })
+        .unwrap();
+        assert_eq!(metadata.last_updated_ms, last_updated_ms);
+        assert_eq!(
+            metadata.snapshot_by_id(1).unwrap().timestamp_ms(),
+            snapshot_ms
+        );
+        assert_eq!(metadata.snapshot_log, vec![SnapshotLog {
+            snapshot_id: 1,
+            timestamp_ms: snapshot_ms,
+        }]);
+        assert_eq!(
+            metadata.metadata_log.last(),
+            Some(&MetadataLog {
+                metadata_file: PREVIOUS_FILE.to_string(),
+                timestamp_ms: base.last_updated_ms,
+            })
+        );
+
+        let metadata = commit(metadata, |builder| {
+            builder
+                .set_last_updated_ms(last_updated_ms + 1)
+                .set_properties(HashMap::from([("k".to_string(), "v".to_string())]))
+        })
+        .unwrap();
+        assert_eq!(metadata.last_updated_ms, last_updated_ms + 1);
+    }
+
+    #[test]
+    fn test_set_last_updated_ms_before_the_previous_one_is_refused_in_build() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let set_properties = |last_updated_ms: i64| {
+            commit(base.clone(), |builder| {
+                builder
+                    .set_last_updated_ms(last_updated_ms)
+                    .set_properties(HashMap::from([("k".to_string(), "v".to_string())]))
+            })
+        };
+        let early = base.last_updated_ms - 2 * 60_000;
+        let err = set_properties(early).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            format!(
+                "Invalid update timestamp {early}: before last metadata log entry at {}",
+                base.last_updated_ms
+            )
+        );
+        let within_tolerance = base.last_updated_ms - 59_000;
+        assert_eq!(
+            set_properties(within_tolerance).unwrap().last_updated_ms,
+            within_tolerance
+        );
+    }
+
+    /// A `main` ref moved to an existing snapshot is logged at the catalog clock, as Iceberg Java
+    /// 1.11 does: alone, or with a snapshot added on another branch in the same build, and with
+    /// a catalog clock ahead of or behind this process's clock.
+    #[test]
+    fn test_main_moved_to_an_existing_snapshot_logs_the_catalog_clock() {
+        let process_now = chrono::Utc::now().timestamp_millis();
+        let main_at = |snapshot_id: i64| SnapshotReference {
+            snapshot_id,
+            retention: SnapshotRetention::Branch {
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+                max_ref_age_ms: None,
+            },
+        };
+        for start in [process_now, process_now - 60 * 60_000] {
+            let server = move |tick: i64| start + tick * 10 * 60_000;
+            let created = TableMetadataBuilder::new(
+                schema(),
+                partition_spec(),
+                sort_order(),
+                TEST_LOCATION.to_string(),
+                FormatVersion::V2,
+                HashMap::new(),
+            )
+            .unwrap()
+            .set_last_updated_ms(start)
+            .build()
+            .unwrap()
+            .metadata;
+            let first = commit(created, |builder| {
+                builder
+                    .set_last_updated_ms(server(1))
+                    .set_branch_snapshot(snapshot_at(1, None, 1, server(1)), MAIN_BRANCH)
+            })
+            .unwrap();
+            let second = commit(first, |builder| {
+                builder
+                    .set_last_updated_ms(server(2))
+                    .set_branch_snapshot(snapshot_at(2, Some(1), 2, server(2)), MAIN_BRANCH)
+            })
+            .unwrap();
+            // No snapshot on `b`, or one two minutes fast, or five minutes slow.
+            for branch_snapshot_offset in [None, Some(2 * 60_000), Some(-5 * 60_000)] {
+                let case = format!("{start} {branch_snapshot_offset:?}");
+                let metadata = commit(second.clone(), |builder| {
+                    let mut builder = builder.set_last_updated_ms(server(3));
+                    if let Some(offset) = branch_snapshot_offset {
+                        builder = builder.set_branch_snapshot(
+                            snapshot_at(3, Some(2), 3, server(3) + offset),
+                            "b",
+                        )?;
+                    }
+                    builder.set_ref(MAIN_BRANCH, main_at(1))
+                })
+                .unwrap();
+                assert_eq!(metadata.last_updated_ms, server(3), "{case}");
+                assert_eq!(
+                    metadata.snapshot_log.last(),
+                    Some(&SnapshotLog {
+                        snapshot_id: 1,
+                        timestamp_ms: server(3),
+                    }),
+                    "{case}"
+                );
+            }
+
+            // Without a catalog clock, `main` logs the added snapshot's time, as Java 1.10 does.
+            let metadata = commit(second, |builder| {
+                builder
+                    .set_branch_snapshot(snapshot_at(3, Some(2), 3, server(3) - 5 * 60_000), "b")?
+                    .set_ref(MAIN_BRANCH, main_at(1))
+            })
+            .unwrap();
+            assert_eq!(
+                metadata.snapshot_log.last(),
+                Some(&SnapshotLog {
+                    snapshot_id: 1,
+                    timestamp_ms: server(3) - 5 * 60_000,
+                }),
+                "{start}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_catalog_clock_lets_older_snapshots_commit() {
+        // A rebased snapshot after a rollback, and a branch snapshot behind the snapshot log.
+        let created = TableMetadataBuilder::new(
+            schema(),
+            partition_spec(),
+            sort_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let t0 = created.last_updated_ms;
+        let after_a = commit(created, |builder| {
+            builder
+                .set_last_updated_ms(t0 + 1)
+                .set_branch_snapshot(snapshot_at(1, None, 1, t0 + 1), MAIN_BRANCH)
+        })
+        .unwrap();
+        let c_at = t0 + 10 * 60_000;
+        let after_c = commit(after_a, |builder| {
+            builder
+                .set_last_updated_ms(c_at)
+                .set_branch_snapshot(snapshot_at(2, Some(1), 2, c_at), MAIN_BRANCH)
+        })
+        .unwrap();
+        let rebased = commit(after_c.clone(), |builder| {
+            builder
+                .set_last_updated_ms(c_at + 60_000)
+                .rollback_branch_to_snapshot(MAIN_BRANCH, 1)?
+                .set_branch_snapshot(snapshot_at(3, Some(1), 2, t0 + 5 * 60_000), MAIN_BRANCH)
+        })
+        .unwrap();
+        assert_eq!(rebased.current_snapshot_id, Some(3));
+        assert_eq!(rebased.last_sequence_number, 2);
+        assert_eq!(rebased.last_updated_ms, c_at + 60_000);
+
+        let on_branch = commit(after_c, |builder| {
+            builder
+                .set_last_updated_ms(c_at + 1)
+                .set_branch_snapshot(snapshot_at(3, Some(2), 3, c_at - 2 * 60_000), "b")
+        })
+        .unwrap();
+        assert_eq!(on_branch.last_updated_ms, c_at + 1);
+    }
+
+    #[test]
+    fn test_set_last_updated_ms_at_the_lowest_time_is_refused_in_build() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let err = commit(base.clone(), |builder| {
+            builder
+                .set_last_updated_ms(i64::MIN)
+                .set_properties(HashMap::from([("k".to_string(), "v".to_string())]))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            format!(
+                "Invalid update timestamp {}: before last metadata log entry at {}",
+                i64::MIN,
+                base.last_updated_ms
+            )
+        );
+    }
+
+    /// A catalog clock as `last-updated-ms` lets writers with a slow clock commit, as Iceberg
+    /// Java 1.11 does; only a `main` snapshot before the snapshot log is refused.
+    #[test]
+    fn test_slow_writer_with_a_catalog_clock() {
+        let base = builder_without_changes(FormatVersion::V2)
+            .build()
+            .unwrap()
+            .metadata;
+        let created = base.last_updated_ms;
+        let server = move |tick: i64| created + tick * 1000;
+        let slow = move |tick: i64| server(tick) - 2 * 60_000;
+        let add_to = |branch: &'static str, tick: i64, snapshot: Snapshot| {
+            move |builder: TableMetadataBuilder| {
+                builder
+                    .set_last_updated_ms(server(tick))
+                    .set_branch_snapshot(snapshot, branch)
+            }
+        };
+
+        // A writer whose clock is always two minutes slow, on `main`.
+        let first = commit(
+            base.clone(),
+            add_to(MAIN_BRANCH, 1, snapshot_at(1, None, 1, slow(1))),
+        )
+        .unwrap();
+        let second = commit(
+            first,
+            add_to(MAIN_BRANCH, 2, snapshot_at(2, Some(1), 2, slow(2))),
+        )
+        .unwrap();
+        assert_eq!(second.last_updated_ms, server(2));
+        assert_eq!(second.snapshot_log, vec![
+            SnapshotLog {
+                snapshot_id: 1,
+                timestamp_ms: slow(1),
+            },
+            SnapshotLog {
+                snapshot_id: 2,
+                timestamp_ms: slow(2),
+            },
+        ]);
+
+        // A correct `main` snapshot, a slow branch snapshot, a property change, a correct
+        // `main` snapshot.
+        let correct = commit(
+            base,
+            add_to(MAIN_BRANCH, 1, snapshot_at(1, None, 1, server(1))),
+        )
+        .unwrap();
+        let on_branch = commit(
+            correct.clone(),
+            add_to("b", 2, snapshot_at(2, Some(1), 2, slow(2))),
+        )
+        .unwrap();
+        let changed = commit(on_branch, |builder| {
+            builder
+                .set_last_updated_ms(server(3))
+                .set_properties(HashMap::from([("k".to_string(), "v".to_string())]))
+        })
+        .unwrap();
+        let next = commit(
+            changed,
+            add_to(MAIN_BRANCH, 4, snapshot_at(3, Some(1), 3, server(4))),
+        )
+        .unwrap();
+        assert_eq!(next.last_updated_ms, server(4));
+        assert_eq!(next.snapshot_log, vec![
+            SnapshotLog {
+                snapshot_id: 1,
+                timestamp_ms: server(1),
+            },
+            SnapshotLog {
+                snapshot_id: 3,
+                timestamp_ms: server(4),
+            },
+        ]);
+
+        // A slow `main` snapshot after a correct one breaks the order of the snapshot log.
+        let err = commit(
+            correct,
+            add_to(MAIN_BRANCH, 2, snapshot_at(2, Some(1), 2, slow(2))),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(err.message(), "Expected sorted snapshot log entries");
     }
 
     #[test]

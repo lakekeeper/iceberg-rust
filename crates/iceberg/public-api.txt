@@ -2924,6 +2924,7 @@ pub fn iceberg::spec::TableMetadataBuilder::set_branch_snapshot(self, snapshot: 
 pub fn iceberg::spec::TableMetadataBuilder::set_current_schema(self, schema_id: i32) -> iceberg::Result<Self>
 pub fn iceberg::spec::TableMetadataBuilder::set_default_partition_spec(self, spec_id: i32) -> iceberg::Result<Self>
 pub fn iceberg::spec::TableMetadataBuilder::set_default_sort_order(self, sort_order_id: i64) -> iceberg::Result<Self>
+pub fn iceberg::spec::TableMetadataBuilder::set_last_updated_ms(self, last_updated_ms: i64) -> Self
 pub fn iceberg::spec::TableMetadataBuilder::set_location(self, location: alloc::string::String) -> Self
 pub fn iceberg::spec::TableMetadataBuilder::set_partition_statistics(self, partition_statistics_file: iceberg::spec::PartitionStatisticsFile) -> Self
 pub fn iceberg::spec::TableMetadataBuilder::set_properties(self, properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> iceberg::Result<Self>
