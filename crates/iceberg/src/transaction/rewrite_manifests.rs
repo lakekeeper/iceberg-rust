@@ -16,7 +16,7 @@
 // under the License.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -30,7 +30,8 @@ use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, Literal, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestList, ManifestListWriter, ManifestStatus, ManifestWriter,
     ManifestWriterBuilder, Operation, PrimitiveLiteral, SchemaId, SchemaRef, Snapshot,
-    SnapshotReference, Struct, Summary, TableProperties, partition_summaries,
+    SnapshotReference, Struct, Summary, TableProperties, UNASSIGNED_SEQUENCE_NUMBER,
+    partition_summaries,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{generate_unique_snapshot_id, main_branch_retention};
@@ -96,6 +97,136 @@ impl RewriteManifestsAction {
         self.snapshot_properties = snapshot_properties;
         self
     }
+
+    /// Re-applies `planned`, a rewrite snapshot this action planned on `base`, on the current
+    /// snapshot of `table`, as Java's `BaseRewriteManifests` does when it retries: the new
+    /// manifests are kept, not read again, and only a new manifest list is written and verified.
+    ///
+    /// Returns `None` when the rewrite does not apply to `table` as planned: a replaced
+    /// manifest is no longer in its current snapshot, its format version, default partition
+    /// spec or current schema changed, or it already holds the planned snapshot.
+    ///
+    /// # Errors
+    /// Fails when `planned` is not a rewrite (`replace`) snapshot that follows `base`'s current
+    /// snapshot, when `base` is a format v3 table, when a manifest list cannot be read or written,
+    /// or when the new list fails verification.
+    pub async fn rebase(
+        base: &Table,
+        planned: &Snapshot,
+        table: &Table,
+    ) -> Result<Option<ActionCommit>> {
+        let (base_metadata, metadata) = (base.metadata(), table.metadata());
+        let Some(base_snapshot) = base_metadata.current_snapshot() else {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "RewriteManifests rebase requires the base to have a current snapshot",
+            ));
+        };
+        if base_metadata.format_version() >= FormatVersion::V3 {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "RewriteManifests does not support format {} tables",
+                    base_metadata.format_version()
+                ),
+            ));
+        }
+        if planned.parent_snapshot_id() != Some(base_snapshot.snapshot_id())
+            || planned.summary().operation != Operation::Replace
+        {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "RewriteManifests rebase requires a rewrite snapshot planned on the base",
+            ));
+        }
+        let Some(head) = metadata.current_snapshot() else {
+            return Ok(None);
+        };
+        if metadata.format_version() != base_metadata.format_version()
+            || metadata.default_partition_spec_id() != base_metadata.default_partition_spec_id()
+            || metadata.current_schema_id() != base_metadata.current_schema_id()
+            || metadata.snapshot_by_id(planned.snapshot_id()).is_some()
+        {
+            return Ok(None);
+        }
+
+        let snapshot_id = planned.snapshot_id();
+        let planned_list = base
+            .manifest_list_reader(&Arc::new(planned.clone()))
+            .load()
+            .await?;
+        let (created, carried): (Vec<&ManifestFile>, Vec<&ManifestFile>) = planned_list
+            .entries()
+            .iter()
+            .partition(|m| m.added_snapshot_id == snapshot_id);
+        let carried: HashSet<&str> = carried.iter().map(|m| m.manifest_path.as_str()).collect();
+        let base_list = base.manifest_list_reader(base_snapshot).load().await?;
+        let replaced: HashSet<&str> = base_list
+            .entries()
+            .iter()
+            .map(|m| m.manifest_path.as_str())
+            .filter(|path| !carried.contains(path))
+            .collect();
+        let head_list = table.manifest_list_reader(head).load().await?;
+        let (gone, kept): (Vec<&ManifestFile>, Vec<&ManifestFile>) = head_list
+            .entries()
+            .iter()
+            .partition(|m| replaced.contains(m.manifest_path.as_str()));
+        // Every replaced path must still be listed: manifest files never change, so it holds the
+        // same entries. Paths, not entries, as a list may name a manifest twice.
+        let gone: HashSet<&str> = gone.iter().map(|m| m.manifest_path.as_str()).collect();
+        if gone.len() != replaced.len() {
+            return Ok(None);
+        }
+        let kept: Vec<ManifestFile> = kept.into_iter().cloned().collect();
+
+        let manifest_list_path = write_manifest_list(
+            table,
+            snapshot_id,
+            &Uuid::now_v7(),
+            created
+                .iter()
+                .map(|m| ManifestFile {
+                    sequence_number: UNASSIGNED_SEQUENCE_NUMBER,
+                    ..(*m).clone()
+                })
+                .chain(kept.iter().cloned()),
+        )
+        .await?;
+        #[cfg(test)]
+        if let Some(hook) = tests::REBASE_OUTPUT.with(|hook| hook.borrow().clone()) {
+            hook(table.clone(), manifest_list_path.clone()).await;
+        }
+        // The new manifests were verified against the replaced ones when planned and their files
+        // do not change: the list must hold them as planned but for the sequence number.
+        let expected: Vec<ManifestFile> = created
+            .into_iter()
+            .map(|m| ManifestFile {
+                sequence_number: metadata.next_sequence_number(),
+                ..m.clone()
+            })
+            .collect();
+        let verified = match read_list_layout(table, &manifest_list_path, &kept).await {
+            Ok(created) if created == expected => Ok(()),
+            Ok(_) => Err(output_mismatch("the new manifests changed")),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = verified {
+            // No catalog saw the list.
+            delete_unsent(table, vec![manifest_list_path]).await;
+            return Err(error);
+        }
+
+        let mut properties = planned.summary().additional_properties.clone();
+        properties.retain(|key, _| !SUMMARY_TOTALS.contains(&key.as_str()));
+        properties.insert("manifests-kept".to_string(), kept.len().to_string());
+        Ok(Some(rewrite_commit(
+            table,
+            snapshot_id,
+            manifest_list_path,
+            properties,
+        )))
+    }
 }
 
 #[async_trait]
@@ -126,7 +257,6 @@ impl TransactionAction for RewriteManifestsAction {
             }
         };
         let default_spec_id = metadata.default_partition_spec_id();
-        let format_version = metadata.format_version();
 
         let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
 
@@ -215,158 +345,222 @@ impl TransactionAction for RewriteManifestsAction {
             }
         }
 
-        let mut counter: u64 = 0;
-        let mut new_manifests: Vec<ManifestFile> = Vec::new();
+        // Files of an output that fails are deleted: no catalog saw them.
+        let mut written_paths: Vec<String> = Vec::new();
+        let output = async {
+            let mut counter: u64 = 0;
+            let mut new_manifests: Vec<ManifestFile> = Vec::new();
 
-        for group in groups.into_values() {
-            let SchemaGroup {
-                schema,
-                input_bytes,
-                mut entries,
-            } = group;
-            if entries.is_empty() {
-                continue;
+            for group in groups.into_values() {
+                let SchemaGroup {
+                    schema,
+                    input_bytes,
+                    mut entries,
+                } = group;
+                if entries.is_empty() {
+                    continue;
+                }
+                // Sorted by partition, each manifest covers a narrow partition range,
+                // so its partition summary keeps pruning scans.
+                entries.sort_by(|a, b| {
+                    compare_partitions(&a.data_file.partition, &b.data_file.partition)
+                        .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
+                });
+                let manifest_count =
+                    usize::try_from(input_bytes.div_ceil(target_size_bytes.max(1)))
+                        .unwrap_or(usize::MAX)
+                        .clamp(1, entries.len());
+                let base = entries.len() / manifest_count;
+                let larger = entries.len() % manifest_count;
+                let mut entries = entries.into_iter();
+                for i in 0..manifest_count {
+                    let size = base + usize::from(i < larger);
+                    let written = write_manifest(
+                        table,
+                        &schema,
+                        &commit_uuid,
+                        counter,
+                        snapshot_id,
+                        entries.by_ref().take(size),
+                    )
+                    .await?;
+                    written_paths.push(written.manifest_path.clone());
+                    counter += 1;
+                    new_manifests.push(written);
+                }
             }
-            // Sorted by partition, each manifest covers a narrow partition range,
-            // so its partition summary keeps pruning scans.
-            entries.sort_by(|a, b| {
-                compare_partitions(&a.data_file.partition, &b.data_file.partition)
-                    .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
-            });
-            let manifest_count = usize::try_from(input_bytes.div_ceil(target_size_bytes.max(1)))
-                .unwrap_or(usize::MAX)
-                .clamp(1, entries.len());
-            let base = entries.len() / manifest_count;
-            let larger = entries.len() % manifest_count;
-            let mut entries = entries.into_iter();
-            for i in 0..manifest_count {
-                let size = base + usize::from(i < larger);
-                let written = write_manifest(
-                    table,
-                    &schema,
-                    &commit_uuid,
-                    counter,
-                    snapshot_id,
-                    entries.by_ref().take(size),
-                )
-                .await?;
-                counter += 1;
-                new_manifests.push(written);
-            }
-        }
 
-        let manifest_list_path = format!(
-            "{}/metadata/snap-{}-0-{}.{}",
-            metadata.location(),
-            snapshot_id,
-            commit_uuid,
-            DataFileFormat::Avro,
-        );
-        let next_seq_num = metadata.next_sequence_number();
-        let writer = table
-            .file_io()
-            .new_output(manifest_list_path.clone())?
-            .writer()
+            let manifest_list_path = write_manifest_list(
+                table,
+                snapshot_id,
+                &commit_uuid,
+                new_manifests.iter().cloned().chain(kept.iter().cloned()),
+            )
             .await?;
-        let mut list_writer = match format_version {
-            FormatVersion::V1 => {
-                ManifestListWriter::v1(writer, snapshot_id, metadata.current_snapshot_id())
+            written_paths.push(manifest_list_path.clone());
+
+            #[cfg(test)]
+            if let Some(corrupt_output) = &self.corrupt_output {
+                corrupt_output(table.clone(), manifest_list_path.clone()).await;
             }
-            FormatVersion::V2 => ManifestListWriter::v2(
-                writer,
+            verify_output(
+                table,
+                &manifest_list_path,
                 snapshot_id,
-                metadata.current_snapshot_id(),
-                next_seq_num,
-            ),
-            FormatVersion::V3 => ManifestListWriter::v3(
-                writer,
-                snapshot_id,
-                metadata.current_snapshot_id(),
-                next_seq_num,
-                Some(metadata.next_row_id()),
-            ),
+                metadata.next_sequence_number(),
+                &kept,
+                expected_entries,
+            )
+            .await?;
+            Ok::<_, Error>((manifest_list_path, new_manifests.len()))
+        }
+        .await;
+        let (manifest_list_path, manifests_created) = match output {
+            Ok(output) => output,
+            Err(error) => {
+                delete_unsent(table, written_paths).await;
+                return Err(error);
+            }
         };
-        let manifests_created = new_manifests.len();
         let manifests_kept = kept.len();
-        list_writer.add_manifests(new_manifests.into_iter().chain(kept.iter().cloned()))?;
-        list_writer.close().await?;
 
-        #[cfg(test)]
-        if let Some(corrupt_output) = &self.corrupt_output {
-            corrupt_output(table.clone(), manifest_list_path.clone()).await;
-        }
-        verify_output(
-            table,
-            &manifest_list_path,
-            snapshot_id,
-            next_seq_num,
-            &kept,
-            expected_entries,
-        )
-        .await?;
-
-        let mut additional_properties: HashMap<String, String> = self.snapshot_properties.clone();
-        for k in [
-            "total-data-files",
-            "total-delete-files",
-            "total-records",
-            "total-files-size",
-            "total-position-deletes",
-            "total-equality-deletes",
-        ] {
-            if let Some(v) = current_snapshot.summary().additional_properties.get(k) {
-                additional_properties.insert(k.to_string(), v.clone());
-            }
-        }
-        additional_properties.insert(
+        let mut properties: HashMap<String, String> = self.snapshot_properties.clone();
+        properties.insert(
             "manifests-created".to_string(),
             manifests_created.to_string(),
         );
-        additional_properties.insert(
+        properties.insert(
             "manifests-replaced".to_string(),
             manifests_replaced.to_string(),
         );
-        additional_properties.insert("manifests-kept".to_string(), manifests_kept.to_string());
-        additional_properties.insert(
+        properties.insert("manifests-kept".to_string(), manifests_kept.to_string());
+        properties.insert(
             "entries-processed".to_string(),
             entries_processed.to_string(),
         );
-        let summary = Summary {
-            operation: Operation::Replace,
-            additional_properties,
-        };
-
-        let commit_ts = chrono::Utc::now().timestamp_millis();
-        let new_snapshot = Snapshot::builder()
-            .with_manifest_list(manifest_list_path)
-            .with_snapshot_id(snapshot_id)
-            .with_parent_snapshot_id(metadata.current_snapshot_id())
-            .with_sequence_number(next_seq_num)
-            .with_summary(summary)
-            .with_schema_id(metadata.current_schema_id())
-            .with_timestamp_ms(commit_ts)
-            .build();
-
-        let updates = vec![
-            TableUpdate::AddSnapshot {
-                snapshot: new_snapshot,
-            },
-            TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(snapshot_id, main_branch_retention(metadata)),
-            },
-        ];
-        let requirements = vec![
-            TableRequirement::UuidMatch {
-                uuid: metadata.uuid(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: metadata.current_snapshot_id(),
-            },
-        ];
-        Ok(ActionCommit::new(updates, requirements))
+        Ok(rewrite_commit(
+            table,
+            snapshot_id,
+            manifest_list_path,
+            properties,
+        ))
     }
+}
+
+/// Totals of the parent's summary a rewrite snapshot repeats, as it changes no file.
+const SUMMARY_TOTALS: [&str; 6] = [
+    "total-data-files",
+    "total-delete-files",
+    "total-records",
+    "total-files-size",
+    "total-position-deletes",
+    "total-equality-deletes",
+];
+
+/// Deletes files of an output that failed before it was returned, so no catalog saw them.
+async fn delete_unsent(table: &Table, paths: Vec<String>) {
+    for path in &paths {
+        if let Err(error) = table.file_io().delete(path).await {
+            tracing::warn!(%error, path, "RewriteManifests failed to delete an unused file");
+        }
+    }
+}
+
+/// Writes the manifest list of a rewrite snapshot that follows `table`'s current snapshot.
+async fn write_manifest_list(
+    table: &Table,
+    snapshot_id: i64,
+    commit_uuid: &Uuid,
+    manifests: impl Iterator<Item = ManifestFile>,
+) -> Result<String> {
+    let metadata = table.metadata();
+    let manifest_list_path = format!(
+        "{}/metadata/snap-{}-0-{}.{}",
+        metadata.location(),
+        snapshot_id,
+        commit_uuid,
+        DataFileFormat::Avro,
+    );
+    let next_seq_num = metadata.next_sequence_number();
+    let writer = table
+        .file_io()
+        .new_output(manifest_list_path.clone())?
+        .writer()
+        .await?;
+    let mut list_writer = match metadata.format_version() {
+        FormatVersion::V1 => {
+            ManifestListWriter::v1(writer, snapshot_id, metadata.current_snapshot_id())
+        }
+        FormatVersion::V2 => ManifestListWriter::v2(
+            writer,
+            snapshot_id,
+            metadata.current_snapshot_id(),
+            next_seq_num,
+        ),
+        FormatVersion::V3 => ManifestListWriter::v3(
+            writer,
+            snapshot_id,
+            metadata.current_snapshot_id(),
+            next_seq_num,
+            Some(metadata.next_row_id()),
+        ),
+    };
+    list_writer.add_manifests(manifests)?;
+    list_writer.close().await?;
+    Ok(manifest_list_path)
+}
+
+/// The commit of a rewrite snapshot with `manifest_list_path` on `table`'s current snapshot:
+/// a `Replace` with `properties` and the current snapshot's totals in its summary.
+fn rewrite_commit(
+    table: &Table,
+    snapshot_id: i64,
+    manifest_list_path: String,
+    mut properties: HashMap<String, String>,
+) -> ActionCommit {
+    let metadata = table.metadata();
+    if let Some(current_snapshot) = metadata.current_snapshot() {
+        for key in SUMMARY_TOTALS {
+            if let Some(value) = current_snapshot.summary().additional_properties.get(key) {
+                properties.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let summary = Summary {
+        operation: Operation::Replace,
+        additional_properties: properties,
+    };
+
+    let commit_ts = chrono::Utc::now().timestamp_millis();
+    let new_snapshot = Snapshot::builder()
+        .with_manifest_list(manifest_list_path)
+        .with_snapshot_id(snapshot_id)
+        .with_parent_snapshot_id(metadata.current_snapshot_id())
+        .with_sequence_number(metadata.next_sequence_number())
+        .with_summary(summary)
+        .with_schema_id(metadata.current_schema_id())
+        .with_timestamp_ms(commit_ts)
+        .build();
+
+    let updates = vec![
+        TableUpdate::AddSnapshot {
+            snapshot: new_snapshot,
+        },
+        TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: SnapshotReference::new(snapshot_id, main_branch_retention(metadata)),
+        },
+    ];
+    let requirements = vec![
+        TableRequirement::UuidMatch {
+            uuid: metadata.uuid(),
+        },
+        TableRequirement::RefSnapshotIdMatch {
+            r#ref: MAIN_BRANCH.to_string(),
+            snapshot_id: metadata.current_snapshot_id(),
+        },
+    ];
+    ActionCommit::new(updates, requirements)
 }
 
 /// Live entries of the rewritten manifests written with one schema.
@@ -595,6 +789,29 @@ fn hash_primitive(value: &PrimitiveLiteral, hasher: &mut impl Hasher) {
     }
 }
 
+/// Reads back the manifest list and fails unless it ends with the unchanged
+/// `kept` manifests; returns the manifests before them.
+async fn read_list_layout(
+    table: &Table,
+    manifest_list_path: &str,
+    kept: &[ManifestFile],
+) -> Result<Vec<ManifestFile>> {
+    let bytes = table
+        .file_io()
+        .new_input(manifest_list_path)?
+        .read()
+        .await?;
+    let list = ManifestList::parse_with_version(&bytes, table.metadata().format_version())?;
+    let Some(created_count) = list.entries().len().checked_sub(kept.len()) else {
+        return Err(output_mismatch("the manifest list lost manifests"));
+    };
+    let (created, carried) = list.entries().split_at(created_count);
+    if carried != kept {
+        return Err(output_mismatch("the kept manifests changed"));
+    }
+    Ok(created.to_vec())
+}
+
 /// Reads back the manifest list and the created manifests, and fails unless
 /// the list holds the created manifests followed by the unchanged kept ones,
 /// and the created manifests hold exactly `expected`, all as `EXISTING`
@@ -609,23 +826,11 @@ async fn verify_output(
 ) -> Result<()> {
     let metadata = table.metadata();
     let format_version = metadata.format_version();
-    let bytes = table
-        .file_io()
-        .new_input(manifest_list_path)?
-        .read()
-        .await?;
-    let list = ManifestList::parse_with_version(&bytes, format_version)?;
-    let Some(created_count) = list.entries().len().checked_sub(kept.len()) else {
-        return Err(output_mismatch("the manifest list lost manifests"));
-    };
-    let (created, carried) = list.entries().split_at(created_count);
-    if carried != kept {
-        return Err(output_mismatch("the kept manifests changed"));
-    }
+    let created = read_list_layout(table, manifest_list_path, kept).await?;
 
     let spec = metadata.default_partition_spec();
     let mut actual = EntryDigest::default();
-    for manifest_file in created {
+    for manifest_file in &created {
         let manifest = table.manifest_reader().read(manifest_file).await?;
         let entries = manifest.entries();
         if let Some(entry) = entries
@@ -1628,6 +1833,12 @@ mod tests {
 
     pub(super) type OutputHook = Arc<dyn Fn(Table, String) -> BoxFuture<'static, ()> + Send + Sync>;
 
+    thread_local! {
+        /// Runs on a rebased manifest list before it is checked, for rebases on this thread.
+        pub(super) static REBASE_OUTPUT: std::cell::RefCell<Option<OutputHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     impl RewriteManifestsAction {
         /// Runs `hook` on the written output before it is verified.
         fn corrupt_output(mut self, hook: OutputHook) -> Self {
@@ -1791,6 +2002,42 @@ mod tests {
         let (_, result) = rewrite_with_edited_output(|_| {}, |_| {}).await;
 
         assert_eq!(result.unwrap().len(), 2);
+    }
+
+    /// An output that fails verification is deleted, as no catalog saw it: the new manifest and
+    /// the manifest list.
+    #[tokio::test]
+    async fn test_an_output_that_fails_verification_is_deleted() {
+        let catalog = new_memory_catalog().await;
+        let table = table_with_a_delete_manifest(&catalog).await;
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: OutputHook = {
+            let written = written.clone();
+            Arc::new(move |table: Table, list_path: String| {
+                let written = written.clone();
+                Box::pin(async move {
+                    let bytes = table.file_io().new_input(&list_path).unwrap();
+                    let bytes = bytes.read().await.unwrap();
+                    let list = ManifestList::parse_with_version(&bytes, FormatVersion::V2).unwrap();
+                    let created = list.entries()[0].manifest_path.clone();
+                    written.lock().unwrap().extend([created, list_path.clone()]);
+                    let drop_one = |entries: &mut Vec<ManifestEntry>| {
+                        entries.pop();
+                    };
+                    rewrite_created_manifest(table, list_path, drop_one, |_| {}).await;
+                })
+            })
+        };
+        let action = Transaction::new(&table)
+            .rewrite_manifests()
+            .corrupt_output(hook);
+
+        assert!(Arc::new(action).commit(&table).await.is_err());
+        let written = written.lock().unwrap().clone();
+        assert_eq!(written.len(), 2);
+        for path in written {
+            assert!(!table.file_io().exists(&path).await.unwrap(), "{path}");
+        }
     }
 
     #[tokio::test]
@@ -2165,5 +2412,1020 @@ mod tests {
         );
         assert_eq!(same.data_file, base.data_file);
         assert_eq!(super::entry_hash(&same), super::entry_hash(&base));
+    }
+
+    /// Commits `commit` to `table` through `catalog`.
+    async fn commit_to(
+        catalog: &impl Catalog,
+        table: &Table,
+        mut commit: crate::transaction::ActionCommit,
+    ) -> crate::Result<Table> {
+        catalog
+            .update_table(
+                crate::TableCommit::builder()
+                    .ident(table.identifier().clone())
+                    .updates(commit.take_updates())
+                    .requirements(commit.take_requirements())
+                    .build(),
+            )
+            .await
+    }
+
+    /// The five files of the table [`planned_rewrite`] builds.
+    const ALL: [&str; 5] = ["a", "b", "c", "d", "e"];
+
+    /// A table of five single-file appends, a rewrite planned on it that replaces the manifests
+    /// holding the files named in `select`, the plan's commit, and its snapshot.
+    async fn planned_rewrite(
+        catalog: &impl Catalog,
+        format_version: FormatVersion,
+        select: &[&str],
+    ) -> (
+        Table,
+        crate::transaction::ActionCommit,
+        crate::spec::Snapshot,
+    ) {
+        let mut table = match format_version {
+            FormatVersion::V1 => make_v1_minimal_table_in_catalog(catalog).await,
+            _ => make_v2_minimal_table_in_catalog(catalog).await,
+        };
+        for name in ALL {
+            table = append_one(catalog, table, data_file(name, 1, 100, 1)).await;
+        }
+        let paths = manifest_paths_holding(&table, select).await;
+        let mut planned = Arc::new(
+            Transaction::new(&table)
+                .rewrite_manifests()
+                .rewrite_if(move |m| paths.contains(&m.manifest_path)),
+        )
+        .commit(&table)
+        .await
+        .unwrap();
+        let updates = planned.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            panic!("the plan adds a snapshot")
+        };
+        let snapshot = snapshot.clone();
+        let planned = crate::transaction::ActionCommit::new(updates, planned.take_requirements());
+        (table, planned, snapshot)
+    }
+
+    /// Rewrites the manifest list of `table`'s current snapshot in place so that it lists the
+    /// manifest at `index` twice, and returns the table reloaded from `catalog`.
+    async fn list_a_manifest_twice(catalog: &impl Catalog, table: &Table, index: usize) -> Table {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let mut manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .unwrap()
+            .entries()
+            .to_vec();
+        manifests.push(manifests[index].clone());
+        let count = manifests.len();
+        let mut writer = ManifestListWriter::v2(
+            table
+                .file_io()
+                .new_output(snapshot.manifest_list())
+                .unwrap()
+                .writer()
+                .await
+                .unwrap(),
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
+        );
+        writer.add_manifests(manifests.into_iter()).unwrap();
+        writer.close().await.unwrap();
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(data_manifests(&reloaded).await.len(), count);
+        reloaded
+    }
+
+    /// Deletes the data file of the manifest at `index` of `table`'s list with an overwrite.
+    async fn delete_the_file_of(catalog: &impl Catalog, table: &Table, index: usize) -> Table {
+        let manifest = data_manifests(table).await[index].clone();
+        let file = table
+            .manifest_reader()
+            .read(&manifest)
+            .await
+            .unwrap()
+            .entries()[0]
+            .data_file()
+            .clone();
+        let tx = Transaction::new(table);
+        tx.overwrite()
+            .delete_data_files([file])
+            .apply(tx)
+            .unwrap()
+            .commit(catalog)
+            .await
+            .unwrap()
+    }
+
+    async fn live_paths_of(table: &Table) -> Vec<String> {
+        all_live_entries(table)
+            .await
+            .into_iter()
+            .map(|e| e.1)
+            .collect()
+    }
+
+    /// A writer deleted the file of a replaced manifest, so that manifest is gone from the head,
+    /// while the head lists another replaced manifest twice: the rebase is refused, as Java's
+    /// per-manifest check refuses it. Once with the duplicate already in the base (the plan
+    /// replaced it twice) and once with the duplicate only in the head.
+    #[tokio::test]
+    async fn test_rebase_is_refused_when_a_replaced_manifest_is_gone_and_another_is_listed_twice() {
+        let mut outcomes = Vec::new();
+        for duplicate_in_base in [true, false] {
+            let catalog = new_memory_catalog().await;
+            let mut table = make_v2_minimal_table_in_catalog(&catalog).await;
+            for name in ["a", "b", "c", "d", "e"] {
+                table = append_one(&catalog, table, data_file(name, 1, 100, 1)).await;
+            }
+            let base = if duplicate_in_base {
+                list_a_manifest_twice(&catalog, &table, 0).await
+            } else {
+                table
+            };
+            let mut planned = Arc::new(Transaction::new(&base).rewrite_manifests())
+                .commit(&base)
+                .await
+                .unwrap();
+            let updates = planned.take_updates();
+            let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+                panic!("the plan adds a snapshot")
+            };
+            let snapshot = snapshot.clone();
+            let replaced: Vec<String> = data_manifests(&base)
+                .await
+                .into_iter()
+                .map(|m| m.manifest_path)
+                .collect();
+
+            let head = delete_the_file_of(&catalog, &base, 1).await;
+            let head = if duplicate_in_base {
+                head
+            } else {
+                list_a_manifest_twice(&catalog, &head, 0).await
+            };
+            let head_paths: Vec<String> = data_manifests(&head)
+                .await
+                .into_iter()
+                .map(|m| m.manifest_path)
+                .collect();
+            assert!(
+                !head_paths.contains(&replaced[1]),
+                "B is gone from the head"
+            );
+            let rebased = RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                .await
+                .unwrap();
+            let outcome = match rebased {
+                None => "refused".to_string(),
+                Some(rebased) => {
+                    let after = commit_to(&catalog, &head, rebased).await.unwrap();
+                    format!(
+                        "rebased: head live {:?}, after live {:?}",
+                        live_paths_of(&head).await,
+                        live_paths_of(&after).await
+                    )
+                }
+            };
+            outcomes.push((duplicate_in_base, outcome));
+        }
+        assert_eq!(outcomes, vec![
+            (true, "refused".to_string()),
+            (false, "refused".to_string())
+        ]);
+    }
+
+    /// A rebased list that fails its check is refused and deleted, as no catalog saw it.
+    #[tokio::test]
+    async fn test_a_rebased_list_that_fails_its_check_is_deleted() {
+        let catalog = new_memory_catalog().await;
+        let (base, _, snapshot) = planned_rewrite(&catalog, FormatVersion::V2, &ALL).await;
+        let head = append_one(&catalog, base.clone(), data_file("f", 1, 100, 1)).await;
+        let parent = head.metadata().current_snapshot_id();
+        let sequence_number = head.metadata().next_sequence_number();
+        let snapshot_id = snapshot.snapshot_id();
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: OutputHook = {
+            let written = written.clone();
+            Arc::new(move |table: Table, list_path: String| {
+                let written = written.clone();
+                Box::pin(async move {
+                    written.lock().unwrap().push(list_path.clone());
+                    let file_io = table.file_io();
+                    let bytes = file_io.new_input(&list_path).unwrap().read().await.unwrap();
+                    let mut manifests: Vec<ManifestFile> =
+                        ManifestList::parse_with_version(&bytes, FormatVersion::V2)
+                            .unwrap()
+                            .consume_entries()
+                            .into_iter()
+                            .collect();
+                    // The created manifest is no longer first.
+                    manifests.reverse();
+                    let output = file_io.new_output(&list_path).unwrap();
+                    let mut writer = ManifestListWriter::v2(
+                        output.writer().await.unwrap(),
+                        snapshot_id,
+                        parent,
+                        sequence_number,
+                    );
+                    writer.add_manifests(manifests.into_iter()).unwrap();
+                    writer.close().await.unwrap();
+                })
+            })
+        };
+        REBASE_OUTPUT.with(|output| *output.borrow_mut() = Some(hook));
+        let rebased = RewriteManifestsAction::rebase(&base, &snapshot, &head).await;
+        REBASE_OUTPUT.with(|output| *output.borrow_mut() = None);
+
+        let error = rebased.err().expect("the check refuses the list");
+        assert_eq!(
+            error.message(),
+            "RewriteManifests output failed verification: the kept manifests changed"
+        );
+        let written = written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1);
+        assert!(!head.file_io().exists(&written[0]).await.unwrap());
+    }
+
+    /// The rebase is refused when the head holds the planned snapshot, or its default spec,
+    /// current schema or format version differs from the base.
+    #[tokio::test]
+    async fn test_rebase_is_refused_when_the_head_does_not_fit_the_plan() {
+        use crate::spec::{NestedField, PrimitiveType, Schema, Type, UnboundPartitionSpec};
+
+        let catalog = new_memory_catalog().await;
+        fn wider(table: &Table) -> Schema {
+            let schema = table.metadata().current_schema();
+            Schema::builder()
+                .with_fields(
+                    schema
+                        .as_struct()
+                        .fields()
+                        .iter()
+                        .cloned()
+                        .chain([NestedField::optional(
+                            100,
+                            "extra",
+                            Type::Primitive(PrimitiveType::Long),
+                        )
+                        .into()]),
+                )
+                .build()
+                .unwrap()
+        }
+        let changes: [fn(&Table) -> Vec<TableUpdate>; 3] = [
+            |_| {
+                vec![
+                    TableUpdate::AddSpec {
+                        spec: UnboundPartitionSpec::builder().build(),
+                    },
+                    TableUpdate::SetDefaultSpec { spec_id: -1 },
+                ]
+            },
+            |table| {
+                vec![
+                    TableUpdate::AddSchema {
+                        schema: wider(table),
+                    },
+                    TableUpdate::SetCurrentSchema { schema_id: -1 },
+                ]
+            },
+            |_| {
+                vec![TableUpdate::UpgradeFormatVersion {
+                    format_version: FormatVersion::V3,
+                }]
+            },
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let (base, _, snapshot) = planned_rewrite(&catalog, FormatVersion::V2, &ALL).await;
+            let updates = change(&base);
+            let head = commit_to(
+                &catalog,
+                &base,
+                crate::transaction::ActionCommit::new(updates, vec![]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                head.metadata().current_snapshot_id(),
+                base.metadata().current_snapshot_id()
+            );
+            let rebased = RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                .await
+                .unwrap();
+            assert!(rebased.is_none(), "change {i}");
+        }
+
+        // The planned rewrite landed, and `main` was rolled back to its parent.
+        let (base, planned, snapshot) = planned_rewrite(&catalog, FormatVersion::V2, &ALL).await;
+        let landed = commit_to(&catalog, &base, planned).await.unwrap();
+        let rollback = TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: crate::spec::SnapshotReference::new(
+                base.metadata().current_snapshot_id().unwrap(),
+                SnapshotRetention::branch(None, None, None),
+            ),
+        };
+        let head = commit_to(
+            &catalog,
+            &landed,
+            crate::transaction::ActionCommit::new(vec![rollback], vec![]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            head.metadata()
+                .snapshot_by_id(snapshot.snapshot_id())
+                .is_some()
+        );
+        let rebased = RewriteManifestsAction::rebase(&base, &snapshot, &head)
+            .await
+            .unwrap();
+        assert!(rebased.is_none());
+    }
+
+    /// Every live entry of the current snapshot, data and deletes: content, path, snapshot id and
+    /// sequence numbers.
+    async fn all_live_entries(
+        table: &Table,
+    ) -> Vec<(String, String, Option<i64>, Option<i64>, Option<i64>)> {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let mut entries = Vec::new();
+        for m in list.entries() {
+            for e in table.manifest_reader().read(m).await.unwrap().entries() {
+                if e.is_alive() {
+                    entries.push((
+                        format!("{:?}", e.content_type()),
+                        e.file_path().to_string(),
+                        e.snapshot_id(),
+                        e.sequence_number(),
+                        e.file_sequence_number,
+                    ));
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Every manifest of the current snapshot, in list order.
+    async fn all_manifests(table: &Table) -> Vec<ManifestFile> {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .unwrap()
+            .entries()
+            .to_vec()
+    }
+
+    /// The manifests `snapshot` created and the paths of `base`'s manifests it replaced.
+    async fn created_and_replaced(
+        base: &Table,
+        snapshot: &crate::spec::Snapshot,
+    ) -> (Vec<ManifestFile>, Vec<String>) {
+        let planned = base
+            .manifest_list_reader(&Arc::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap()
+            .entries()
+            .to_vec();
+        let planned_paths: Vec<&str> = planned.iter().map(|m| m.manifest_path.as_str()).collect();
+        let replaced = all_manifests(base)
+            .await
+            .into_iter()
+            .map(|m| m.manifest_path)
+            .filter(|p| !planned_paths.contains(&p.as_str()))
+            .collect();
+        let created = planned
+            .into_iter()
+            .filter(|m| m.added_snapshot_id == snapshot.snapshot_id())
+            .collect();
+        (created, replaced)
+    }
+
+    const TOTALS: [&str; 6] = [
+        "total-data-files",
+        "total-delete-files",
+        "total-records",
+        "total-files-size",
+        "total-position-deletes",
+        "total-equality-deletes",
+    ];
+
+    /// Rebases `snapshot`, planned on `base`, onto `head`, commits it and checks the result
+    /// against `head`: the planned snapshot id, `head` as parent and its next sequence number,
+    /// the planned manifests (with the new sequence number) followed by `head`'s other manifests
+    /// in `head`'s order, `head`'s live entries, the planned counts, `head`'s totals.
+    async fn rebase_and_check(
+        catalog: &impl Catalog,
+        base: &Table,
+        snapshot: &crate::spec::Snapshot,
+        head: &Table,
+    ) -> Table {
+        let (created, replaced) = created_and_replaced(base, snapshot).await;
+        let kept: Vec<ManifestFile> = all_manifests(head)
+            .await
+            .into_iter()
+            .filter(|m| !replaced.contains(&m.manifest_path))
+            .collect();
+        let rebased = RewriteManifestsAction::rebase(base, snapshot, head)
+            .await
+            .unwrap()
+            .expect("every replaced manifest is in the head");
+        let after = commit_to(catalog, head, rebased).await.unwrap();
+        let current = after.metadata().current_snapshot().unwrap();
+        let parent = head.metadata().current_snapshot().unwrap();
+        assert_eq!(current.snapshot_id(), snapshot.snapshot_id());
+        assert_eq!(current.parent_snapshot_id(), Some(parent.snapshot_id()));
+        assert_eq!(
+            current.sequence_number(),
+            head.metadata().next_sequence_number()
+        );
+        assert_eq!(current.summary().operation, Operation::Replace);
+        let v1 = head.metadata().format_version() == FormatVersion::V1;
+        let expected: Vec<ManifestFile> = created
+            .iter()
+            .map(|m| ManifestFile {
+                sequence_number: if v1 { 0 } else { current.sequence_number() },
+                ..m.clone()
+            })
+            .chain(kept.iter().cloned())
+            .collect();
+        assert_eq!(all_manifests(&after).await, expected);
+        assert_eq!(all_live_entries(&after).await, all_live_entries(head).await);
+        let props = &current.summary().additional_properties;
+        let planned_props = &snapshot.summary().additional_properties;
+        for key in [
+            "manifests-created",
+            "manifests-replaced",
+            "entries-processed",
+        ] {
+            assert_eq!(props.get(key), planned_props.get(key), "{key}");
+        }
+        assert_eq!(props["manifests-kept"], kept.len().to_string());
+        let head_props = &parent.summary().additional_properties;
+        for key in TOTALS {
+            assert_eq!(props.get(key), head_props.get(key), "{key}");
+        }
+        after
+    }
+
+    /// Paths of the data manifests that hold a file named in `names`.
+    async fn manifest_paths_holding(table: &Table, names: &[&str]) -> Vec<String> {
+        let mut paths = Vec::new();
+        for m in data_manifests(table).await {
+            let entries = table.manifest_reader().read(&m).await.unwrap();
+            if entries.entries().iter().any(|e| {
+                names
+                    .iter()
+                    .any(|n| e.file_path() == format!("test/{n}.parquet"))
+            }) {
+                paths.push(m.manifest_path.clone());
+            }
+        }
+        paths
+    }
+
+    /// The live data file named `name`.
+    async fn live_file(table: &Table, name: &str) -> DataFile {
+        for m in data_manifests(table).await {
+            for e in table.manifest_reader().read(&m).await.unwrap().entries() {
+                if e.is_alive() && e.file_path() == format!("test/{name}.parquet") {
+                    return e.data_file().clone();
+                }
+            }
+        }
+        panic!("no live file {name}")
+    }
+
+    async fn overwrite(
+        catalog: &impl Catalog,
+        table: &Table,
+        add: Vec<DataFile>,
+        delete: Vec<DataFile>,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        tx.overwrite()
+            .add_data_files(add)
+            .delete_data_files(delete)
+            .apply(tx)
+            .unwrap()
+            .commit(catalog)
+            .await
+            .unwrap()
+    }
+
+    async fn update(catalog: &impl Catalog, table: &Table, updates: Vec<TableUpdate>) -> Table {
+        commit_to(
+            catalog,
+            table,
+            crate::transaction::ActionCommit::new(updates, vec![]),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn set_ref(name: &str, snapshot_id: i64, retention: SnapshotRetention) -> TableUpdate {
+        TableUpdate::SetSnapshotRef {
+            ref_name: name.to_string(),
+            reference: crate::spec::SnapshotReference::new(snapshot_id, retention),
+        }
+    }
+
+    fn delete_of(content: DataContentType, name: &str, records: u64) -> DataFile {
+        let mut file = data_file(name, 1, 50, records);
+        file.content = content;
+        if content == DataContentType::EqualityDeletes {
+            file.equality_ids = Some(vec![2]);
+        }
+        file
+    }
+
+    /// Writer commits that keep every manifest the plan replaces: the rewrite is re-applied on
+    /// each, on v1 and v2 tables, and keeps the writer's manifests and entries exactly.
+    #[tokio::test]
+    async fn test_rebase_applies_on_writer_commits_that_keep_the_replaced_manifests() {
+        for format_version in [FormatVersion::V1, FormatVersion::V2] {
+            let catalog = new_memory_catalog().await;
+
+            // An append: the planned manifest, then the appended one, and the plan's counts.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let head = append_one(&catalog, base.clone(), data_file("f", 1, 100, 1)).await;
+            let after = rebase_and_check(&catalog, &base, &snapshot, &head).await;
+            let current = after.metadata().current_snapshot().unwrap();
+            let summary = |key: &str| current.summary().additional_properties[key].clone();
+            assert_eq!(
+                [
+                    "manifests-created",
+                    "manifests-replaced",
+                    "manifests-kept",
+                    "entries-processed",
+                    "total-data-files",
+                    "total-records",
+                ]
+                .map(summary),
+                ["1", "5", "1", "5", "6", "6"].map(String::from)
+            );
+
+            // An overwrite that only adds files.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let head = overwrite(&catalog, &base, vec![data_file("f", 1, 100, 7)], vec![]).await;
+            let after = rebase_and_check(&catalog, &base, &snapshot, &head).await;
+            assert_eq!(all_manifests(&after).await.len(), 2);
+
+            // An overwrite that deletes a file of a manifest the plan carries.
+            let (base, _, snapshot) =
+                planned_rewrite(&catalog, format_version, &["a", "b", "c"]).await;
+            let e = live_file(&base, "e").await;
+            let head = overwrite(&catalog, &base, vec![data_file("g", 1, 100, 3)], vec![e]).await;
+            let after = rebase_and_check(&catalog, &base, &snapshot, &head).await;
+            let names: Vec<String> = all_live_entries(&after)
+                .await
+                .into_iter()
+                .map(|e| e.1)
+                .collect();
+            assert_eq!(
+                names,
+                ["a", "b", "c", "d", "g"].map(|n| format!("test/{n}.parquet"))
+            );
+
+            // A concurrent rewrite of the manifests the plan carries.
+            let (base, _, snapshot) =
+                planned_rewrite(&catalog, format_version, &["a", "b", "c"]).await;
+            let carried = manifest_paths_holding(&base, &["d", "e"]).await;
+            let tx = Transaction::new(&base);
+            let head = tx
+                .rewrite_manifests()
+                .rewrite_if(move |m| carried.contains(&m.manifest_path))
+                .apply(tx)
+                .unwrap()
+                .commit(&catalog)
+                .await
+                .unwrap();
+            assert_eq!(data_manifests(&head).await.len(), 4);
+            let after = rebase_and_check(&catalog, &base, &snapshot, &head).await;
+            assert_eq!(data_manifests(&after).await.len(), 2);
+
+            // A property change: the head's snapshot is the base's.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let head = update(&catalog, &base, vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("k".to_string(), "v".to_string())]),
+            }])
+            .await;
+            rebase_and_check(&catalog, &base, &snapshot, &head).await;
+
+            // An append, then the base's snapshot expired.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let head = append_one(&catalog, base.clone(), data_file("f", 1, 100, 1)).await;
+            let base_id = base.metadata().current_snapshot_id().unwrap();
+            let head = update(&catalog, &head, vec![TableUpdate::RemoveSnapshots {
+                snapshot_ids: vec![base_id],
+            }])
+            .await;
+            assert!(head.metadata().snapshot_by_id(base_id).is_none());
+            rebase_and_check(&catalog, &base, &snapshot, &head).await;
+
+            // `main` rolled back to the third append; the plan replaces only its manifests.
+            let (base, _, snapshot) =
+                planned_rewrite(&catalog, format_version, &["a", "b", "c"]).await;
+            let current = base.metadata().current_snapshot().unwrap();
+            let parent = base
+                .metadata()
+                .snapshot_by_id(current.parent_snapshot_id().unwrap())
+                .unwrap();
+            let third = parent.parent_snapshot_id().unwrap();
+            let head = update(&catalog, &base, vec![set_ref(
+                MAIN_BRANCH,
+                third,
+                SnapshotRetention::branch(None, None, None),
+            )])
+            .await;
+            let after = rebase_and_check(&catalog, &base, &snapshot, &head).await;
+            assert_eq!(all_manifests(&after).await.len(), 1);
+            let names: Vec<String> = all_live_entries(&after)
+                .await
+                .into_iter()
+                .map(|e| e.1)
+                .collect();
+            assert_eq!(names, ["a", "b", "c"].map(|n| format!("test/{n}.parquet")));
+
+            // A tag and a branch on the base, then an append to `main`: both refs stay.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let base_id = base.metadata().current_snapshot_id().unwrap();
+            let head = update(&catalog, &base, vec![
+                set_ref("t", base_id, SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
+                }),
+                set_ref("b", base_id, SnapshotRetention::branch(None, None, None)),
+            ])
+            .await;
+            let head = append_one(&catalog, head, data_file("f", 1, 100, 1)).await;
+            let after = rebase_and_check(&catalog, &base, &snapshot, &head).await;
+            assert_eq!(after.metadata().refs()["t"].snapshot_id, base_id);
+            assert_eq!(after.metadata().refs()["b"].snapshot_id, base_id);
+        }
+    }
+
+    /// Delete files of a merge-on-read writer land between the plan and its commit: the rewrite
+    /// is re-applied, keeps the delete manifest, the deletes' sequence numbers, and the data
+    /// entries' sequence numbers that decide which rows the deletes remove.
+    #[tokio::test]
+    async fn test_rebase_keeps_position_and_equality_deletes_and_their_sequence_numbers() {
+        let catalog = new_memory_catalog().await;
+        let (base, _, snapshot) = planned_rewrite(&catalog, FormatVersion::V2, &ALL).await;
+        let mut position = delete_of(DataContentType::PositionDeletes, "pos", 2);
+        position.referenced_data_file = Some("test/a.parquet".to_string());
+        let equality = delete_of(DataContentType::EqualityDeletes, "eq", 1);
+        let head = stage_delete_files(&catalog, &base, vec![position, equality]).await;
+        let head = append_one(&catalog, head, data_file("f", 1, 100, 1)).await;
+        let delete_seq = head.metadata().next_sequence_number() - 2;
+
+        let after = rebase_and_check(&catalog, &base, &snapshot, &head).await;
+
+        let manifests = all_manifests(&after).await;
+        assert_eq!(manifests.iter().map(|m| m.content).collect::<Vec<_>>(), [
+            ManifestContentType::Data,
+            ManifestContentType::Deletes,
+            ManifestContentType::Data
+        ]);
+        let created = &manifests[0];
+        let base_seqs: Vec<i64> = all_live_entries(&base)
+            .await
+            .into_iter()
+            .map(|e| e.3.unwrap())
+            .collect();
+        assert_eq!(
+            created.min_sequence_number,
+            *base_seqs.iter().min().unwrap()
+        );
+        assert!(created.sequence_number > delete_seq);
+        let deletes: Vec<(String, Option<i64>)> = all_live_entries(&after)
+            .await
+            .into_iter()
+            .filter(|e| e.0 != "Data")
+            .map(|e| (e.1, e.3))
+            .collect();
+        assert_eq!(deletes, vec![
+            ("test/eq.parquet".to_string(), Some(delete_seq)),
+            ("test/pos.parquet".to_string(), Some(delete_seq)),
+        ]);
+        // The data entries keep the sequence numbers that decide which rows the deletes remove.
+        let data: Vec<i64> = all_live_entries(&after)
+            .await
+            .into_iter()
+            .filter(|e| e.0 == "Data")
+            .map(|e| e.3.unwrap())
+            .collect();
+        let mut data = data;
+        data.sort_unstable();
+        assert_eq!(
+            data,
+            (delete_seq - 5..delete_seq)
+                .chain([delete_seq + 1])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Writer commits that remove a manifest the plan replaces, or change what the plan was
+    /// written for: the rebase is refused, on v1 and v2 tables.
+    #[tokio::test]
+    async fn test_rebase_is_refused_after_writer_commits_that_drop_a_replaced_manifest() {
+        for format_version in [FormatVersion::V1, FormatVersion::V2] {
+            let catalog = new_memory_catalog().await;
+
+            // An overwrite deleting a file of a replaced manifest rewrites that manifest.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let c = live_file(&base, "c").await;
+            let head = overwrite(&catalog, &base, vec![], vec![c]).await;
+            assert!(
+                RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // A copy-on-write row delta removing a file of a replaced manifest.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let a = live_file(&base, "a").await;
+            let tx = Transaction::new(&base);
+            let head = tx
+                .row_delta()
+                .remove_data_files(vec![a])
+                .apply(tx)
+                .unwrap()
+                .commit(&catalog)
+                .await
+                .unwrap();
+            assert!(
+                RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // A concurrent rewrite that merges two replaced manifests with a carried one.
+            let (base, _, snapshot) =
+                planned_rewrite(&catalog, format_version, &["a", "b", "c"]).await;
+            let mixed = manifest_paths_holding(&base, &["c", "d"]).await;
+            let tx = Transaction::new(&base);
+            let head = tx
+                .rewrite_manifests()
+                .rewrite_if(move |m| mixed.contains(&m.manifest_path))
+                .apply(tx)
+                .unwrap()
+                .commit(&catalog)
+                .await
+                .unwrap();
+            assert!(
+                RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // `main` rolled back to before the last replaced manifest was added.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let parent = base
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id()
+                .unwrap();
+            let head = update(&catalog, &base, vec![set_ref(
+                MAIN_BRANCH,
+                parent,
+                SnapshotRetention::branch(None, None, None),
+            )])
+            .await;
+            assert!(
+                RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // `main` removed: the head has no current snapshot.
+            let (base, _, snapshot) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let head = update(&catalog, &base, vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string(),
+            }])
+            .await;
+            assert!(head.metadata().current_snapshot().is_none());
+            assert!(
+                RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // A v1 table upgraded to v2.
+        let catalog = new_memory_catalog().await;
+        let (base, _, snapshot) = planned_rewrite(&catalog, FormatVersion::V1, &ALL).await;
+        let head = update(&catalog, &base, vec![TableUpdate::UpgradeFormatVersion {
+            format_version: FormatVersion::V2,
+        }])
+        .await;
+        assert_eq!(
+            head.metadata().current_snapshot_id(),
+            base.metadata().current_snapshot_id()
+        );
+        assert!(
+            RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Writer commits land between each rebase and its commit: the stale rebase loses its
+    /// commit, the next rebase follows it with the same snapshot id and planned manifest, and the
+    /// last one commits on the third writer commit with a new manifest list each time.
+    #[tokio::test]
+    async fn test_rebases_chain_over_several_writer_commits() {
+        for format_version in [FormatVersion::V1, FormatVersion::V2] {
+            let catalog = new_memory_catalog().await;
+            let (base, _, planned) = planned_rewrite(&catalog, format_version, &ALL).await;
+            let (created, _) = created_and_replaced(&base, &planned).await;
+            let mut previous = (base.clone(), planned.clone());
+            let mut lists = vec![planned.manifest_list().to_string()];
+            let mut head = append_one(&catalog, base.clone(), data_file("f", 1, 100, 1)).await;
+            for name in ["g", "h"] {
+                let mut rebased = RewriteManifestsAction::rebase(&previous.0, &previous.1, &head)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let updates = rebased.take_updates();
+                let requirements = rebased.take_requirements();
+                let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+                    panic!("a snapshot")
+                };
+                let snapshot = snapshot.clone();
+                assert_eq!(snapshot.snapshot_id(), planned.snapshot_id());
+                assert_eq!(
+                    snapshot.parent_snapshot_id(),
+                    head.metadata().current_snapshot_id()
+                );
+                lists.push(snapshot.manifest_list().to_string());
+                let next = append_one(&catalog, head.clone(), data_file(name, 1, 100, 1)).await;
+                let error = commit_to(
+                    &catalog,
+                    &head,
+                    crate::transaction::ActionCommit::new(updates, requirements),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.kind(), crate::ErrorKind::CatalogCommitConflicts);
+                previous = (head, snapshot);
+                head = next;
+            }
+            let after = rebase_and_check(&catalog, &previous.0, &previous.1, &head).await;
+            let manifests = all_manifests(&after).await;
+            assert_eq!(manifests.len(), 4);
+            assert_eq!(manifests[0].manifest_path, created[0].manifest_path);
+            let current = after.metadata().current_snapshot().unwrap();
+            lists.push(current.manifest_list().to_string());
+            let distinct: std::collections::HashSet<&String> = lists.iter().collect();
+            assert_eq!(distinct.len(), 4);
+            assert_eq!(all_live_entries(&after).await.len(), 8);
+            assert_eq!(
+                after
+                    .metadata()
+                    .snapshots()
+                    .filter(|s| s.summary().operation == Operation::Replace)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// A plan that writes two manifests keeps both, in order, when re-applied.
+    #[tokio::test]
+    async fn test_rebase_keeps_several_created_manifests_in_order() {
+        let catalog = new_memory_catalog().await;
+        let mut table = make_v2_minimal_table_in_catalog(&catalog).await;
+        for i in 0..8 {
+            table = append_one(&catalog, table, data_file(&format!("p{i}"), i, 100, 1)).await;
+        }
+        let target = data_manifest_bytes(&table).await.div_ceil(2);
+        let mut planned = Arc::new(
+            Transaction::new(&table)
+                .rewrite_manifests()
+                .set_target_size_bytes(target),
+        )
+        .commit(&table)
+        .await
+        .unwrap();
+        let updates = planned.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            panic!("a snapshot")
+        };
+        let (created, _) = created_and_replaced(&table, snapshot).await;
+        assert_eq!(created.len(), 2);
+        let head = append_one(&catalog, table.clone(), data_file("q", 9, 100, 1)).await;
+        let after = rebase_and_check(&catalog, &table, snapshot, &head).await;
+        let paths: Vec<String> = all_manifests(&after)
+            .await
+            .into_iter()
+            .map(|m| m.manifest_path)
+            .collect();
+        assert_eq!(&paths[..2], &[
+            created[0].manifest_path.clone(),
+            created[1].manifest_path.clone()
+        ]);
+        assert_eq!(paths.len(), 3);
+    }
+
+    /// The re-applied rewrite keeps the plan's snapshot properties, and `main`'s retention as the
+    /// head has it.
+    #[tokio::test]
+    async fn test_rebase_keeps_snapshot_properties_and_the_heads_retention() {
+        let catalog = new_memory_catalog().await;
+        let mut table = make_v2_minimal_table_in_catalog(&catalog).await;
+        for name in ["a", "b", "c"] {
+            table = append_one(&catalog, table, data_file(name, 1, 100, 1)).await;
+        }
+        let mut planned = Arc::new(
+            Transaction::new(&table)
+                .rewrite_manifests()
+                .set_snapshot_properties(HashMap::from([("app".to_string(), "x".to_string())])),
+        )
+        .commit(&table)
+        .await
+        .unwrap();
+        let updates = planned.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            panic!("a snapshot")
+        };
+        let head = append_one(&catalog, table.clone(), data_file("d", 1, 100, 1)).await;
+        let retention = SnapshotRetention::branch(Some(7), Some(1_000_000), None);
+        let head = set_main_retention(&catalog, &head, retention.clone()).await;
+        let after = rebase_and_check(&catalog, &table, snapshot, &head).await;
+        let current = after.metadata().current_snapshot().unwrap();
+        assert_eq!(current.summary().additional_properties["app"], "x");
+        assert_eq!(after.metadata().refs()[MAIN_BRANCH].retention, retention);
+    }
+
+    /// A rebase needs a base below format v3 with a current snapshot, and a rewrite snapshot
+    /// planned on it.
+    #[tokio::test]
+    async fn test_rebase_requires_a_snapshot_planned_on_the_base() {
+        let catalog = new_memory_catalog().await;
+        let (base, _, snapshot) = planned_rewrite(&catalog, FormatVersion::V2, &ALL).await;
+        let head = append_one(&catalog, base.clone(), data_file("f", 1, 100, 1)).await;
+        let Err(error) = RewriteManifestsAction::rebase(&head, &snapshot, &head).await else {
+            panic!("the snapshot was not planned on the head")
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::PreconditionFailed);
+        let empty = make_v2_minimal_table_in_catalog(&catalog).await;
+        let Err(error) = RewriteManifestsAction::rebase(&empty, &snapshot, &head).await else {
+            panic!("the base has no snapshot")
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::PreconditionFailed);
+        let append = head.metadata().current_snapshot().unwrap();
+        let Err(error) = RewriteManifestsAction::rebase(&base, append, &head).await else {
+            panic!("an append is not a rewrite")
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::PreconditionFailed);
+
+        let v3 = make_v3_minimal_table_in_catalog(&catalog).await;
+        let v3 = append_one(&catalog, v3, data_file("a", 1, 100, 1)).await;
+        let v3_head = append_one(&catalog, v3.clone(), data_file("b", 1, 100, 1)).await;
+        let next = v3_head.metadata().current_snapshot().unwrap();
+        let Err(error) = RewriteManifestsAction::rebase(&v3, next, &v3_head).await else {
+            panic!("a v3 base is refused")
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
+    }
+
+    /// The base's manifest list is gone (its snapshot expired and its files removed): the rebase
+    /// fails, it does not guess the replaced manifests.
+    #[tokio::test]
+    async fn test_rebase_fails_when_the_base_list_is_gone() {
+        let catalog = new_memory_catalog().await;
+        let (base, _, snapshot) = planned_rewrite(&catalog, FormatVersion::V2, &ALL).await;
+        let head = append_one(&catalog, base.clone(), data_file("f", 1, 100, 1)).await;
+        let base_list = base
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .manifest_list()
+            .to_string();
+        base.file_io().delete(&base_list).await.unwrap();
+        assert!(
+            RewriteManifestsAction::rebase(&base, &snapshot, &head)
+                .await
+                .is_err()
+        );
     }
 }
