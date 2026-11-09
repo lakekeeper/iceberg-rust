@@ -326,6 +326,8 @@ pub(crate) struct MergingSnapshotProducer {
     /// commit retry cannot overwrite a manifest an earlier attempt wrote
     /// under the same commit uuid.
     manifest_counter: AtomicU64,
+    /// Additional key/value properties for the new snapshot's summary.
+    snapshot_properties: HashMap<String, String>,
 }
 
 impl MergingSnapshotProducer {
@@ -339,7 +341,12 @@ impl MergingSnapshotProducer {
             filter_manager: ManifestFilterManager::new(true),
             commit_uuid: Uuid::now_v7(),
             manifest_counter: AtomicU64::new(0),
+            snapshot_properties: HashMap::new(),
         }
+    }
+
+    pub(crate) fn set_snapshot_properties(&mut self, snapshot_properties: HashMap<String, String>) {
+        self.snapshot_properties = snapshot_properties;
     }
 
     pub(crate) fn add_data_file(&mut self, file: DataFile) {
@@ -483,7 +490,7 @@ impl MergingSnapshotProducer {
         let snapshot_producer = SnapshotProducer::builder()
             .with_table(table)
             .with_commit_uuid(self.commit_uuid)
-            .with_snapshot_properties(HashMap::new())
+            .with_snapshot_properties(self.snapshot_properties.clone())
             .with_added_data_files(self.added_data_files.clone())
             .with_added_delete_files(
                 self.added_delete_files
@@ -675,9 +682,13 @@ impl MergingSnapshotProducer {
             collector.add_file(file, schema.clone(), spec.clone());
         }
 
+        // Computed metrics overwrite colliding snapshot properties, as in
+        // `SnapshotProducer::summary`.
+        let mut additional_properties = self.snapshot_properties.clone();
+        additional_properties.extend(collector.build());
         let summary = Summary {
             operation: self.operation.clone(),
-            additional_properties: collector.build(),
+            additional_properties,
         };
 
         let previous_snapshot = table_metadata.current_snapshot();

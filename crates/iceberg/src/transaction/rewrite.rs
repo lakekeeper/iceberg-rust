@@ -27,6 +27,7 @@
 //! The resulting snapshot uses [`Operation::Replace`] to indicate that files
 //! were reorganised without changing the data.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -203,6 +204,14 @@ impl RewriteFilesAction {
     /// a V1 table.
     pub fn data_sequence_number(mut self, sequence_number: i64) -> Self {
         self.data_sequence_number = Some(sequence_number);
+        self
+    }
+
+    /// Sets additional key/value properties to record in the new snapshot's summary.
+    ///
+    /// The summary's computed metrics take precedence over a property of the same name.
+    pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
+        self.producer.set_snapshot_properties(snapshot_properties);
         self
     }
 
@@ -683,6 +692,38 @@ mod tests {
             }
         }
         assert_eq!(live_files, vec!["test/merged.parquet"]);
+    }
+
+    /// Snapshot properties land in the summary next to the computed metrics, which a property
+    /// of the same name does not override.
+    #[tokio::test]
+    async fn test_rewrite_files_snapshot_properties() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2.clone()]).await;
+
+        let merged = make_data_file(&table, "test/merged.parquet", 20, 200);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(f1)
+            .delete_file(f2)
+            .add_file(merged)
+            .set_snapshot_properties(HashMap::from([
+                ("lakekeeper.rollbackable".to_string(), "true".to_string()),
+                ("added-data-files".to_string(), "9999".to_string()),
+            ]));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Replace);
+        let summary = &snapshot.summary().additional_properties;
+        assert_eq!(summary.get("lakekeeper.rollbackable").unwrap(), "true");
+        assert_eq!(summary.get("added-data-files").unwrap(), "1");
+        assert_eq!(summary.get("deleted-data-files").unwrap(), "2");
     }
 
     /// Rewrite with a non-existent delete target should fail.
