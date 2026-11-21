@@ -26,6 +26,7 @@ use crate::spec::{ManifestContentType, ManifestEntry, ManifestFile, TableMetadat
 pub struct ManifestReader {
     file_io: FileIO,
     table_metadata: Option<TableMetadataRef>,
+    row_id_inheritance: bool,
 }
 
 impl ManifestReader {
@@ -34,6 +35,7 @@ impl ManifestReader {
         Self {
             file_io,
             table_metadata: None,
+            row_id_inheritance: true,
         }
     }
 
@@ -42,6 +44,14 @@ impl ManifestReader {
     /// [`ManifestMetadata::parse_with`](crate::spec::ManifestMetadata::parse_with)).
     pub(crate) fn with_table_metadata(mut self, table_metadata: TableMetadataRef) -> Self {
         self.table_metadata = Some(table_metadata);
+        self
+    }
+
+    /// Skip first row ID inheritance: a data file whose `first_row_id` is
+    /// unassigned keeps `None`. Ids of a data manifest without a `first_row_id`
+    /// are still cleared.
+    pub(crate) fn without_row_id_inheritance(mut self) -> Self {
+        self.row_id_inheritance = false;
         self
     }
 
@@ -73,7 +83,9 @@ impl ManifestReader {
             entry.inherit_data(manifest_file);
         }
 
-        self.assign_first_row_ids(manifest_file, &mut entries)?;
+        if self.row_id_inheritance || manifest_file.first_row_id.is_none() {
+            self.assign_first_row_ids(manifest_file, &mut entries)?;
+        }
 
         Ok(Manifest::new(metadata, entries))
     }
@@ -240,6 +252,56 @@ mod tests {
                 .is_err(),
             "encrypted manifest must not parse as plaintext"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_without_row_id_inheritance_keeps_unassigned_first_row_ids() {
+        let schema = test_schema();
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+        let io = FileIO::new_with_memory();
+        let path = "memory:///table/metadata/v3.avro";
+        let mut writer = ManifestWriterBuilder::new(
+            io.new_output(path).unwrap(),
+            Some(1),
+            schema,
+            partition_spec,
+        )
+        .build_v3_data();
+        let unassigned = data_entry(ManifestStatus::Existing, 3, None).data_file;
+        let assigned = data_entry(ManifestStatus::Existing, 5, Some(100)).data_file;
+        writer.add_existing_file(unassigned, 1, 1, Some(1)).unwrap();
+        writer.add_existing_file(assigned, 1, 1, Some(1)).unwrap();
+        let mut manifest_file = writer.write_manifest_file().await.unwrap();
+        manifest_file.first_row_id = Some(10);
+
+        let row_ids = |manifest: Manifest| -> Vec<Option<i64>> {
+            manifest
+                .entries()
+                .iter()
+                .map(|e| e.data_file().first_row_id())
+                .collect()
+        };
+        let inherited = ManifestReader::new(io.clone())
+            .read(&manifest_file)
+            .await
+            .unwrap();
+        let unassigned = ManifestReader::new(io.clone())
+            .without_row_id_inheritance()
+            .read(&manifest_file)
+            .await
+            .unwrap();
+        manifest_file.first_row_id = None;
+        let cleared = ManifestReader::new(io)
+            .without_row_id_inheritance()
+            .read(&manifest_file)
+            .await
+            .unwrap();
+        assert_eq!(row_ids(inherited), vec![Some(10), Some(100)]);
+        assert_eq!(row_ids(unassigned), vec![None, Some(100)]);
+        assert_eq!(row_ids(cleared), vec![None, None]);
     }
 
     fn test_schema() -> Arc<Schema> {
