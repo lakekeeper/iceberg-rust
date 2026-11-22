@@ -30,7 +30,7 @@ use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, Literal, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestList, ManifestListWriter, ManifestStatus, ManifestWriter,
     ManifestWriterBuilder, Operation, PrimitiveLiteral, SchemaId, SchemaRef, Snapshot,
-    SnapshotReference, Struct, Summary, TableProperties, UNASSIGNED_SEQUENCE_NUMBER,
+    SnapshotReference, Struct, Summary, TableMetadata, TableProperties, UNASSIGNED_SEQUENCE_NUMBER,
     partition_summaries,
 };
 use crate::table::Table;
@@ -50,7 +50,12 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 ///
 /// Before it returns the commit, the action reads back what it wrote and fails
 /// unless the new manifests hold exactly the live entries of the replaced ones.
-/// Tables of format version 3 or higher are refused.
+///
+/// On format v3 tables, entries keep their row ids. Each new manifest gets a
+/// `first_row_id` from the table's `next-row-id`, and takes as many row ids as its
+/// files without one (written before row lineage) have rows. Tables with an
+/// encryption manager are refused, and so is a rewrite of a manifest that is still
+/// encrypted.
 pub struct RewriteManifestsAction {
     target_size_bytes: Option<u64>,
     rewrite_if: Option<ManifestPredicate>,
@@ -104,12 +109,13 @@ impl RewriteManifestsAction {
     ///
     /// Returns `None` when the rewrite does not apply to `table` as planned: a replaced
     /// manifest is no longer in its current snapshot, its format version, default partition
-    /// spec or current schema changed, or it already holds the planned snapshot.
+    /// spec or current schema changed, it already holds the planned snapshot, or the plan
+    /// gave row ids to files without one, which `table` may have given others since.
     ///
     /// # Errors
     /// Fails when `planned` is not a rewrite (`replace`) snapshot that follows `base`'s current
-    /// snapshot, when `base` is a format v3 table, when a manifest list cannot be read or written,
-    /// or when the new list fails verification.
+    /// snapshot, when `table` has an encryption manager, when a manifest list cannot be read or
+    /// written, or when the new list fails verification.
     pub async fn rebase(
         base: &Table,
         planned: &Snapshot,
@@ -122,15 +128,7 @@ impl RewriteManifestsAction {
                 "RewriteManifests rebase requires the base to have a current snapshot",
             ));
         };
-        if base_metadata.format_version() >= FormatVersion::V3 {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "RewriteManifests does not support format {} tables",
-                    base_metadata.format_version()
-                ),
-            ));
-        }
+        refuse_encrypted(table)?;
         if planned.parent_snapshot_id() != Some(base_snapshot.snapshot_id())
             || planned.summary().operation != Operation::Replace
         {
@@ -142,6 +140,12 @@ impl RewriteManifestsAction {
         let Some(head) = metadata.current_snapshot() else {
             return Ok(None);
         };
+        // A plan gives row ids only to files that had none, between an upgrade to v3 and the
+        // first v3 commit. A commit since may have given those files other ids. Planning again
+        // reads the files with their ids.
+        if planned.added_rows_count().is_some_and(|rows| rows > 0) {
+            return Ok(None);
+        }
         if metadata.format_version() != base_metadata.format_version()
             || metadata.default_partition_spec_id() != base_metadata.default_partition_spec_id()
             || metadata.current_schema_id() != base_metadata.current_schema_id()
@@ -178,19 +182,30 @@ impl RewriteManifestsAction {
         if gone.len() != replaced.len() {
             return Ok(None);
         }
-        let kept: Vec<ManifestFile> = kept.into_iter().cloned().collect();
+        let mut kept: Vec<ManifestFile> = kept.into_iter().cloned().collect();
+        // The plan gave no row ids, so every file with rows in the new manifests has one; the
+        // manifests only need a `first_row_id` at or after the head's `next-row-id`.
+        let mut created: Vec<ManifestFile> = created
+            .into_iter()
+            .map(|m| ManifestFile {
+                sequence_number: UNASSIGNED_SEQUENCE_NUMBER,
+                first_row_id: None,
+                ..m.clone()
+            })
+            .collect();
+        let row_range = assign_row_ids(
+            metadata,
+            created
+                .iter_mut()
+                .map(|m| (m, Some(0)))
+                .chain(kept.iter_mut().map(|m| (m, None))),
+        )?;
 
         let manifest_list_path = write_manifest_list(
             table,
             snapshot_id,
             &Uuid::now_v7(),
-            created
-                .iter()
-                .map(|m| ManifestFile {
-                    sequence_number: UNASSIGNED_SEQUENCE_NUMBER,
-                    ..(*m).clone()
-                })
-                .chain(kept.iter().cloned()),
+            created.iter().cloned().chain(kept.iter().cloned()),
         )
         .await?;
         #[cfg(test)]
@@ -198,12 +213,13 @@ impl RewriteManifestsAction {
             hook(table.clone(), manifest_list_path.clone()).await;
         }
         // The new manifests were verified against the replaced ones when planned and their files
-        // do not change: the list must hold them as planned but for the sequence number.
+        // do not change: the list must hold them as planned but for the sequence number and row
+        // ids.
         let expected: Vec<ManifestFile> = created
             .into_iter()
             .map(|m| ManifestFile {
                 sequence_number: metadata.next_sequence_number(),
-                ..m.clone()
+                ..m
             })
             .collect();
         let verified = match read_list_layout(table, &manifest_list_path, &kept).await {
@@ -225,6 +241,7 @@ impl RewriteManifestsAction {
             snapshot_id,
             manifest_list_path,
             properties,
+            row_range,
         )))
     }
 }
@@ -233,22 +250,13 @@ impl RewriteManifestsAction {
 impl TransactionAction for RewriteManifestsAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let metadata = table.metadata();
-        // Row lineage (first row ids and `next-row-id`) is not maintained here.
-        if metadata.format_version() >= FormatVersion::V3 {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "RewriteManifests does not support format {} tables",
-                    metadata.format_version()
-                ),
-            ));
-        }
         let Some(current_snapshot) = metadata.current_snapshot() else {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "RewriteManifests requires the table to have a current snapshot",
             ));
         };
+        refuse_encrypted(table)?;
 
         let target_size_bytes = match self.target_size_bytes {
             Some(target_size_bytes) => target_size_bytes,
@@ -260,7 +268,7 @@ impl TransactionAction for RewriteManifestsAction {
 
         let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
 
-        let (to_rewrite, kept): (Vec<ManifestFile>, Vec<ManifestFile>) =
+        let (to_rewrite, mut kept): (Vec<ManifestFile>, Vec<ManifestFile>) =
             manifest_list.entries().iter().cloned().partition(|m| {
                 m.content == ManifestContentType::Data
                     && m.partition_spec_id == default_spec_id
@@ -281,6 +289,17 @@ impl TransactionAction for RewriteManifestsAction {
             .sum();
         if to_rewrite.len() == 1 && total_size <= target_size_bytes {
             return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        // Manifests written while the table had an encryption manager stay encrypted after it
+        // is gone; new manifests would hold their entries, data file keys included, in plaintext.
+        if let Some(manifest) = to_rewrite.iter().find(|m| m.key_metadata.is_some()) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "RewriteManifests does not rewrite encrypted manifest {}",
+                    manifest.manifest_path
+                ),
+            ));
         }
         let manifests_replaced = to_rewrite.len();
 
@@ -350,6 +369,7 @@ impl TransactionAction for RewriteManifestsAction {
         let output = async {
             let mut counter: u64 = 0;
             let mut new_manifests: Vec<ManifestFile> = Vec::new();
+            let mut unassigned_rows: Vec<u64> = Vec::new();
 
             for group in groups.into_values() {
                 let SchemaGroup {
@@ -375,7 +395,7 @@ impl TransactionAction for RewriteManifestsAction {
                 let mut entries = entries.into_iter();
                 for i in 0..manifest_count {
                     let size = base + usize::from(i < larger);
-                    let written = write_manifest(
+                    let (written, rows) = write_manifest(
                         table,
                         &schema,
                         &commit_uuid,
@@ -387,9 +407,17 @@ impl TransactionAction for RewriteManifestsAction {
                     written_paths.push(written.manifest_path.clone());
                     counter += 1;
                     new_manifests.push(written);
+                    unassigned_rows.push(rows);
                 }
             }
 
+            let row_range = assign_row_ids(
+                metadata,
+                new_manifests
+                    .iter_mut()
+                    .zip(unassigned_rows.into_iter().map(Some))
+                    .chain(kept.iter_mut().map(|m| (m, None))),
+            )?;
             let manifest_list_path = write_manifest_list(
                 table,
                 snapshot_id,
@@ -412,10 +440,10 @@ impl TransactionAction for RewriteManifestsAction {
                 expected_entries,
             )
             .await?;
-            Ok::<_, Error>((manifest_list_path, new_manifests.len()))
+            Ok::<_, Error>((manifest_list_path, new_manifests.len(), row_range))
         }
         .await;
-        let (manifest_list_path, manifests_created) = match output {
+        let (manifest_list_path, manifests_created, row_range) = match output {
             Ok(output) => output,
             Err(error) => {
                 delete_unsent(table, written_paths).await;
@@ -443,6 +471,7 @@ impl TransactionAction for RewriteManifestsAction {
             snapshot_id,
             manifest_list_path,
             properties,
+            row_range,
         ))
     }
 }
@@ -456,6 +485,63 @@ const SUMMARY_TOTALS: [&str; 6] = [
     "total-position-deletes",
     "total-equality-deletes",
 ];
+
+/// Refuses `table` when it has an encryption manager: the manifests and lists written here are
+/// not encrypted.
+fn refuse_encrypted(table: &Table) -> Result<()> {
+    if table.encryption_manager().is_some() {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "RewriteManifests does not support encrypted tables",
+        ));
+    }
+    Ok(())
+}
+
+/// Gives each data manifest without a `first_row_id` the table's next row id, and takes as many
+/// ids as the rows of its files without a `first_row_id`: the given count, or for a manifest
+/// written before row lineage, its existing and added rows. Returns the row range of the
+/// snapshot, the table's `next-row-id` and the number of ids taken, or `None` below format v3.
+///
+/// The spec's "Snapshot Root File First Row ID Assignment" requires no more.
+fn assign_row_ids<'a>(
+    metadata: &TableMetadata,
+    manifests: impl Iterator<Item = (&'a mut ManifestFile, Option<u64>)>,
+) -> Result<Option<(u64, u64)>> {
+    if metadata.format_version() < FormatVersion::V3 {
+        return Ok(None);
+    }
+    let first_row_id = metadata.next_row_id();
+    let mut next_row_id = first_row_id;
+    for (manifest, unassigned_rows) in manifests {
+        if manifest.content != ManifestContentType::Data || manifest.first_row_id.is_some() {
+            continue;
+        }
+        let rows = match unassigned_rows {
+            Some(rows) => rows,
+            None => manifest
+                .existing_rows_count
+                .zip(manifest.added_rows_count)
+                .and_then(|(existing, added)| existing.checked_add(added))
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Manifest {} has no row counts to assign row ids from",
+                            manifest.manifest_path
+                        ),
+                    )
+                })?,
+        };
+        manifest.first_row_id = Some(next_row_id);
+        // Row ids are longs: readers refuse ids above `i64::MAX`.
+        next_row_id = next_row_id
+            .checked_add(rows)
+            .filter(|&id| i64::try_from(id).is_ok())
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Row id overflow"))?;
+    }
+    Ok(Some((first_row_id, next_row_id - first_row_id)))
+}
 
 /// Deletes files of an output that failed before it was returned, so no catalog saw them.
 async fn delete_unsent(table: &Table, paths: Vec<String>) {
@@ -517,6 +603,7 @@ fn rewrite_commit(
     snapshot_id: i64,
     manifest_list_path: String,
     mut properties: HashMap<String, String>,
+    row_range: Option<(u64, u64)>,
 ) -> ActionCommit {
     let metadata = table.metadata();
     if let Some(current_snapshot) = metadata.current_snapshot() {
@@ -539,8 +626,13 @@ fn rewrite_commit(
         .with_sequence_number(metadata.next_sequence_number())
         .with_summary(summary)
         .with_schema_id(metadata.current_schema_id())
-        .with_timestamp_ms(commit_ts)
-        .build();
+        .with_timestamp_ms(commit_ts);
+    let new_snapshot = match row_range {
+        Some((first_row_id, added_rows)) => new_snapshot
+            .with_row_range(first_row_id, added_rows)
+            .build(),
+        None => new_snapshot.build(),
+    };
 
     let updates = vec![
         TableUpdate::AddSnapshot {
@@ -595,7 +687,8 @@ fn compare_partitions(a: &Struct, b: &Struct) -> Ordering {
         .unwrap_or_else(|| a.fields().len().cmp(&b.fields().len()))
 }
 
-/// Writes `entries` into one new manifest as `EXISTING` entries.
+/// Writes `entries` into one new manifest as `EXISTING` entries. Returns the manifest and the
+/// rows of its files without a `first_row_id`.
 async fn write_manifest(
     table: &Table,
     schema: &SchemaRef,
@@ -603,9 +696,15 @@ async fn write_manifest(
     n: u64,
     snapshot_id: i64,
     entries: impl Iterator<Item = ExistingEntry>,
-) -> Result<ManifestFile> {
+) -> Result<(ManifestFile, u64)> {
     let mut writer = new_manifest_writer(table, schema, commit_uuid, n, snapshot_id)?;
+    let mut unassigned_rows: u64 = 0;
     for entry in entries {
+        if entry.data_file.first_row_id.is_none() {
+            unassigned_rows = unassigned_rows
+                .checked_add(entry.data_file.record_count)
+                .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Row id overflow"))?;
+        }
         writer.add_existing_file(
             entry.data_file,
             entry.snapshot_id,
@@ -613,7 +712,7 @@ async fn write_manifest(
             entry.file_sequence_number,
         )?;
     }
-    writer.write_manifest_file().await
+    Ok((writer.write_manifest_file().await?, unassigned_rows))
 }
 
 /// Live entries read in parallel at most this many manifests at a time.
@@ -815,7 +914,8 @@ async fn read_list_layout(
 /// Reads back the manifest list and the created manifests, and fails unless
 /// the list holds the created manifests followed by the unchanged kept ones,
 /// and the created manifests hold exactly `expected`, all as `EXISTING`
-/// entries, with counts and partition summaries that match those entries.
+/// entries, with counts, partition summaries and, from format v3, consecutive
+/// row ranges that match those entries.
 async fn verify_output(
     table: &Table,
     manifest_list_path: &str,
@@ -829,9 +929,15 @@ async fn verify_output(
     let created = read_list_layout(table, manifest_list_path, kept).await?;
 
     let spec = metadata.default_partition_spec();
+    let row_lineage = format_version >= FormatVersion::V3;
+    let mut next_row_id = metadata.next_row_id();
     let mut actual = EntryDigest::default();
     for manifest_file in &created {
-        let manifest = table.manifest_reader().read(manifest_file).await?;
+        let manifest = table
+            .manifest_reader()
+            .without_row_id_inheritance()
+            .read(manifest_file)
+            .await?;
         let entries = manifest.entries();
         if let Some(entry) = entries
             .iter()
@@ -843,7 +949,19 @@ async fn verify_output(
                 entry.status()
             )));
         }
-        let rows = entries.iter().map(|e| e.data_file().record_count()).sum();
+        let rows = entries
+            .iter()
+            .try_fold(0u64, |rows, e| {
+                rows.checked_add(e.data_file().record_count())
+            })
+            .ok_or_else(|| output_mismatch("the new manifests hold more rows than exist"))?;
+        let inherited_rows = entries
+            .iter()
+            .filter(|e| e.data_file().first_row_id().is_none())
+            .try_fold(0u64, |rows, e| {
+                rows.checked_add(e.data_file().record_count())
+            })
+            .ok_or_else(|| output_mismatch("the new manifests take more row ids than exist"))?;
         let min_sequence_number = entries.iter().filter_map(|e| e.sequence_number()).min();
         // v1 manifest lists hold no sequence numbers.
         let (sequence_number, min_sequence_number) = match format_version {
@@ -873,7 +991,7 @@ async fn verify_output(
                 entries.iter().map(|e| &e.data_file().partition),
             )?),
             key_metadata: manifest_file.key_metadata.clone(),
-            first_row_id: None,
+            first_row_id: row_lineage.then_some(next_row_id),
         };
         if *manifest_file != implied {
             return Err(output_mismatch(format!(
@@ -881,6 +999,9 @@ async fn verify_output(
                 manifest_file.manifest_path
             )));
         }
+        next_row_id = next_row_id
+            .checked_add(inherited_rows)
+            .ok_or_else(|| output_mismatch("the new manifests take more row ids than exist"))?;
         for entry in entries {
             actual.add(entry);
         }
@@ -1374,26 +1495,178 @@ mod tests {
         assert_eq!(total, 6);
     }
 
-    /// Row lineage is not maintained, so v3 tables are refused before any
-    /// manifest is read.
+    /// The `first_row_id` of each data manifest, and the row ids of the live files.
+    async fn row_lineage(table: &Table) -> (Vec<Option<u64>>, Vec<(String, Option<i64>)>) {
+        let mut manifest_row_ids = Vec::new();
+        let mut row_ids = Vec::new();
+        for m in data_manifests(table).await {
+            for e in table.manifest_reader().read(&m).await.unwrap().entries() {
+                if e.is_alive() {
+                    row_ids.push((e.file_path().to_string(), e.data_file().first_row_id()));
+                }
+            }
+            manifest_row_ids.push(m.first_row_id);
+        }
+        row_ids.sort();
+        (manifest_row_ids, row_ids)
+    }
+
+    fn row_ids(ids: &[(&str, i64)]) -> Vec<(String, Option<i64>)> {
+        ids.iter()
+            .map(|(name, id)| (format!("test/{name}.parquet"), Some(*id)))
+            .collect()
+    }
+
+    /// Every rewritten file has a row id, so the new manifest takes none.
     #[tokio::test]
-    async fn test_v3_table_is_refused() {
+    async fn test_v3_rewrite_keeps_row_ids_and_takes_no_new_ones() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_one(&catalog, table, data_file("a", 1, 100, 30)).await;
         let table = append_one(&catalog, table, data_file("b", 1, 100, 17)).await;
+        assert_eq!(table.metadata().next_row_id(), 47);
+
+        let after = rewrite(&catalog, &table, 8 * 1024 * 1024).await;
+
+        assert_eq!(after.metadata().next_row_id(), 47);
+        let current = after.metadata().current_snapshot().unwrap();
+        assert_eq!(current.row_range(), Some((47, 0)));
+        let (manifest_row_ids, file_row_ids) = row_lineage(&after).await;
+        assert_eq!(manifest_row_ids, vec![Some(47)]);
+        assert_eq!(file_row_ids, row_ids(&[("a", 0), ("b", 30)]));
+    }
+
+    /// An empty file appended last holds the table's `next-row-id` as its row id.
+    #[tokio::test]
+    async fn test_v3_rewrite_keeps_the_row_id_of_an_empty_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_one(&catalog, table, data_file("a", 1, 100, 30)).await;
+        let table = append_one(&catalog, table, data_file("e", 1, 100, 0)).await;
+        assert_eq!(table.metadata().next_row_id(), 30);
+
+        let after = rewrite(&catalog, &table, 8 * 1024 * 1024).await;
+
+        assert_eq!(after.metadata().next_row_id(), 30);
+        let current = after.metadata().current_snapshot().unwrap();
+        assert_eq!(current.row_range(), Some((30, 0)));
+        let (manifest_row_ids, file_row_ids) = row_lineage(&after).await;
+        assert_eq!(manifest_row_ids, vec![Some(30)]);
+        assert_eq!(file_row_ids, row_ids(&[("a", 0), ("e", 30)]));
+    }
+
+    /// After an upgrade from v2, the current manifest list predates row lineage: the rewritten
+    /// entries take row ids from the new manifest's range, and a kept manifest gets the next one.
+    #[tokio::test]
+    async fn test_v3_rewrite_assigns_row_ids_to_manifests_written_before_row_lineage() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = append_one(&catalog, table, data_file("a", 1, 100, 30)).await;
+        let table = append_one(&catalog, table, data_file("b", 1, 100, 17)).await;
+        let table = append_one(&catalog, table, data_file("c", 1, 100, 5)).await;
+        let table = update(&catalog, &table, vec![TableUpdate::UpgradeFormatVersion {
+            format_version: FormatVersion::V3,
+        }])
+        .await;
+        let replaced = manifest_paths_holding(&table, &["a", "b"]).await;
+
+        let tx = Transaction::new(&table);
+        let after = tx
+            .rewrite_manifests()
+            .rewrite_if(move |m| replaced.contains(&m.manifest_path))
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(after.metadata().next_row_id(), 52);
+        let current = after.metadata().current_snapshot().unwrap();
+        assert_eq!(current.row_range(), Some((0, 52)));
+        let (manifest_row_ids, file_row_ids) = row_lineage(&after).await;
+        assert_eq!(manifest_row_ids, vec![Some(0), Some(47)]);
+        assert_eq!(file_row_ids, row_ids(&[("a", 0), ("b", 30), ("c", 47)]));
+    }
+
+    /// The manifests and lists written here are not encrypted.
+    #[tokio::test]
+    async fn test_encrypted_table_is_refused() {
+        let table = crate::test_utils::make_encrypted_table().await;
+        let expected = (
+            crate::ErrorKind::FeatureUnsupported,
+            "RewriteManifests does not support encrypted tables",
+        );
 
         let err = Arc::new(Transaction::new(&table).rewrite_manifests())
             .commit(&table)
             .await
             .err()
             .unwrap();
+        assert_eq!((err.kind(), err.message()), expected);
 
-        assert_eq!(err.kind(), crate::ErrorKind::FeatureUnsupported);
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let err = RewriteManifestsAction::rebase(&table, snapshot, &table)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!((err.kind(), err.message()), expected);
+    }
+
+    /// A manifest that kept its key metadata after the table lost its encryption manager is not
+    /// rewritten, but may be kept, or left alone when a rewrite of it alone would not change it.
+    #[tokio::test]
+    async fn test_encrypted_manifest_is_refused_without_an_encryption_manager() {
+        let catalog = new_memory_catalog().await;
+        let mut table = make_v2_minimal_table_in_catalog(&catalog).await;
+        for name in ["a", "b", "c"] {
+            table = append_one(&catalog, table, data_file(name, 1, 100, 1)).await;
+        }
+        let encrypted = data_manifests(&table).await[0].manifest_path.clone();
+        let table = edit_current_list(&catalog, &table, |manifests| {
+            manifests[0].key_metadata = Some(vec![1])
+        })
+        .await;
+
+        let err = Arc::new(Transaction::new(&table).rewrite_manifests())
+            .commit(&table)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(
-            err.message(),
-            "RewriteManifests does not support format v3 tables"
+            (err.kind(), err.message().to_string()),
+            (
+                crate::ErrorKind::FeatureUnsupported,
+                format!("RewriteManifests does not rewrite encrypted manifest {encrypted}")
+            )
         );
+
+        let kept = encrypted.clone();
+        let tx = Transaction::new(&table);
+        let after = tx
+            .rewrite_manifests()
+            .rewrite_if(move |m| m.manifest_path != kept)
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        let manifests: Vec<(String, Option<Vec<u8>>)> = data_manifests(&after)
+            .await
+            .into_iter()
+            .filter(|m| m.key_metadata.is_some())
+            .map(|m| (m.manifest_path, m.key_metadata))
+            .collect();
+        assert_eq!(manifests, vec![(encrypted.clone(), Some(vec![1]))]);
+
+        let mut commit = Arc::new(
+            Transaction::new(&after)
+                .rewrite_manifests()
+                .rewrite_if(move |m| m.manifest_path == encrypted),
+        )
+        .commit(&after)
+        .await
+        .unwrap();
+        assert_eq!(commit.take_updates(), vec![]);
     }
 
     #[tokio::test]
@@ -1875,9 +2148,10 @@ mod tests {
     ) {
         let file_io = table.file_io();
         let metadata = table.metadata();
+        let format_version = metadata.format_version();
         let bytes = file_io.new_input(&list_path).unwrap().read().await.unwrap();
         let mut manifests: Vec<ManifestFile> =
-            ManifestList::parse_with_version(&bytes, FormatVersion::V2)
+            ManifestList::parse_with_version(&bytes, format_version)
                 .unwrap()
                 .consume_entries()
                 .into_iter()
@@ -1885,6 +2159,7 @@ mod tests {
         let created = manifests[0].clone();
         let mut entries: Vec<ManifestEntry> = table
             .manifest_reader()
+            .without_row_id_inheritance()
             .read(&created)
             .await
             .unwrap()
@@ -1900,13 +2175,16 @@ mod tests {
                 metadata.location()
             ))
             .unwrap();
-        let mut writer = ManifestWriterBuilder::new(
+        let builder = ManifestWriterBuilder::new(
             output,
             Some(created.added_snapshot_id),
             metadata.current_schema().clone(),
             metadata.default_partition_spec().as_ref().clone(),
-        )
-        .build_v2_data();
+        );
+        let mut writer = match format_version {
+            FormatVersion::V3 => builder.build_v3_data(),
+            _ => builder.build_v2_data(),
+        };
         for e in entries {
             let sequence_number = e.sequence_number.unwrap();
             match e.status {
@@ -1925,20 +2203,31 @@ mod tests {
         }
         let mut rewritten = writer.write_manifest_file().await.unwrap();
         rewritten.sequence_number = created.sequence_number;
+        rewritten.first_row_id = created.first_row_id;
         manifests[0] = rewritten;
         edit_list(&mut manifests);
 
-        let mut list_writer = ManifestListWriter::v2(
-            file_io
-                .new_output(&list_path)
-                .unwrap()
-                .writer()
-                .await
-                .unwrap(),
-            created.added_snapshot_id,
-            metadata.current_snapshot_id(),
-            created.sequence_number,
-        );
+        let writer = file_io
+            .new_output(&list_path)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut list_writer = match format_version {
+            FormatVersion::V3 => ManifestListWriter::v3(
+                writer,
+                created.added_snapshot_id,
+                metadata.current_snapshot_id(),
+                created.sequence_number,
+                Some(metadata.next_row_id()),
+            ),
+            _ => ManifestListWriter::v2(
+                writer,
+                created.added_snapshot_id,
+                metadata.current_snapshot_id(),
+                created.sequence_number,
+            ),
+        };
         list_writer.add_manifests(manifests.into_iter()).unwrap();
         list_writer.close().await.unwrap();
     }
@@ -1993,6 +2282,82 @@ mod tests {
             "the manifest list entry of {}/metadata/corrupted-m0.avro does not match its entries",
             table.metadata().location()
         )
+    }
+
+    /// Rewrites a v3 table of two appends into one manifest, edits the output with
+    /// [`rewrite_created_manifest`], and returns the result of the action. With `from_v2`, the
+    /// appends predate an upgrade to v3, so their files have no row ids.
+    async fn rewrite_v3_with_edited_output(
+        from_v2: bool,
+        edit_entries: fn(&mut Vec<ManifestEntry>),
+        edit_list: fn(&mut Vec<ManifestFile>),
+    ) -> (Table, crate::Result<Vec<TableUpdate>>) {
+        let catalog = new_memory_catalog().await;
+        let table = if from_v2 {
+            make_v2_minimal_table_in_catalog(&catalog).await
+        } else {
+            make_v3_minimal_table_in_catalog(&catalog).await
+        };
+        let table = append_one(&catalog, table, data_file("a", 1, 100, 30)).await;
+        let mut table = append_one(&catalog, table, data_file("b", 1, 100, 17)).await;
+        if from_v2 {
+            table = update(&catalog, &table, vec![TableUpdate::UpgradeFormatVersion {
+                format_version: FormatVersion::V3,
+            }])
+            .await;
+        }
+        let hook: OutputHook = Arc::new(move |table, list_path| {
+            Box::pin(rewrite_created_manifest(
+                table,
+                list_path,
+                edit_entries,
+                edit_list,
+            ))
+        });
+        let action = Transaction::new(&table)
+            .rewrite_manifests()
+            .corrupt_output(hook);
+        let result = Arc::new(action)
+            .commit(&table)
+            .await
+            .map(|mut commit| commit.take_updates());
+        (table, result)
+    }
+
+    /// An entry that loses its row id inherits one from the new range, an entry without one that
+    /// is given one does not inherit it, and a new manifest whose range overlaps existing rows
+    /// does not follow the table's `next-row-id`.
+    #[tokio::test]
+    async fn test_verification_fails_on_changed_row_ids() {
+        for from_v2 in [false, true] {
+            let (_, result) = rewrite_v3_with_edited_output(from_v2, |_| {}, |_| {}).await;
+            assert_eq!(result.unwrap().len(), 2);
+        }
+
+        let edits: [fn(&mut Vec<ManifestEntry>); 2] = [
+            |entries| entries[0].data_file.first_row_id = None,
+            |entries| entries[0].data_file.first_row_id = Some(1_000_000),
+        ];
+        for (from_v2, edit) in [false, true].into_iter().zip(edits) {
+            let (_, result) = rewrite_v3_with_edited_output(from_v2, edit, |_| {}).await;
+            let err = result.err().unwrap();
+            assert_eq!(
+                err.message(),
+                format!("RewriteManifests output failed verification: {ENTRIES_DIFFER}")
+            );
+        }
+
+        let (table, result) =
+            rewrite_v3_with_edited_output(false, |_| {}, |list| list[0].first_row_id = Some(0))
+                .await;
+        let err = result.err().unwrap();
+        assert_eq!(
+            err.message(),
+            format!(
+                "RewriteManifests output failed verification: {}",
+                manifest_list_entry_differs(&table)
+            )
+        );
     }
 
     /// The output rewritten without edits passes, so each failure below comes
@@ -2447,7 +2812,8 @@ mod tests {
     ) {
         let mut table = match format_version {
             FormatVersion::V1 => make_v1_minimal_table_in_catalog(catalog).await,
-            _ => make_v2_minimal_table_in_catalog(catalog).await,
+            FormatVersion::V2 => make_v2_minimal_table_in_catalog(catalog).await,
+            FormatVersion::V3 => make_v3_minimal_table_in_catalog(catalog).await,
         };
         for name in ALL {
             table = append_one(catalog, table, data_file(name, 1, 100, 1)).await;
@@ -2473,6 +2839,22 @@ mod tests {
     /// Rewrites the manifest list of `table`'s current snapshot in place so that it lists the
     /// manifest at `index` twice, and returns the table reloaded from `catalog`.
     async fn list_a_manifest_twice(catalog: &impl Catalog, table: &Table, index: usize) -> Table {
+        let count = data_manifests(table).await.len() + 1;
+        let reloaded = edit_current_list(catalog, table, |manifests| {
+            manifests.push(manifests[index].clone())
+        })
+        .await;
+        assert_eq!(data_manifests(&reloaded).await.len(), count);
+        reloaded
+    }
+
+    /// Rewrites the v2 manifest list of `table`'s current snapshot in place with `edit` applied,
+    /// and returns the table reloaded from `catalog`.
+    async fn edit_current_list(
+        catalog: &impl Catalog,
+        table: &Table,
+        edit: impl FnOnce(&mut Vec<ManifestFile>),
+    ) -> Table {
         let snapshot = table.metadata().current_snapshot().unwrap();
         let mut manifests = table
             .manifest_list_reader(snapshot)
@@ -2481,8 +2863,7 @@ mod tests {
             .unwrap()
             .entries()
             .to_vec();
-        manifests.push(manifests[index].clone());
-        let count = manifests.len();
+        edit(&mut manifests);
         let mut writer = ManifestListWriter::v2(
             table
                 .file_io()
@@ -2497,9 +2878,7 @@ mod tests {
         );
         writer.add_manifests(manifests.into_iter()).unwrap();
         writer.close().await.unwrap();
-        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
-        assert_eq!(data_manifests(&reloaded).await.len(), count);
-        reloaded
+        catalog.load_table(table.identifier()).await.unwrap()
     }
 
     /// Deletes the data file of the manifest at `index` of `table`'s list with an overwrite.
@@ -2750,11 +3129,18 @@ mod tests {
         assert!(rebased.is_none());
     }
 
-    /// Every live entry of the current snapshot, data and deletes: content, path, snapshot id and
-    /// sequence numbers.
+    /// Every live entry of the current snapshot, data and deletes: content, path, snapshot id,
+    /// sequence numbers and first row id.
     async fn all_live_entries(
         table: &Table,
-    ) -> Vec<(String, String, Option<i64>, Option<i64>, Option<i64>)> {
+    ) -> Vec<(
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )> {
         let snapshot = table.metadata().current_snapshot().unwrap();
         let list = table.manifest_list_reader(snapshot).load().await.unwrap();
         let mut entries = Vec::new();
@@ -2767,6 +3153,7 @@ mod tests {
                         e.snapshot_id(),
                         e.sequence_number(),
                         e.file_sequence_number,
+                        e.data_file().first_row_id(),
                     ));
                 }
             }
@@ -2824,8 +3211,9 @@ mod tests {
 
     /// Rebases `snapshot`, planned on `base`, onto `head`, commits it and checks the result
     /// against `head`: the planned snapshot id, `head` as parent and its next sequence number,
-    /// the planned manifests (with the new sequence number) followed by `head`'s other manifests
-    /// in `head`'s order, `head`'s live entries, the planned counts, `head`'s totals.
+    /// the planned manifests (with the new sequence number and, from v3, `head`'s next row id as
+    /// first row id) followed by `head`'s other manifests in `head`'s order, `head`'s live entries,
+    /// the planned counts, `head`'s totals.
     async fn rebase_and_check(
         catalog: &impl Catalog,
         base: &Table,
@@ -2852,16 +3240,23 @@ mod tests {
             head.metadata().next_sequence_number()
         );
         assert_eq!(current.summary().operation, Operation::Replace);
-        let v1 = head.metadata().format_version() == FormatVersion::V1;
+        let format_version = head.metadata().format_version();
+        let next_row_id =
+            (format_version == FormatVersion::V3).then(|| head.metadata().next_row_id());
         let expected: Vec<ManifestFile> = created
             .iter()
             .map(|m| ManifestFile {
-                sequence_number: if v1 { 0 } else { current.sequence_number() },
+                sequence_number: match format_version {
+                    FormatVersion::V1 => 0,
+                    _ => current.sequence_number(),
+                },
+                first_row_id: next_row_id,
                 ..m.clone()
             })
             .chain(kept.iter().cloned())
             .collect();
         assert_eq!(all_manifests(&after).await, expected);
+        assert_eq!(current.row_range(), next_row_id.map(|id| (id, 0)));
         assert_eq!(all_live_entries(&after).await, all_live_entries(head).await);
         let props = &current.summary().additional_properties;
         let planned_props = &snapshot.summary().additional_properties;
@@ -2952,10 +3347,10 @@ mod tests {
     }
 
     /// Writer commits that keep every manifest the plan replaces: the rewrite is re-applied on
-    /// each, on v1 and v2 tables, and keeps the writer's manifests and entries exactly.
+    /// each, and keeps the writer's manifests and entries exactly.
     #[tokio::test]
     async fn test_rebase_applies_on_writer_commits_that_keep_the_replaced_manifests() {
-        for format_version in [FormatVersion::V1, FormatVersion::V2] {
+        for format_version in [FormatVersion::V1, FormatVersion::V2, FormatVersion::V3] {
             let catalog = new_memory_catalog().await;
 
             // An append: the planned manifest, then the appended one, and the plan's counts.
@@ -3137,10 +3532,10 @@ mod tests {
     }
 
     /// Writer commits that remove a manifest the plan replaces, or change what the plan was
-    /// written for: the rebase is refused, on v1 and v2 tables.
+    /// written for: the rebase is refused.
     #[tokio::test]
     async fn test_rebase_is_refused_after_writer_commits_that_drop_a_replaced_manifest() {
-        for format_version in [FormatVersion::V1, FormatVersion::V2] {
+        for format_version in [FormatVersion::V1, FormatVersion::V2, FormatVersion::V3] {
             let catalog = new_memory_catalog().await;
 
             // An overwrite deleting a file of a replaced manifest rewrites that manifest.
@@ -3253,7 +3648,7 @@ mod tests {
     /// last one commits on the third writer commit with a new manifest list each time.
     #[tokio::test]
     async fn test_rebases_chain_over_several_writer_commits() {
-        for format_version in [FormatVersion::V1, FormatVersion::V2] {
+        for format_version in [FormatVersion::V1, FormatVersion::V2, FormatVersion::V3] {
             let catalog = new_memory_catalog().await;
             let (base, _, planned) = planned_rewrite(&catalog, format_version, &ALL).await;
             let (created, _) = created_and_replaced(&base, &planned).await;
@@ -3376,8 +3771,7 @@ mod tests {
         assert_eq!(after.metadata().refs()[MAIN_BRANCH].retention, retention);
     }
 
-    /// A rebase needs a base below format v3 with a current snapshot, and a rewrite snapshot
-    /// planned on it.
+    /// A rebase needs a base with a current snapshot, and a rewrite snapshot planned on it.
     #[tokio::test]
     async fn test_rebase_requires_a_snapshot_planned_on_the_base() {
         let catalog = new_memory_catalog().await;
@@ -3397,15 +3791,36 @@ mod tests {
             panic!("an append is not a rewrite")
         };
         assert_eq!(error.kind(), crate::ErrorKind::PreconditionFailed);
+    }
 
-        let v3 = make_v3_minimal_table_in_catalog(&catalog).await;
-        let v3 = append_one(&catalog, v3, data_file("a", 1, 100, 1)).await;
-        let v3_head = append_one(&catalog, v3.clone(), data_file("b", 1, 100, 1)).await;
-        let next = v3_head.metadata().current_snapshot().unwrap();
-        let Err(error) = RewriteManifestsAction::rebase(&v3, next, &v3_head).await else {
-            panic!("a v3 base is refused")
+    /// A plan made right after an upgrade to v3 gave row ids to the files of the manifests it
+    /// replaced; a writer commit gives those files other ids, so the plan is not re-applied.
+    #[tokio::test]
+    async fn test_rebase_is_refused_when_the_plan_gave_row_ids() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = append_one(&catalog, table, data_file("a", 1, 100, 30)).await;
+        let table = append_one(&catalog, table, data_file("b", 1, 100, 17)).await;
+        let base = update(&catalog, &table, vec![TableUpdate::UpgradeFormatVersion {
+            format_version: FormatVersion::V3,
+        }])
+        .await;
+        let mut planned = Arc::new(Transaction::new(&base).rewrite_manifests())
+            .commit(&base)
+            .await
+            .unwrap();
+        let updates = planned.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            panic!("the plan adds a snapshot")
         };
-        assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
+        assert_eq!(snapshot.row_range(), Some((0, 47)));
+        let head = append_one(&catalog, base.clone(), data_file("c", 1, 100, 5)).await;
+
+        let rebased = RewriteManifestsAction::rebase(&base, snapshot, &head)
+            .await
+            .unwrap();
+
+        assert!(rebased.is_none());
     }
 
     /// The base's manifest list is gone (its snapshot expired and its files removed): the rebase
